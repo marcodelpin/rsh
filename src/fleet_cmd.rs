@@ -198,6 +198,7 @@ pub async fn run_fleet(args: &[String]) -> Result<()> {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
+                encrypted_net_info: Vec::new(),
             };
 
             eprintln!("Querying {} for group '{}'...", rdv_server, group_name);

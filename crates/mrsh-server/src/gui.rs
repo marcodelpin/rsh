@@ -95,7 +95,9 @@ fn handle_mouse(action: &str, args: &str) -> Response {
 
 #[cfg(not(target_os = "windows"))]
 fn handle_mouse(action: &str, _args: &str) -> Response {
-    Response::error(&format!("mouse {} not available on this platform", action))
+    Response::error(&format!(
+        "mouse {action} not available on Linux. GUI automation requires a Windows host with mrsh tray (port 9822)"
+    ))
 }
 
 // ── Keyboard ───────────────────────────────────────────────────────
@@ -167,7 +169,9 @@ fn handle_key(action: &str, args: &str) -> Response {
 
 #[cfg(not(target_os = "windows"))]
 fn handle_key(action: &str, _args: &str) -> Response {
-    Response::error(&format!("key {} not available on this platform", action))
+    Response::error(&format!(
+        "key {action} not available on Linux. GUI automation requires a Windows host with mrsh tray (port 9822)"
+    ))
 }
 
 // ── Window management ──────────────────────────────────────────────
@@ -176,6 +180,11 @@ fn handle_key(action: &str, _args: &str) -> Response {
 fn handle_window(action: &str, args: &str) -> Response {
     use windows::Win32::Foundation::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
+
+    // Window enumeration and management require an interactive desktop
+    if matches!(action, "list" | "find") && crate::is_session_zero() {
+        return Response::error(&crate::session_zero_hint(&format!("window {action}")));
+    }
 
     match action {
         "list" => {
@@ -270,7 +279,9 @@ unsafe extern "system" fn enum_windows_callback(
 
 #[cfg(not(target_os = "windows"))]
 fn handle_window(action: &str, _args: &str) -> Response {
-    Response::error(&format!("window {} not available on this platform", action))
+    Response::error(&format!(
+        "window {action} not available on Linux. Window management requires a Windows host with mrsh tray (port 9822)"
+    ))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────

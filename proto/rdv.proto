@@ -34,6 +34,9 @@ message RegisterPeer {
   string hostname = 4;
   string platform = 5;     // "windows" or "linux"
   int32 service_port = 6;  // rsh command listener port (e.g. 8822)
+  // Encrypted network info for LAN discovery (envelope encryption).
+  // Opaque to hbbs — only group members with the private key can decrypt.
+  bytes encrypted_net_info = 7;
 }
 
 message RegisterPeerResponse {
@@ -114,6 +117,8 @@ message PunchHoleResponse {
     bool is_local = 6;
   }
   string other_failure = 7;
+  // Forwarded from RegisterPeer — encrypted network info for LAN discovery.
+  bytes encrypted_net_info = 8;
 }
 
 // --- Relay ---
@@ -180,6 +185,38 @@ message TestNatRequest {
 message TestNatResponse {
   int32 port = 1;
   ConfigUpdate cu = 2;
+}
+
+// --- Encrypted LAN Discovery (rsh extension) ---
+// Envelope encryption: payload encrypted with random AES-256-GCM key,
+// then the AES key is encrypted once per group with ECIES (X25519 + AES-GCM).
+// hbbs stores and forwards the blob opaque — only group members can decrypt.
+
+message EncryptedNetworkInfo {
+  bytes encrypted_data = 1;        // AES-256-GCM(sym_key, serialized NetworkInfo)
+  bytes nonce = 2;                 // 12-byte AES-GCM nonce
+  repeated GroupKeyEntry keys = 3; // sym_key encrypted per group
+}
+
+message GroupKeyEntry {
+  string group_hash = 1;           // identifies which group
+  bytes ephemeral_pubkey = 2;      // 32-byte X25519 ephemeral public key
+  bytes encrypted_key = 3;         // AES-GCM(DH(ephemeral, group_pub), sym_key)
+  bytes key_nonce = 4;             // 12-byte nonce for the key encryption
+}
+
+message NetworkInfo {
+  repeated NetInterface interfaces = 1;
+  string hostname = 2;
+  uint32 service_port = 3;
+  uint32 tray_port = 4;
+}
+
+message NetInterface {
+  string name = 1;      // "Ethernet", "Wi-Fi", "Tailscale"
+  string ip = 2;        // "192.0.2.50"
+  string netmask = 3;   // "255.255.255.0"
+  string gateway = 4;   // "192.0.2.1"
 }
 
 message PeerDiscovery {

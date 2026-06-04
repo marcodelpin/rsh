@@ -80,6 +80,7 @@ mod tests {
     fn connection_event_fields() {
         let addr = test_addr(12345);
         let event = ConnectionEvent {
+            kind: EventKind::Connected,
             peer: addr,
             key_comment: Some("test-key".to_string()),
             timestamp: std::time::SystemTime::now(),
@@ -91,6 +92,7 @@ mod tests {
     #[test]
     fn connection_event_clone() {
         let event = ConnectionEvent {
+            kind: EventKind::Disconnected,
             peer: test_addr(1111),
             key_comment: None,
             timestamp: std::time::SystemTime::now(),
@@ -103,6 +105,7 @@ mod tests {
     #[test]
     fn connection_event_debug() {
         let event = ConnectionEvent {
+            kind: EventKind::Connected,
             peer: test_addr(2222),
             key_comment: Some("admin".to_string()),
             timestamp: std::time::SystemTime::now(),

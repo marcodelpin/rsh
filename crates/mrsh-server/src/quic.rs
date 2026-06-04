@@ -183,9 +183,7 @@ async fn authenticate_quic_stream(
                     success: false,
                     error: Some(e.to_string()),
                     version: Some(ctx.server_version.clone()),
-                    mux_enabled: None,
-                    caps: None,
-                    banner: None,
+                    ..Default::default()
                 },
             )
             .await;
@@ -269,6 +267,8 @@ async fn authenticate_quic_inner(
         mux_enabled: Some(true),
         caps: Some(ctx.caps.clone()),
         banner: ctx.banner.clone(),
+        device_id: ctx.device_id.clone(),
+        rendezvous_server: ctx.rendezvous_server.clone(),
     };
     send_quic_json(send, &result).await?;
     send.finish().context("finish auth send stream")?;

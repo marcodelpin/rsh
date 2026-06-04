@@ -592,4 +592,448 @@ mod tests {
             );
         }
     }
+
+    // --- "cat" alias for "read" ---
+
+    #[tokio::test]
+    async fn cat_alias_without_path_returns_error() {
+        let req = make_request("cat");
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("missing path"));
+    }
+
+    // --- write with path but missing content ---
+
+    #[tokio::test]
+    async fn write_with_path_but_no_content_returns_error() {
+        let mut req = make_request("write");
+        req.path = Some("/tmp/test.txt".to_string());
+        // content is None
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("missing content"));
+    }
+
+    // --- connect without target ---
+
+    #[tokio::test]
+    async fn connect_without_target_returns_error() {
+        let req = make_request("connect");
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("missing target"));
+    }
+
+    // --- shell with default size (no command field) ---
+
+    #[tokio::test]
+    async fn shell_default_size() {
+        let store = session::SessionStore::new();
+        let req = make_request("shell");
+        match dispatch(&req, &store).await {
+            DispatchResult::Hijack(HijackAction::Shell { size, env_vars }) => {
+                assert_eq!(size, "80x24");
+                assert!(env_vars.is_empty());
+            }
+            _ => panic!("expected Hijack::Shell"),
+        }
+    }
+
+    // --- shell with env_vars ---
+
+    #[tokio::test]
+    async fn shell_with_env_vars() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("shell");
+        req.env_vars = Some(vec!["FOO=bar".to_string(), "BAZ=qux".to_string()]);
+        match dispatch(&req, &store).await {
+            DispatchResult::Hijack(HijackAction::Shell { env_vars, .. }) => {
+                assert_eq!(env_vars.len(), 2);
+                assert_eq!(env_vars[0], "FOO=bar");
+            }
+            _ => panic!("expected Hijack::Shell"),
+        }
+    }
+
+    // --- shell-persistent with all fields ---
+
+    #[tokio::test]
+    async fn shell_persistent_full_fields() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("shell-persistent");
+        req.command = Some("100x50".to_string());
+        req.path = Some("my-session".to_string());
+        req.binary = Some(true); // readonly
+        req.env_vars = Some(vec!["TERM=xterm".to_string()]);
+        match dispatch(&req, &store).await {
+            DispatchResult::Hijack(HijackAction::ShellPersistent {
+                size,
+                session_id,
+                readonly,
+                env_vars,
+            }) => {
+                assert_eq!(size, "100x50");
+                assert_eq!(session_id.as_deref(), Some("my-session"));
+                assert!(readonly);
+                assert_eq!(env_vars, vec!["TERM=xterm"]);
+            }
+            _ => panic!("expected Hijack::ShellPersistent"),
+        }
+    }
+
+    // --- shell-persistent: empty session_id is filtered to None ---
+
+    #[tokio::test]
+    async fn shell_persistent_empty_session_id_is_none() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("shell-persistent");
+        req.path = Some("".to_string()); // empty string
+        match dispatch(&req, &store).await {
+            DispatchResult::Hijack(HijackAction::ShellPersistent { session_id, .. }) => {
+                assert!(session_id.is_none(), "empty session_id should be filtered to None");
+            }
+            _ => panic!("expected Hijack::ShellPersistent"),
+        }
+    }
+
+    // --- shell-persistent defaults ---
+
+    #[tokio::test]
+    async fn shell_persistent_defaults() {
+        let store = session::SessionStore::new();
+        let req = make_request("shell-persistent");
+        match dispatch(&req, &store).await {
+            DispatchResult::Hijack(HijackAction::ShellPersistent {
+                size,
+                session_id,
+                readonly,
+                env_vars,
+            }) => {
+                assert_eq!(size, "80x24");
+                assert!(session_id.is_none());
+                assert!(!readonly);
+                assert!(env_vars.is_empty());
+            }
+            _ => panic!("expected Hijack::ShellPersistent"),
+        }
+    }
+
+    // --- session unknown sub-command ---
+
+    #[tokio::test]
+    async fn session_unknown_subcommand() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("session");
+        req.command = Some("restart".to_string());
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(!resp.success);
+                assert!(resp.error.unwrap().contains("unknown session command"));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    // --- session kill without path (missing session id) ---
+
+    #[tokio::test]
+    async fn session_kill_missing_id() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("session");
+        req.command = Some("kill".to_string());
+        // path is None — no session id
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(!resp.success);
+                assert!(resp.error.unwrap().contains("missing session id"));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    // --- session default command (empty string) ---
+
+    #[tokio::test]
+    async fn session_empty_command() {
+        let store = session::SessionStore::new();
+        let req = make_request("session");
+        // command is None → defaults to ""
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(!resp.success);
+                assert!(resp.error.unwrap().contains("unknown session command"));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    // --- sync routes to SyncStream variants ---
+
+    #[tokio::test]
+    async fn sync_pull_delta_returns_sync_stream() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("sync");
+        req.sync_type = Some("pull-delta".to_string());
+        match dispatch(&req, &store).await {
+            DispatchResult::SyncStream(SyncStreamAction::PullDelta) => {}
+            _ => panic!("expected SyncStream::PullDelta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_batch_patch_bin_returns_sync_stream() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("sync");
+        req.sync_type = Some("batch-patch-bin".to_string());
+        match dispatch(&req, &store).await {
+            DispatchResult::SyncStream(SyncStreamAction::BatchPatchBin) => {}
+            _ => panic!("expected SyncStream::BatchPatchBin"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_push_chunked_returns_sync_stream() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("sync");
+        req.sync_type = Some("push-chunked".to_string());
+        match dispatch(&req, &store).await {
+            DispatchResult::SyncStream(SyncStreamAction::PushChunked) => {}
+            _ => panic!("expected SyncStream::PushChunked"),
+        }
+    }
+
+    // --- handle_request wraps hijack as error ---
+
+    #[tokio::test]
+    async fn handle_request_hijack_returns_error() {
+        let mut req = make_request("connect");
+        req.command = Some("localhost:1234".to_string());
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("hijack not supported"));
+    }
+
+    // --- handle_request wraps sync_stream as error ---
+
+    #[tokio::test]
+    async fn handle_request_sync_stream_returns_error() {
+        let mut req = make_request("sync");
+        req.sync_type = Some("pull-delta".to_string());
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("sync stream not supported"));
+    }
+
+    // --- screenshot direct type: default args ---
+
+    #[tokio::test]
+    async fn screenshot_default_args() {
+        let store = session::SessionStore::new();
+        let req = make_request("screenshot");
+        // All fields None → display=0, quality=80, scale=100
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                // On non-Windows the screenshot handler may fail, but it should
+                // not return "unknown command".
+                assert!(!resp.error.as_deref().unwrap_or("").contains("unknown"));
+            }
+            _ => panic!("expected Response for screenshot"),
+        }
+    }
+
+    // --- screenshot direct type: custom args ---
+
+    #[tokio::test]
+    async fn screenshot_custom_args() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("screenshot");
+        req.command = Some("1".to_string()); // display=1
+        req.content = Some("90".to_string()); // quality=90
+        req.path = Some("50".to_string()); // scale=50
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(!resp.error.as_deref().unwrap_or("").contains("unknown"));
+            }
+            _ => panic!("expected Response for screenshot"),
+        }
+    }
+
+    // --- screenshot: invalid numeric args fall back to defaults ---
+
+    #[tokio::test]
+    async fn screenshot_invalid_args_use_defaults() {
+        let store = session::SessionStore::new();
+        let mut req = make_request("screenshot");
+        req.command = Some("abc".to_string()); // not parseable → display=0
+        req.content = Some("xyz".to_string()); // not parseable → quality=80
+        req.path = Some("!!!".to_string()); // not parseable → scale=100
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                // Should dispatch fine (no unknown command error), handler runs with defaults
+                assert!(!resp.error.as_deref().unwrap_or("").contains("unknown"));
+            }
+            _ => panic!("expected Response for screenshot"),
+        }
+    }
+
+    // --- input with no command (None) ---
+
+    #[tokio::test]
+    async fn input_no_command() {
+        let req = make_request("input");
+        // command is None → defaults to "" → split = [] → len < 2
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("input requires"));
+    }
+
+    // --- native with no command (None) ---
+
+    #[tokio::test]
+    async fn native_no_command() {
+        let req = make_request("native");
+        // command is None → defaults to "" → split = [] → empty
+        let resp = handle_request(&req).await;
+        assert!(!resp.success);
+        assert!(resp.error.unwrap().contains("native requires"));
+    }
+
+    // --- exec-as-user dispatches (not "unknown") ---
+
+    #[tokio::test]
+    async fn exec_as_user_dispatches() {
+        let mut req = make_request("exec-as-user");
+        req.command = Some("whoami".to_string());
+        let resp = handle_request(&req).await;
+        // On non-Windows: may fail but should NOT be "unknown command"
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+    }
+
+    // --- input with extra args passed through ---
+
+    #[tokio::test]
+    async fn input_args_joined() {
+        let mut req = make_request("input");
+        req.command = Some("mouse move 500 300".to_string());
+        let resp = handle_request(&req).await;
+        // Dispatched to gui::handle_input("mouse", "move", "500 300")
+        // On non-Windows: error about platform
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(!resp.success);
+            assert!(resp.error.unwrap().contains("not available"));
+        }
+    }
+
+    // --- native clip-get dispatches ---
+
+    #[tokio::test]
+    async fn native_clip_get_dispatches() {
+        let mut req = make_request("native");
+        req.command = Some("clip-get".to_string());
+        let resp = handle_request(&req).await;
+        // Should dispatch (not unknown native command)
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+    }
+
+    // --- native clip-set dispatches with args ---
+
+    #[tokio::test]
+    async fn native_clip_set_dispatches() {
+        let mut req = make_request("native");
+        req.command = Some("clip-set hello world".to_string());
+        let resp = handle_request(&req).await;
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+    }
+
+    // --- native tail dispatches ---
+
+    #[tokio::test]
+    async fn native_tail_dispatches() {
+        let mut req = make_request("native");
+        req.command = Some("tail C:/some/file.log 50".to_string());
+        let resp = handle_request(&req).await;
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+    }
+
+    // --- dispatch ping directly via dispatch() ---
+
+    #[tokio::test]
+    async fn dispatch_ping_directly() {
+        let store = session::SessionStore::new();
+        let req = make_request("ping");
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(resp.success);
+                assert_eq!(resp.output.as_deref(), Some("pong"));
+                assert!(resp.error.is_none());
+                assert!(resp.size.is_none());
+                assert!(resp.binary.is_none());
+                assert!(resp.gzip.is_none());
+            }
+            _ => panic!("expected Response for ping"),
+        }
+    }
+
+    // --- dispatch unknown directly via dispatch() ---
+
+    #[tokio::test]
+    async fn dispatch_unknown_directly() {
+        let store = session::SessionStore::new();
+        let req = make_request("totally-invalid");
+        match dispatch(&req, &store).await {
+            DispatchResult::Response(resp) => {
+                assert!(!resp.success);
+                assert!(resp.error.unwrap().contains("unknown command: totally-invalid"));
+            }
+            _ => panic!("expected Response for unknown"),
+        }
+    }
+
+    // --- ls defaults to current dir when path is None ---
+
+    #[tokio::test]
+    async fn ls_default_path() {
+        let req = make_request("ls");
+        // path is None → defaults to "."
+        let resp = handle_request(&req).await;
+        assert!(resp.success);
+    }
+
+    // --- exec with no command (None → empty string) ---
+
+    #[tokio::test]
+    async fn exec_no_command_field() {
+        let req = make_request("exec");
+        // command is None → defaults to ""
+        let resp = handle_request(&req).await;
+        // Should dispatch (not unknown), might succeed or fail depending on platform
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+    }
+
+    // --- exec with env_vars ---
+
+    #[tokio::test]
+    async fn exec_with_env_vars() {
+        let mut req = make_request("exec");
+        req.command = Some("echo test".to_string());
+        req.env_vars = Some(vec!["MY_VAR=hello".to_string()]);
+        let resp = handle_request(&req).await;
+        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+    }
+
+    // --- native kill with valid-looking pid dispatches ---
+
+    #[tokio::test]
+    async fn native_kill_valid_pid_dispatches() {
+        let mut req = make_request("native");
+        req.command = Some("kill 99999".to_string());
+        let resp = handle_request(&req).await;
+        // Should dispatch to exec (Stop-Process), not return "invalid pid"
+        assert!(
+            !resp.error.as_deref().unwrap_or("").contains("invalid pid"),
+            "valid numeric pid should not trigger invalid pid error"
+        );
+    }
 }

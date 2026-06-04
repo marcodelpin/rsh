@@ -21,6 +21,17 @@ pub struct RelayConnectOptions {
     pub server_name: String,
     /// Port for P2P direct connection attempts.
     pub port: u16,
+    /// Port to request via relay protocol.
+    /// - `0` = tray-first: server tries tray (9822), falls back to SYSTEM (8822).
+    /// - Non-zero = explicit: server routes to exactly this port.
+    /// When omitted from construction, defaults to `port` (explicit behavior).
+    pub target_port: u16,
+    /// Skip P2P attempts and go directly to relay. Set this after the first
+    /// connection used relay (saves 5s P2P timeout on reconnections).
+    pub force_relay: bool,
+    /// Enrollment token for decrypting server's network info (LAN discovery).
+    /// Empty string = no LAN probe (not enrolled in any group).
+    pub enrollment_token: String,
 }
 
 /// P2P timeout when relay is available (shortened to let relay win faster).
@@ -47,15 +58,73 @@ pub async fn connect_via_relay(opts: &RelayConnectOptions) -> Result<TlsClient> 
         hostname: String::new(),
         platform: String::new(),
         service_port: 0,
+        encrypted_net_info: Vec::new(),
     };
 
     let result = rdv_client
-        .resolve_with_port(&opts.device_id, opts.port)
+        .resolve_with_port(&opts.device_id, opts.target_port)
         .await
         .context("rendezvous resolve failed")?;
 
-    // Try P2P first if address available
-    if let Some(addr) = result.addr {
+    // Try encrypted LAN discovery: if server sent network info, try direct LAN connect
+    if !result.encrypted_net_info.is_empty() && !opts.enrollment_token.is_empty() && !opts.force_relay {
+        if let Ok(Some(net_info)) = mrsh_relay::net_crypto::decrypt_network_info(
+            &result.encrypted_net_info,
+            &opts.enrollment_token,
+        ) {
+            let lan_port = if opts.target_port != 0 {
+                opts.target_port
+            } else if net_info.service_port != 0 {
+                net_info.service_port as u16
+            } else {
+                opts.port
+            };
+
+            // Compare our local interfaces with server's — find matching subnets
+            let our_ifaces = mrsh_relay::net_crypto::collect_network_info("", 0, 0);
+            for server_iface in &net_info.interfaces {
+                for our_iface in &our_ifaces.interfaces {
+                    if mrsh_relay::net_crypto::same_subnet(
+                        &our_iface.ip, &our_iface.netmask,
+                        &server_iface.ip, &server_iface.netmask,
+                    ) {
+                        info!(
+                            "LAN probe: {} ({}) and server {} ({}) share subnet — trying direct",
+                            our_iface.ip, our_iface.name, server_iface.ip, server_iface.name,
+                        );
+                        let lan_result = tokio::time::timeout(
+                            std::time::Duration::from_millis(500),
+                            crate::client::connect(&ConnectOptions {
+                                host: server_iface.ip.clone(),
+                                port: lan_port,
+                                key_path: opts.key_path.clone(),
+                                password_user: None,
+                            }),
+                        ).await;
+                        match lan_result {
+                            Ok(Ok(c)) => {
+                                info!(
+                                    "LAN direct: connected to {} ({}) on port {}",
+                                    net_info.hostname, server_iface.ip, lan_port,
+                                );
+                                return Ok(c);
+                            }
+                            Ok(Err(e)) => {
+                                debug!("LAN probe {} failed: {} (TLS mismatch = different network)", server_iface.ip, e);
+                            }
+                            Err(_) => {
+                                debug!("LAN probe {} timed out", server_iface.ip);
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("LAN probe: no matching subnet found, falling back to P2P/relay");
+        }
+    }
+
+    // Try P2P first if address available (skip if force_relay is set)
+    if let Some(addr) = result.addr && !opts.force_relay {
         debug!("P2P: trying {}:{}", addr.ip(), opts.port);
         let p2p_result = tokio::time::timeout(
             std::time::Duration::from_secs(P2P_TIMEOUT_SECS),
@@ -130,6 +199,9 @@ pub fn relay_options_from_config(
         key_path: key_path.clone(),
         server_name: hostname,
         port: host_config.port,
+        target_port: host_config.port,
+        force_relay: false,
+        enrollment_token: String::new(),
     })
 }
 
@@ -157,6 +229,7 @@ mod tests {
         assert_eq!(opts.rendezvous_key, "testkey");
         assert_eq!(opts.server_name, "192.168.1.100");
         assert_eq!(opts.port, 8822);
+        assert_eq!(opts.target_port, 8822);
     }
 
     #[test]
@@ -199,6 +272,9 @@ mod tests {
             key_path: None,
             server_name: "host".to_string(),
             port: 8822,
+            target_port: 8822,
+            force_relay: false,
+            enrollment_token: String::new(),
         };
         let debug = format!("{:?}", opts);
         assert!(debug.contains("12345"));

@@ -396,8 +396,8 @@ mod win32_tray {
                 use windows::Win32::UI::WindowsAndMessaging::LoadImageW;
                 use windows::Win32::Foundation::HINSTANCE;
                 // winres embeds icon as MAKEINTRESOURCE(1) — integer ID, not string.
-                // PCWSTR from a raw integer: low word = resource ID, high word = 0.
-                let res_id = windows::core::PCWSTR(std::ptr::dangling::<u16>());
+                // MAKEINTRESOURCE(1) = pointer with value 1 (low word = resource ID).
+                let res_id = windows::core::PCWSTR(1 as *const u16);
                 let exe_icon = LoadImageW(
                     Some(HINSTANCE(hinstance.0)),
                     res_id,
@@ -532,7 +532,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         {
             let cancel = tokio_util::sync::CancellationToken::new();
-            let result = run_tray(cancel, 8822);
+            let result = run_tray(cancel, 8822, String::new());
             assert!(result.is_err());
         }
     }
@@ -542,7 +542,7 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         {
             let cancel = tokio_util::sync::CancellationToken::new();
-            let result = run_tray(cancel, 9822);
+            let result = run_tray(cancel, 9822, String::new());
             let err = result.unwrap_err();
             assert!(
                 err.to_string().contains("not available"),
@@ -573,7 +573,7 @@ mod tests {
         {
             let cancel = tokio_util::sync::CancellationToken::new();
             cancel.cancel(); // Pre-cancel
-            let result = run_tray(cancel, 8822);
+            let result = run_tray(cancel, 8822, String::new());
             assert!(result.is_err());
         }
     }
@@ -585,7 +585,7 @@ mod tests {
         {
             for port in [0, 1, 8822, 9822, 65535] {
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let result = run_tray(cancel, port);
+                let result = run_tray(cancel, port, String::new());
                 assert!(result.is_err(), "port {} should fail on non-Windows", port);
             }
         }

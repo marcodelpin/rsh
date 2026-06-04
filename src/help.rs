@@ -11,7 +11,7 @@ USAGE:
 
 OPTIONS:
   -h <host>     Remote host (IP, hostname, or DeviceID)
-  -p <port>     Remote port (omit to auto-try: 8822 → 9822 → 22)
+  -p <port>     Remote port (omit to auto-try: 9822 → 8822 → 22)
   -i <key>      SSH key file
   -v, -vv       Verbose output
 
@@ -54,6 +54,20 @@ LOCAL COMMANDS (no -h needed):
                   Stores peer group_hash for fleet group discovery.
   help          This help
 
+SERVER MODE (run mrsh as a server):
+  mrsh                  Start server (Windows: tray mode, Linux: foreground)
+  mrsh --tray           Run as tray app (port 9822, system tray icon, user session)
+  mrsh --console        Foreground server (both platforms, debug mode)
+  mrsh --daemon         Background daemon (Linux, systemd signal handling)
+  mrsh --install        Install system service (Windows SCM / Linux systemd)
+  mrsh --uninstall      Remove system service
+  mrsh -p <port>        Override listening port (default: 8822)
+
+  Windows runs TWO instances: service (port 8822, SYSTEM) + tray (port 9822, user).
+  The service auto-starts the tray at boot via a scheduled task (mrsh-tray).
+  If the tray is not running, start it manually: mrsh --tray
+  Or from the service: schtasks /run /tn mrsh-tray
+
 CLIENT COMMANDS (require -h):
   ping          Test connectivity
   exec <cmd>    Execute command (streaming output, no timeout)
@@ -91,6 +105,12 @@ TRANSFER OPTIONS:
   clip get|set  Clipboard
   service       Service management
   filever       PE version info
+  rlog <path>   Remote log query (server-side grep/tail, streaming)
+                  --grep <pattern>  Filter lines by regex
+                  --tail <N>        Show only last N lines
+                  --max <N>         Limit to N matches
+                  -i                Case-insensitive match
+                  -v                Invert match (exclude pattern)
   sessions      List/kill persistent sessions
   self-update   Trigger remote self-update
   input         GUI automation (mouse/key/window)
@@ -99,7 +119,9 @@ TRANSFER OPTIONS:
   window        Window control (alias for input window)
   plugin        Plugin management
   cache         Block cache stats/index
-  tunnel <l> <r> TCP tunnel (ssh -L equivalent)
+  tunnel <l> <r> TCP tunnel (ssh -L equivalent, persistent listener)
+                  Stays open, accepts multiple connections (e.g. browser).
+                  Each local connection opens a new mrsh stream to the server.
   -D <port>     SOCKS5 proxy (ssh -D equivalent)
   --user <name> Password auth (fallback when no SSH key)
   reboot [-f]   Reboot remote host
@@ -120,7 +142,12 @@ AI USAGE:
   - CONNECTION PRIORITY: LAN direct > Tailscale > Relay (DeviceID)
   - CONFIG FILE: ~/.mrsh/config defines Host aliases with Hostname, Port, DeviceID, MAC.
     Always check config before assuming default ports.
-  - AUTO-TRY PORTS: Without -p, mrsh tries 8822 → 9822 → 22 in sequence.
+  - DO NOT USE -p <port> unless you have a specific reason. mrsh auto-selects the
+    best port: tray (9822) first, then service (8822), then SSH (22).
+    The tray runs in the user session (mapped drives, GUI, screenshots, network shares).
+    The service runs as SYSTEM (admin ops, no user context). Omitting -p gets you tray.
+    Use -p 8822 ONLY when: (a) you need SYSTEM privileges, or (b) no user is logged in.
+  - AUTO-TRY PORTS: Without -p, mrsh tries 9822 → 8822 → 22 in sequence.
     Port 22 covers hosts running mrsh on the SSH port. No manual -p needed.
   - FIREWALL: On install (--install) or first startup, mrsh MUST open firewall
     for all ports it listens on. Without this, LAN clients get "connection refused".
@@ -202,34 +229,45 @@ AI USAGE:
     Do NOT use manual bat/ps1 scripts — self-update handles stop/swap/start automatically.
 
   SERVICE + TRAY ARCHITECTURE (CRITICAL FOR AI AGENTS):
-  - ALWAYS CONNECT TO TRAY (port 9822) FIRST. Tray is the preferred endpoint.
-    Tray = user session: mapped drives, GUI, screenshots, network shares, user env.
-    Tray handles 90%+ of operations better than the SYSTEM service.
-  - Service (port 8822): runs as SYSTEM via SCM. Use ONLY for admin operations
-    (service install, registry HKLM, launching tray when it's down).
-  - CONNECTION SEQUENCE:
-    1. Try tray first:  mrsh -h <host> -p 9822 exec '<cmd>'
-    2. If tray down (connection refused): launch tray from service:
-       mrsh -h <host> exec 'schtasks /run /tn mrsh-tray'
-       Wait 3-5s, then use -p 9822
-    3. If ONLY admin/SYSTEM needed: use service directly (no -p, default 8822)
+  - JUST USE: mrsh -h <host> exec '<cmd>'   (no -p needed!)
+    Auto-try connects to tray (9822) first — user session with full capabilities.
+    Falls back to service (8822) if tray is down, then SSH (22).
+  - Service (port 8822): runs as SYSTEM via SCM. Use -p 8822 ONLY for:
+    (a) admin operations (service install, registry HKLM, launching tray when down)
+    (b) unattended machines (no user logged in, tray not running)
+  - If tray is down (auto-try falls through to service): launch tray from service:
+       mrsh -h <host> -p 8822 exec 'schtasks /run /tn mrsh-tray'
+       Wait 3-5s, then use without -p (auto-try will find the tray)
   - At service startup, `ensure_tray_task` auto-heals the tray scheduled task.
   - Tray tooltip shows: version, port, and DeviceID. Click "ID: ..." to copy.
+  - TRAY ICON COLOR: blue = idle, RED = active connections. Reverts to blue
+    when all connections close. Provides at-a-glance connection status.
+  - TOAST NOTIFICATIONS: shown ONLY on first connection after 5+ minutes idle.
+    NEVER during active connections (prevents GUI click interference).
+    Connections are logged silently to audit.log regardless of toast.
 
     Capability matrix:
       | Feature                    | Port 8822 (SYSTEM)   | Port 9822 (tray/user) |
       | exec, push/pull            | Yes                  | Yes                   |
-      | mapped drives (Z:, etc.)   | NO (invisible)       | Yes                   |
-      | network shares (UNC)       | NO (no user creds)   | Yes                   |
+      | mapped drives (Z:, etc.)   | NO (invisible)       | Yes (user session)    |
+      | network shares (UNC)       | NO (no user creds)   | Yes (user session)    |
       | user env vars ($env:HOME)  | SYSTEM profile       | User profile          |
       | mouse/key input            | Yes (cross-session)  | Yes                   |
       | window list/find           | null (no desktop)    | Yes (JSON)            |
       | screenshot                 | fails                | Yes                   |
-      | install user software      | NO                   | Yes                   |
-      | service install/HKLM       | Yes (SYSTEM)         | NO (user-level)       |
+      | install software           | Yes (SYSTEM)         | Yes (if admin-install)|
+      | HKLM registry / services   | Yes (SYSTEM)         | Yes (if admin-install)|
+      | Program Files / System32   | Yes (SYSTEM)         | Yes (if admin-install)|
+      | UAC prompt                 | NEVER (SYSTEM)       | NEVER (SYSTEM tray)   |
 
-    WRONG: mrsh -h host exec 'Get-ChildItem Z:\'           ← uses SYSTEM, Z: invisible
-    RIGHT: mrsh -h host -p 9822 exec 'Get-ChildItem Z:\'   ← uses tray, Z: visible
+    ADMIN-INSTALL vs USER-INSTALL:
+    When the installer runs as Administrator, BOTH service AND tray run as SYSTEM.
+    The tray in Session 1 (user desktop) has full admin: write Program Files,
+    modify HKLM registry, control services — all without UAC prompts.
+    When installed by a normal user, the tray runs as that user (no admin).
+
+    WRONG: mrsh -h host -p 8822 exec 'Get-ChildItem Z:\'    ← forces SYSTEM, Z: invisible
+    RIGHT: mrsh -h host exec 'Get-ChildItem Z:\'           ← auto-try finds tray, Z: visible
 
   SELF-UPDATE (existing machines):
   - CRITICAL: NEVER kill/stop/restart mrsh through its own connection using /ru SYSTEM.

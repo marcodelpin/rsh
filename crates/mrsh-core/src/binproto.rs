@@ -230,7 +230,19 @@ pub fn parse_auth_request(data: &[u8]) -> Result<(Vec<u8>, String, Vec<String>)>
 }
 
 /// Build AUTH_OK payload: version_str + caps_count + caps[] + banner_str (optional)
+/// + device_id (optional) + rendezvous_server (optional)
 pub fn build_auth_ok(version: &str, caps: &[&str], banner: Option<&str>) -> Vec<u8> {
+    build_auth_ok_full(version, caps, banner, None, None)
+}
+
+/// Build AUTH_OK with all fields including device_id and rendezvous_server.
+pub fn build_auth_ok_full(
+    version: &str,
+    caps: &[&str],
+    banner: Option<&str>,
+    device_id: Option<&str>,
+    rendezvous_server: Option<&str>,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     encode_str(&mut buf, version);
     buf.push(caps.len() as u8);
@@ -243,15 +255,43 @@ pub fn build_auth_ok(version: &str, caps: &[&str], banner: Option<&str>) -> Vec<
     } else {
         buf.push(0);
     }
+    // Extended fields (backward-compatible: old clients stop reading at banner)
+    if let Some(id) = device_id {
+        buf.push(1); // has_device_id flag
+        encode_str(&mut buf, id);
+    } else {
+        buf.push(0);
+    }
+    if let Some(rdv) = rendezvous_server {
+        buf.push(1); // has_rendezvous flag
+        encode_str(&mut buf, rdv);
+    } else {
+        buf.push(0);
+    }
     buf
+}
+
+/// Parsed AUTH_OK fields.
+pub struct AuthOkFields {
+    pub version: String,
+    pub caps: Vec<String>,
+    pub banner: Option<String>,
+    pub device_id: Option<String>,
+    pub rendezvous_server: Option<String>,
 }
 
 /// Parse AUTH_OK payload.
 pub fn parse_auth_ok(data: &[u8]) -> Result<(String, Vec<String>, Option<String>)> {
+    let fields = parse_auth_ok_full(data)?;
+    Ok((fields.version, fields.caps, fields.banner))
+}
+
+/// Parse AUTH_OK payload with all extended fields.
+pub fn parse_auth_ok_full(data: &[u8]) -> Result<AuthOkFields> {
     let (version, off) = decode_str(data, 0)?;
     let version = version.to_string();
     if off >= data.len() {
-        return Ok((version, vec![], None));
+        return Ok(AuthOkFields { version, caps: vec![], banner: None, device_id: None, rendezvous_server: None });
     }
     let caps_count = data[off] as usize;
     let mut off = off + 1;
@@ -262,12 +302,29 @@ pub fn parse_auth_ok(data: &[u8]) -> Result<(String, Vec<String>, Option<String>
         off = new_off;
     }
     let banner = if off < data.len() && data[off] == 1 {
-        let (b, _) = decode_str(data, off + 1)?;
+        let (b, new_off) = decode_str(data, off + 1)?;
+        off = new_off;
         Some(b.to_string())
+    } else {
+        if off < data.len() { off += 1; } // skip 0 flag
+        None
+    };
+    // Extended fields (v1.7.9+): device_id, rendezvous_server
+    let device_id = if off < data.len() && data[off] == 1 {
+        let (id, new_off) = decode_str(data, off + 1)?;
+        off = new_off;
+        Some(id.to_string())
+    } else {
+        if off < data.len() { off += 1; }
+        None
+    };
+    let rendezvous_server = if off < data.len() && data[off] == 1 {
+        let (rdv, _new_off) = decode_str(data, off + 1)?;
+        Some(rdv.to_string())
     } else {
         None
     };
-    Ok((version, caps, banner))
+    Ok(AuthOkFields { version, caps, banner, device_id, rendezvous_server })
 }
 
 // ── Exec message builders ───────────────────────────────────────

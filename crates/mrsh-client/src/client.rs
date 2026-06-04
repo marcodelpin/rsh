@@ -22,6 +22,10 @@ pub struct RshClient<S> {
     pub server_version: Option<String>,
     pub server_caps: Vec<String>,
     pub mux_enabled: bool,
+    /// Server's DeviceID (reported during auth, for relay rediscovery).
+    pub server_device_id: Option<String>,
+    /// Server's rendezvous server address (reported during auth).
+    pub server_rendezvous: Option<String>,
 }
 
 /// Connection options.
@@ -60,14 +64,17 @@ pub async fn connect(opts: &ConnectOptions) -> Result<TlsClient> {
 }
 
 /// Ports to try when no port is specified (-p omitted, no config port).
-pub const AUTO_TRY_PORTS: &[u16] = &[8822, 9822, 22];
+/// Order: tray (9822) first — user session has mapped drives, GUI, screenshots.
+/// Then service (8822) — SYSTEM, for admin ops or when no user is logged in.
+/// Finally SSH (22) — fallback for hosts running mrsh on the SSH port.
+pub const AUTO_TRY_PORTS: &[u16] = &[9822, 8822, 22];
 
 /// Short timeout per port during auto-try (seconds).
 const AUTO_TRY_TIMEOUT_SECS: u64 = 3;
 
 /// Connect with auto-try: attempt multiple ports sequentially with short timeouts.
 /// Returns the first successful connection. On failure, returns the error from the
-/// primary port (8822) for a clear error message.
+/// first port attempted (9822/tray) for a clear error message.
 pub async fn connect_auto_try(opts: &ConnectOptions) -> Result<(TlsClient, u16)> {
     let mut primary_error = None;
 
@@ -145,6 +152,8 @@ async fn auth_password<S: AsyncRead + AsyncWrite + Unpin>(
         server_version: None,
         server_caps: Vec::new(),
         mux_enabled: false,
+        server_device_id: None,
+        server_rendezvous: None,
     };
 
     let auth_req = protocol::AuthRequest {
@@ -176,6 +185,8 @@ async fn auth_password<S: AsyncRead + AsyncWrite + Unpin>(
     client.server_version = result.version.clone();
     client.server_caps = result.caps.unwrap_or_default();
     client.mux_enabled = result.mux_enabled.unwrap_or(false);
+    client.server_device_id = result.device_id;
+    client.server_rendezvous = result.rendezvous_server;
     info!(
         "authenticated via password (server: {})",
         result.version.as_deref().unwrap_or("unknown")
@@ -219,6 +230,8 @@ async fn auth_client<S: AsyncRead + AsyncWrite + Unpin>(
         server_version: None,
         server_caps: Vec::new(),
         mux_enabled: false,
+        server_device_id: None,
+        server_rendezvous: None,
     };
 
     // Try binary auth first — server auto-detects by first byte.
@@ -339,6 +352,8 @@ impl<S> RshClient<S> {
             server_version: Some("test-server".to_string()),
             server_caps: Vec::new(),
             mux_enabled: false,
+            server_device_id: None,
+            server_rendezvous: None,
         }
     }
 }
@@ -390,11 +405,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RshClient<S> {
 
         match type_id {
             msg::AUTH_OK => {
-                let (version, caps, _banner) = binproto::parse_auth_ok(&result_data)?;
-                self.server_version = Some(version);
-                self.server_caps = caps;
-                info!("authenticated via binary protocol (server: {})",
-                    self.server_version.as_deref().unwrap_or("unknown"));
+                let fields = binproto::parse_auth_ok_full(&result_data)?;
+                self.server_version = Some(fields.version);
+                self.server_caps = fields.caps;
+                self.server_device_id = fields.device_id;
+                self.server_rendezvous = fields.rendezvous_server;
+                info!("authenticated via binary protocol (server: {}{})",
+                    self.server_version.as_deref().unwrap_or("unknown"),
+                    self.server_device_id.as_ref().map(|id| format!(", device_id={}", id)).unwrap_or_default());
                 Ok(())
             }
             msg::AUTH_FAIL => {
@@ -422,6 +440,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RshClient<S> {
     /// Check if server supports streaming exec (stdout/stderr chunks as they arrive).
     pub fn supports_stream_exec(&self) -> bool {
         self.server_caps.iter().any(|c| c == "stream-exec")
+    }
+
+    /// True if connected to user-session tray (has desktop, mapped drives, GUI).
+    pub fn is_tray(&self) -> bool {
+        self.supports("tray")
+    }
+
+    /// True if connected to SYSTEM service (admin privileges, no desktop).
+    pub fn is_system(&self) -> bool {
+        self.supports("system")
+    }
+
+    /// Describe the server instance: type, capabilities, limitations, and hints.
+    /// Returns a multi-line string for display on stderr.
+    pub fn describe_instance(&self, port: u16) -> String {
+        let version = self.server_version.as_deref().unwrap_or("unknown");
+
+        if self.is_tray() {
+            format!(
+                "  instance: USER TRAY (port {port}, v{version})\n\
+                 \x20 session:  interactive desktop — user context\n\
+                 \x20 can:      screenshot, window, mapped drives, GUI, clipboard, exec, push/pull\n\
+                 \x20 cannot:   install services (no SYSTEM privileges)\n\
+                 \x20 for admin: mrsh -h <host> -p 8822 (SYSTEM service)"
+            )
+        } else if self.is_system() {
+            format!(
+                "  instance: SYSTEM SERVICE (port {port}, v{version})\n\
+                 \x20 session:  session 0 — no desktop\n\
+                 \x20 can:      exec as SYSTEM, install services, registry HKLM, push/pull\n\
+                 \x20 cannot:   screenshot, window list, mapped drives, GUI automation\n\
+                 \x20 for desktop: mrsh -h <host> -p 9822 (user tray)"
+            )
+        } else {
+            // Linux or old server without system/tray caps
+            let platform = if self.server_caps.iter().any(|c| c == "window") {
+                "windows"
+            } else {
+                "linux"
+            };
+            format!(
+                "  instance: server (port {port}, v{version}, {platform})\n\
+                 \x20 caps:     {}",
+                self.server_caps.join(", ")
+            )
+        }
     }
 
     /// Execute a command via binary protocol. Returns (exit_code, output).

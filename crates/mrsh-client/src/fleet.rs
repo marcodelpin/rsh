@@ -169,6 +169,7 @@ async fn discover_from_hbbs(config: &Config) -> Vec<mrsh_relay::rendezvous::Grou
         hostname: String::new(),
         platform: String::new(),
         service_port: 0,
+        encrypted_net_info: Vec::new(),
     };
 
     match client.list_peers().await {
@@ -241,6 +242,9 @@ async fn probe_host(
                     key_path: None,
                     server_name: hostname.to_string(),
                     port,
+                    target_port: port,
+                    force_relay: false,
+                    enrollment_token: String::new(),
                 };
                 match tokio::time::timeout(
                     Duration::from_secs(15),
@@ -506,6 +510,9 @@ async fn update_single_host(host: &HostStatus, binary_data: &[u8]) -> UpdateResu
                     key_path: None,
                     server_name: host.hostname.clone(),
                     port: host.port,
+                    target_port: host.port,
+                    force_relay: false,
+                    enrollment_token: String::new(),
                 };
                 if let Ok(client) = crate::relay_connect::connect_via_relay(&relay_opts).await {
                     return push_and_update_tls(host, client, binary_data, old_version).await;

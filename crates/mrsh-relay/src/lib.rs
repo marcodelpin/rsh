@@ -3,6 +3,7 @@ pub mod proto {
 }
 pub mod codec;
 pub mod discovery;
+pub mod net_crypto;
 pub mod relay;
 pub mod rendezvous;
 pub mod stun;

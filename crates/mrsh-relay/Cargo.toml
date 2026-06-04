@@ -14,6 +14,8 @@ rand.workspace = true
 sha2.workspace = true
 hex = "0.4"
 tokio-util = "0.7"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
 
 [build-dependencies]
 prost-build.workspace = true

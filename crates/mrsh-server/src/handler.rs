@@ -50,6 +50,10 @@ pub struct ServerContext {
     pub totp_recovery_path: Option<std::path::PathBuf>,
     /// Path to server_key file (for SSH host key). None if SSH not configured.
     pub server_key_path: Option<std::path::PathBuf>,
+    /// This server's DeviceID (for relay rediscovery by clients).
+    pub device_id: Option<String>,
+    /// Rendezvous server address (host:port) this server is registered on.
+    pub rendezvous_server: Option<String>,
 }
 
 /// Authenticated client info.
@@ -547,9 +551,7 @@ async fn send_auth_fail<S: AsyncWriteExt + Unpin>(
             success: false,
             error: Some(error.to_string()),
             version: Some(server_version.to_string()),
-            mux_enabled: None,
-            caps: None,
-            banner: None,
+            ..Default::default()
         };
         wire::send_json(stream, &result).await
     }
@@ -597,9 +599,7 @@ where
                 success: false,
                 error: Some(format!("unsupported auth type: {}", auth_req.auth_type)),
                 version: Some(ctx.server_version.clone()),
-                mux_enabled: None,
-                caps: None,
-                banner: None,
+                ..Default::default()
             };
             wire::send_json(stream, &result).await?;
             anyhow::bail!("unsupported auth type: {}", auth_req.auth_type);
@@ -700,9 +700,7 @@ where
                 success: false,
                 error: Some("TOTP required but not configured for this key".to_string()),
                 version: Some(ctx.server_version.clone()),
-                mux_enabled: None,
-                caps: None,
-                banner: None,
+                ..Default::default()
             };
             wire::send_json(stream, &result).await?;
             anyhow::bail!("TOTP required but no secret for key {}", key_fingerprint);
@@ -756,9 +754,7 @@ where
                     success: false,
                     error: Some("TOTP verification failed".to_string()),
                     version: Some(ctx.server_version.clone()),
-                    mux_enabled: None,
-                    caps: None,
-                    banner: None,
+                    ..Default::default()
                 };
                 wire::send_json(stream, &result).await?;
                 anyhow::bail!("TOTP verification failed for key {}", key_fingerprint);
@@ -782,6 +778,13 @@ where
         final_caps.push("binary-proto".to_string());
     }
 
+    // Always include informational caps (instance type, platform) — not negotiated
+    for info_cap in &["tray", "system", "screenshot", "window", "mouse", "keyboard"] {
+        if ctx.caps.iter().any(|c| c == *info_cap) && !final_caps.iter().any(|c| c == *info_cap) {
+            final_caps.push(info_cap.to_string());
+        }
+    }
+
     // 7. Send success
     let mux_enabled = if cfg!(windows) && _want_mux {
         Some(true)
@@ -791,10 +794,12 @@ where
 
     if use_binary {
         let cap_refs: Vec<&str> = final_caps.iter().map(|s| s.as_str()).collect();
-        let payload = mrsh_core::binproto::build_auth_ok(
+        let payload = mrsh_core::binproto::build_auth_ok_full(
             &ctx.server_version,
             &cap_refs,
             ctx.banner.as_deref(),
+            ctx.device_id.as_deref(),
+            ctx.rendezvous_server.as_deref(),
         );
         mrsh_core::binproto::send_msg(
             stream,
@@ -809,6 +814,8 @@ where
             mux_enabled,
             caps: Some(final_caps.clone()),
             banner: ctx.banner.clone(),
+            device_id: ctx.device_id.clone(),
+            rendezvous_server: ctx.rendezvous_server.clone(),
         };
         wire::send_json(stream, &result).await?;
     }
@@ -893,6 +900,8 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            device_id: Some("123456789".to_string()),
+            rendezvous_server: Some("rdv.test:21116".to_string()),
         }
     }
 

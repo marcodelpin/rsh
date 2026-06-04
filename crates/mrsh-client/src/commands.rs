@@ -1004,4 +1004,460 @@ mod tests {
         assert!(err.to_string().contains("disk full"));
         h.await.unwrap();
     }
+
+    // ── Additional check_response tests ─────────────────────────────
+
+    #[test]
+    fn check_response_error_no_message() {
+        // When error field is None, should report "unknown error"
+        let resp = Response {
+            success: false,
+            output: None,
+            error: None,
+            size: None,
+            binary: None,
+            gzip: None,
+        };
+        let err = check_response(&resp).unwrap_err();
+        assert!(err.to_string().contains("unknown error"));
+    }
+
+    #[test]
+    fn check_response_success_with_no_output() {
+        let resp = Response {
+            success: true,
+            output: None,
+            error: None,
+            size: None,
+            binary: None,
+            gzip: None,
+        };
+        assert!(check_response(&resp).is_ok());
+    }
+
+    #[test]
+    fn check_response_error_with_empty_string() {
+        let resp = Response {
+            success: false,
+            output: None,
+            error: Some("".to_string()),
+            size: None,
+            binary: None,
+            gzip: None,
+        };
+        // Even an empty error string should still fail
+        let err = check_response(&resp);
+        assert!(err.is_err());
+    }
+
+    // ── Additional build_request tests ──────────────────────────────
+
+    #[test]
+    fn build_request_all_none() {
+        let req = build_request("ping", None, None, None);
+        assert_eq!(req.req_type, "ping");
+        assert!(req.command.is_none());
+        assert!(req.path.is_none());
+        assert!(req.content.is_none());
+        assert!(req.binary.is_none());
+        assert!(req.gzip.is_none());
+        assert!(req.sync_type.is_none());
+        assert!(req.delta.is_none());
+        assert!(req.signatures.is_none());
+        assert!(req.paths.is_none());
+        assert!(req.batch_patches.is_none());
+        assert!(req.env_vars.is_none());
+    }
+
+    #[test]
+    fn simple_request_format() {
+        let req = simple_request("exec");
+        assert_eq!(req.req_type, "exec");
+        assert!(req.command.is_none());
+        assert!(req.path.is_none());
+        assert!(req.content.is_none());
+        assert!(req.binary.is_none());
+        assert!(req.env_vars.is_none());
+    }
+
+    #[test]
+    fn simple_request_preserves_type_string() {
+        let req = simple_request("self-update");
+        assert_eq!(req.req_type, "self-update");
+    }
+
+    // ── Additional error propagation tests ──────────────────────────
+
+    #[tokio::test]
+    async fn cat_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("no such file"));
+
+        let err = cat(&mut client, "/nonexistent").await.unwrap_err();
+        assert!(err.to_string().contains("no such file"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("display not found"));
+
+        let err = screenshot(&mut client, 5, 80, 50).await.unwrap_err();
+        assert!(err.to_string().contains("display not found"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_kill_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("session not found"));
+
+        let err = session_kill(&mut client, "nosuchid").await.unwrap_err();
+        assert!(err.to_string().contains("session not found"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn self_update_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("binary not found"));
+
+        let err = self_update(&mut client, "/bad/path").await.unwrap_err();
+        assert!(err.to_string().contains("binary not found"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("input not supported"));
+
+        let err = input(&mut client, "mouse", "click", "100,200").await.unwrap_err();
+        assert!(err.to_string().contains("input not supported"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("not available"));
+
+        let err = native(&mut client, "info").await.unwrap_err();
+        assert!(err.to_string().contains("not available"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_error_propagates() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, err_response("plugin not loaded"));
+
+        let err = plugin(&mut client, "status foo").await.unwrap_err();
+        assert!(err.to_string().contains("plugin not loaded"));
+        h.await.unwrap();
+    }
+
+    // ── Edge cases ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ls_invalid_json_returns_parse_error() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, ok_response("not valid json"));
+
+        let err = ls(&mut client, "/tmp").await.unwrap_err();
+        assert!(err.to_string().contains("parse ls response"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cat_binary_invalid_base64_returns_error() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |_| {}, ok_response_binary("!!!not-base64!!!"));
+
+        let err = cat(&mut client, "/bin/bad").await.unwrap_err();
+        assert!(err.to_string().contains("decode base64"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_success_with_empty_output() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |req| {
+            assert_eq!(req.req_type, "exec");
+        }, ok_response(""));
+
+        let result = exec(&mut client, "true", &[]).await.unwrap();
+        assert_eq!(result, "");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_success_output_none_defaults_empty() {
+        let (mut client, server) = mock_client();
+        let resp = Response {
+            success: true,
+            output: None,
+            error: None,
+            size: None,
+            binary: None,
+            gzip: None,
+        };
+        let h = spawn_mock_server(server, |_| {}, resp);
+
+        let result = exec(&mut client, "true", &[]).await.unwrap();
+        assert_eq!(result, "");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cat_non_binary_returns_raw_bytes() {
+        // When binary flag is false/None, output is returned as raw UTF-8 bytes
+        let (mut client, server) = mock_client();
+        let resp = Response {
+            success: true,
+            output: Some("plain text content".to_string()),
+            error: None,
+            size: None,
+            binary: Some(false),
+            gzip: None,
+        };
+        let h = spawn_mock_server(server, |_| {}, resp);
+
+        let data = cat(&mut client, "/etc/hostname").await.unwrap();
+        assert_eq!(data, b"plain text content");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_file_empty_content() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, move |req| {
+            assert_eq!(req.req_type, "write");
+            assert_eq!(req.path.as_deref(), Some("/tmp/empty"));
+            // base64 of empty slice is ""
+            assert_eq!(req.content.as_deref(), Some(""));
+            assert_eq!(req.binary, Some(true));
+        }, ok_response(""));
+
+        write_file(&mut client, "/tmp/empty", b"").await.unwrap();
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn screenshot_parameters_encoded_correctly() {
+        let (mut client, server) = mock_client();
+        let fake_data = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&fake_data);
+        let h = spawn_mock_server(server, |req| {
+            assert_eq!(req.req_type, "screenshot");
+            assert_eq!(req.command.as_deref(), Some("2"));   // display 2
+            assert_eq!(req.content.as_deref(), Some("100")); // quality 100
+            assert_eq!(req.path.as_deref(), Some("75"));     // scale 75
+        }, ok_response(&b64));
+
+        let data = screenshot(&mut client, 2, 100, 75).await.unwrap();
+        assert_eq!(data, fake_data);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn input_with_multi_word_args() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |req| {
+            assert_eq!(req.req_type, "input");
+            // "key type Hello World" — command=key, action=type, args="Hello World"
+            assert_eq!(req.command.as_deref(), Some("key type Hello World"));
+        }, ok_response("ok"));
+
+        let result = input(&mut client, "key", "type", "Hello World").await.unwrap();
+        assert_eq!(result, "ok");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_action_formats() {
+        // Test various service actions format correctly
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |req| {
+            assert_eq!(req.req_type, "native");
+            assert_eq!(req.command.as_deref(), Some("service restart sshd"));
+        }, ok_response("restarted"));
+
+        let result = service(&mut client, "restart", Some("sshd")).await.unwrap();
+        assert_eq!(result, "restarted");
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_multiple_env_vars() {
+        let (mut client, server) = mock_client();
+        let h = spawn_mock_server(server, |req| {
+            let env = req.env_vars.as_ref().unwrap();
+            assert_eq!(env.len(), 3);
+            assert_eq!(env[0], "A=1");
+            assert_eq!(env[1], "B=2");
+            assert_eq!(env[2], "C=3");
+        }, ok_response("ok"));
+
+        let envs = vec!["A=1".to_string(), "B=2".to_string(), "C=3".to_string()];
+        exec(&mut client, "env", &envs).await.unwrap();
+        h.await.unwrap();
+    }
+
+    // ── Log query (binary protocol) ─────────────────────────────────
+
+    /// Spawn a mock binary-protocol server for log_query tests.
+    /// Reads the LOG_QUERY message, validates it, then sends the provided messages.
+    fn spawn_log_query_server(
+        mut server: DuplexStream,
+        validate: impl FnOnce(&[u8]) + Send + 'static,
+        responses: Vec<(u8, Vec<u8>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        use mrsh_core::binproto;
+        tokio::spawn(async move {
+            // Read the LOG_QUERY message
+            let (type_id, payload) = binproto::recv_msg(&mut server).await.unwrap();
+            assert_eq!(type_id, binproto::msg::LOG_QUERY);
+            validate(&payload);
+            // Send each response message
+            for (msg_type, data) in responses {
+                binproto::send_msg(&mut server, msg_type, &data).await.unwrap();
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn log_query_data_then_end() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+
+        let line1 = b"2026-03-25 error: something failed";
+        let line2 = b"2026-03-25 error: another failure";
+        let log_end = binproto::build_log_end(1000, 2, 5000);
+
+        let h = spawn_log_query_server(server, |payload| {
+            let (path, pattern, flags, tail, _offset, max) =
+                binproto::parse_log_query(payload).unwrap();
+            assert_eq!(path, "/var/log/app.log");
+            assert_eq!(pattern, "error");
+            assert_eq!(flags, 0);
+            assert_eq!(tail, 100);
+            assert_eq!(max, 50);
+        }, vec![
+            (msg::LOG_DATA, line1.to_vec()),
+            (msg::LOG_DATA, line2.to_vec()),
+            (msg::LOG_END, log_end),
+        ]);
+
+        let (scanned, matched) = log_query(&mut client, "/var/log/app.log", "error", 0, 100, 50)
+            .await
+            .unwrap();
+        assert_eq!(scanned, 1000);
+        assert_eq!(matched, 2);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_query_no_matches() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+        let log_end = binproto::build_log_end(500, 0, 2000);
+
+        let h = spawn_log_query_server(server, |_| {}, vec![
+            (msg::LOG_END, log_end),
+        ]);
+
+        let (scanned, matched) = log_query(&mut client, "/var/log/app.log", "nonexistent", 0, 50, 10)
+            .await
+            .unwrap();
+        assert_eq!(scanned, 500);
+        assert_eq!(matched, 0);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_query_server_error() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+        let error_payload = binproto::build_error("file not found");
+
+        let h = spawn_log_query_server(server, |_| {}, vec![
+            (msg::ERROR, error_payload),
+        ]);
+
+        let err = log_query(&mut client, "/nonexistent.log", "pattern", 0, 100, 50)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("file not found"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_query_unexpected_message_type() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+
+        let h = spawn_log_query_server(server, |_| {}, vec![
+            (msg::PING, vec![]),  // unexpected message type for log_query
+        ]);
+
+        let err = log_query(&mut client, "/var/log/test.log", "x", 0, 10, 5)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unexpected message type"));
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_query_with_flags() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+        let flags = binproto::LOG_FLAG_CASE_INSENSITIVE | binproto::LOG_FLAG_INVERT;
+        let log_end = binproto::build_log_end(200, 5, 1000);
+
+        let h = spawn_log_query_server(server, move |payload| {
+            let (_path, _pattern, f, _tail, _offset, _max) =
+                binproto::parse_log_query(payload).unwrap();
+            assert_eq!(f, flags);
+        }, vec![
+            (msg::LOG_END, log_end),
+        ]);
+
+        let (scanned, matched) = log_query(&mut client, "/var/log/test.log", "debug", flags, 0, 100)
+            .await
+            .unwrap();
+        assert_eq!(scanned, 200);
+        assert_eq!(matched, 5);
+        h.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn log_query_data_lines_printed_before_end() {
+        use mrsh_core::binproto::{self, msg};
+
+        let (mut client, server) = mock_client();
+        // Server sends 3 LOG_DATA lines, then LOG_END with matched=3
+        let log_end = binproto::build_log_end(100, 3, 500);
+
+        let h = spawn_log_query_server(server, |_| {}, vec![
+            (msg::LOG_DATA, b"line one".to_vec()),
+            (msg::LOG_DATA, b"line two".to_vec()),
+            (msg::LOG_DATA, b"line three".to_vec()),
+            (msg::LOG_END, log_end),
+        ]);
+
+        let (scanned, matched) = log_query(&mut client, "/log", "pattern", 0, 50, 100)
+            .await
+            .unwrap();
+        // LOG_END matched count is authoritative (overwrites incremental counter)
+        assert_eq!(scanned, 100);
+        assert_eq!(matched, 3);
+        h.await.unwrap();
+    }
 }

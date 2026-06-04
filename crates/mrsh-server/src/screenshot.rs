@@ -118,7 +118,11 @@ fn capture_screen_linux(_display: u32, quality: u8, _scale: u8) -> anyhow::Resul
     let has_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
     let has_x11 = std::env::var("DISPLAY").is_ok();
     if !has_wayland && !has_x11 {
-        anyhow::bail!("no display server available (DISPLAY and WAYLAND_DISPLAY not set)");
+        anyhow::bail!(
+            "screenshot failed: no display server (DISPLAY and WAYLAND_DISPLAY not set).\n\
+             This is a headless Linux server — screenshots require a graphical desktop.\n\
+             For Windows hosts, connect to the tray instance: mrsh -h <host> -p 9822 ss"
+        );
     }
 
     let tmp_path = "/tmp/rsh-screenshot.png";
@@ -158,12 +162,16 @@ fn capture_screen_windows(_display: u32, quality: u8, scale: u8) -> anyhow::Resu
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    // Get screen dimensions
+    // Check if we have a desktop (SYSTEM service in session 0 does not)
+    if crate::is_session_zero() {
+        anyhow::bail!("{}", crate::session_zero_hint("ss"));
+    }
+
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
 
     if width == 0 || height == 0 {
-        anyhow::bail!("could not get screen dimensions");
+        anyhow::bail!("could not get screen dimensions (display may be locked or unavailable)");
     }
 
     // Scale

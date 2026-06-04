@@ -348,4 +348,447 @@ mod tests {
         assert!(err.contains("empty command"));
         handle.await.unwrap().unwrap();
     }
+
+    // ── build_command tests ─────────────────────────────────────
+
+    #[test]
+    fn build_command_uses_sh_on_linux() {
+        let cmd = build_command("echo test");
+        // On non-windows, build_command creates `sh -c <command>`
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "sh");
+        let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
+        assert_eq!(args, vec!["-c", "echo test"]);
+    }
+
+    #[test]
+    fn build_command_preserves_complex_command() {
+        let complex = "ls -la /tmp && echo done | grep done";
+        let cmd = build_command(complex);
+        let std_cmd = cmd.as_std();
+        let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], complex);
+    }
+
+    #[test]
+    fn build_command_with_empty_string() {
+        // build_command itself does not validate — that's handle_exec's job.
+        // Verify it still produces a valid Command structure.
+        let cmd = build_command("");
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "sh");
+        let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
+        assert_eq!(args, vec!["-c", ""]);
+    }
+
+    // ── is_dangerous_env_var exhaustive coverage ────────────────
+
+    #[test]
+    fn blocks_all_documented_dangerous_vars() {
+        // Every single entry in the matches! block
+        let dangerous = [
+            "PATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "SHELL",
+            "COMSPEC",
+            "IFS",
+            "PSMODULEPATH",
+            "PSModulePath",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "HOME",
+            "USERPROFILE",
+            "USER",
+            "USERNAME",
+            "LOGNAME",
+        ];
+        for var in &dangerous {
+            assert!(
+                is_dangerous_env_var(var),
+                "{} should be blocked",
+                var
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_vars_case_insensitive() {
+        // The function does .to_uppercase() so lowercase/mixed should also block
+        assert!(is_dangerous_env_var("path"));
+        assert!(is_dangerous_env_var("Path"));
+        assert!(is_dangerous_env_var("ld_preload"));
+        assert!(is_dangerous_env_var("Ld_Preload"));
+        assert!(is_dangerous_env_var("shell"));
+        assert!(is_dangerous_env_var("Shell"));
+        assert!(is_dangerous_env_var("comspec"));
+        assert!(is_dangerous_env_var("ifs"));
+        assert!(is_dangerous_env_var("home"));
+        assert!(is_dangerous_env_var("Home"));
+        assert!(is_dangerous_env_var("username"));
+        assert!(is_dangerous_env_var("logname"));
+        assert!(is_dangerous_env_var("all_proxy"));
+        assert!(is_dangerous_env_var("no_proxy"));
+        assert!(is_dangerous_env_var("userprofile"));
+    }
+
+    #[test]
+    fn allows_vars_with_dangerous_substring() {
+        // Vars that contain a dangerous name as substring should NOT be blocked
+        assert!(!is_dangerous_env_var("MY_PATH"));
+        assert!(!is_dangerous_env_var("PATH_EXTRA"));
+        assert!(!is_dangerous_env_var("MY_HOME_DIR"));
+        assert!(!is_dangerous_env_var("CUSTOM_USER"));
+        assert!(!is_dangerous_env_var("NEW_SHELL_VAR"));
+        assert!(!is_dangerous_env_var("NOT_HTTP_PROXY_REALLY"));
+    }
+
+    #[test]
+    fn allows_common_safe_env_vars() {
+        let safe = [
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "TERM",
+            "DISPLAY",
+            "EDITOR",
+            "VISUAL",
+            "CARGO_HOME",
+            "GOPATH",
+            "NODE_ENV",
+            "APP_CONFIG",
+            "DATABASE_URL",
+            "PORT",
+            "DEBUG",
+            "VERBOSE",
+        ];
+        for var in &safe {
+            assert!(
+                !is_dangerous_env_var(var),
+                "{} should be allowed",
+                var
+            );
+        }
+    }
+
+    #[test]
+    fn dangerous_var_empty_name() {
+        assert!(!is_dangerous_env_var(""));
+    }
+
+    // ── handle_exec response format tests ───────────────────────
+
+    #[tokio::test]
+    async fn exec_empty_command_response_fields() {
+        let resp = handle_exec("", &[]).await;
+        assert!(!resp.success);
+        assert!(resp.output.is_none());
+        assert_eq!(resp.error, Some("empty command".to_string()));
+        assert!(resp.size.is_none());
+        assert!(resp.binary.is_none());
+        assert!(resp.gzip.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_success_response_fields() {
+        let resp = handle_exec("echo ok", &[]).await;
+        assert!(resp.success);
+        assert!(resp.output.is_some());
+        assert!(resp.error.is_none());
+        assert!(resp.size.is_none());
+        assert!(resp.binary.is_none());
+        assert!(resp.gzip.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_failure_response_has_output_not_error() {
+        // A command that runs but exits non-zero still has output, not error
+        let resp = handle_exec("echo fail_msg >&2; false", &[]).await;
+        assert!(!resp.success);
+        assert!(resp.output.is_some()); // combined stdout+stderr
+        assert!(resp.error.is_none()); // error is only for spawn failures
+    }
+
+    // ── handle_exec safety guard integration ────────────────────
+
+    #[tokio::test]
+    async fn exec_blocks_taskkill_rsh() {
+        let resp = handle_exec("taskkill /im rsh.exe /f", &[]).await;
+        assert!(!resp.success);
+        assert!(resp.output.is_none());
+        let err = resp.error.unwrap();
+        assert!(err.contains("BLOCKED"), "expected BLOCKED, got: {}", err);
+        assert!(err.contains("safety guard"));
+    }
+
+    #[tokio::test]
+    async fn exec_blocks_stop_service_mrsh() {
+        let resp = handle_exec("Stop-Service mrsh", &[]).await;
+        assert!(!resp.success);
+        let err = resp.error.unwrap();
+        assert!(err.contains("BLOCKED"));
+    }
+
+    #[tokio::test]
+    async fn exec_blocks_net_stop_rsh() {
+        let resp = handle_exec("net stop rsh", &[]).await;
+        assert!(!resp.success);
+        let err = resp.error.unwrap();
+        assert!(err.contains("BLOCKED"));
+    }
+
+    #[tokio::test]
+    async fn exec_blocks_sc_delete_mrsh() {
+        let resp = handle_exec("sc delete mrsh", &[]).await;
+        assert!(!resp.success);
+        let err = resp.error.unwrap();
+        assert!(err.contains("BLOCKED"));
+    }
+
+    #[tokio::test]
+    async fn exec_blocks_remove_item_rsh_exe() {
+        let resp = handle_exec("Remove-Item C:\\ProgramData\\mrsh\\rsh.exe", &[]).await;
+        assert!(!resp.success);
+        let err = resp.error.unwrap();
+        assert!(err.contains("BLOCKED"));
+    }
+
+    #[tokio::test]
+    async fn exec_allows_safe_commands() {
+        // Verify safety guard does NOT block normal commands
+        let resp = handle_exec("echo hello_world", &[]).await;
+        assert!(resp.success);
+        assert!(resp.output.unwrap().contains("hello_world"));
+    }
+
+    // ── handle_exec env var filtering ───────────────────────────
+
+    #[tokio::test]
+    async fn exec_dangerous_env_var_silently_dropped() {
+        // PATH is dangerous; command should still succeed but not see the override
+        // Use printenv which lists env vars. PATH override should be dropped,
+        // so the default PATH is used (not /evil/path).
+        let resp = handle_exec(
+            "printenv PATH",
+            &["PATH=/evil/path".to_string()],
+        )
+        .await;
+        // Command succeeds (printenv PATH still works with inherited PATH)
+        assert!(resp.success);
+        let output = resp.output.unwrap();
+        assert!(
+            !output.contains("/evil/path"),
+            "PATH override should have been blocked, got: {}",
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_safe_env_var_passed_through() {
+        let resp = handle_exec(
+            "printenv MY_CUSTOM_VAR",
+            &["MY_CUSTOM_VAR=secret42".to_string()],
+        )
+        .await;
+        assert!(resp.success);
+        assert!(
+            resp.output.unwrap().contains("secret42"),
+            "safe env var should be passed to command"
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_malformed_env_var_ignored() {
+        // Entries without '=' should be silently ignored
+        let resp = handle_exec("echo works", &["NO_EQUALS_SIGN".to_string()]).await;
+        assert!(resp.success);
+        assert!(resp.output.unwrap().contains("works"));
+    }
+
+    #[tokio::test]
+    async fn exec_multiple_env_vars_mixed() {
+        // Mix of safe, dangerous, and malformed env vars
+        let env_vars = vec![
+            "SAFE_ONE=alpha".to_string(),
+            "PATH=/bad".to_string(),         // dangerous, dropped
+            "MALFORMED".to_string(),          // no '=', ignored
+            "SAFE_TWO=beta".to_string(),
+            "LD_PRELOAD=/evil.so".to_string(), // dangerous, dropped
+        ];
+        let resp = handle_exec(
+            "echo ${SAFE_ONE}_${SAFE_TWO}",
+            &env_vars,
+        )
+        .await;
+        assert!(resp.success);
+        let output = resp.output.unwrap();
+        assert!(output.contains("alpha"), "SAFE_ONE should be set");
+        assert!(output.contains("beta"), "SAFE_TWO should be set");
+    }
+
+    #[tokio::test]
+    async fn exec_env_var_with_equals_in_value() {
+        // Value itself contains '=' — split_once should handle this
+        let resp = handle_exec(
+            "printenv CONN_STR",
+            &["CONN_STR=host=localhost;port=5432".to_string()],
+        )
+        .await;
+        assert!(resp.success);
+        assert!(
+            resp.output.unwrap().contains("host=localhost;port=5432"),
+            "value with embedded '=' should be preserved"
+        );
+    }
+
+    // ── handle_exec_stream safety guard integration ─────────────
+
+    #[tokio::test]
+    async fn exec_stream_blocks_dangerous_command() {
+        use mrsh_core::binproto;
+
+        let (mut reader, writer) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(async move {
+            handle_exec_stream(
+                "taskkill /im rsh.exe /f",
+                &[],
+                &mut tokio::io::BufWriter::new(writer),
+            )
+            .await
+        });
+
+        let (type_id, data) = binproto::recv_msg(&mut reader).await.unwrap();
+        assert_eq!(type_id, msg::ERROR);
+        let err = binproto::parse_error(&data).unwrap();
+        assert!(err.contains("BLOCKED"), "expected BLOCKED, got: {}", err);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stream_failing_command() {
+        use mrsh_core::binproto;
+
+        let (mut reader, writer) = tokio::io::duplex(65536);
+        let handle = tokio::spawn(async move {
+            handle_exec_stream(
+                "false",
+                &[],
+                &mut tokio::io::BufWriter::new(writer),
+            )
+            .await
+        });
+
+        // Read all messages until EXEC_EXIT
+        let exit_code = loop {
+            let (type_id, data) = binproto::recv_msg(&mut reader).await.unwrap();
+            match type_id {
+                msg::EXEC_STDOUT | msg::EXEC_STDERR => {}
+                msg::EXEC_EXIT => {
+                    break u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                }
+                _ => panic!("unexpected msg type 0x{:02x}", type_id),
+            }
+        };
+        assert_eq!(exit_code, 1, "false should exit with code 1");
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stream_with_env_vars() {
+        use mrsh_core::binproto;
+
+        let (mut reader, writer) = tokio::io::duplex(65536);
+        let env = vec!["STREAM_TEST_VAR=streamed123".to_string()];
+        let handle = tokio::spawn(async move {
+            handle_exec_stream(
+                "printenv STREAM_TEST_VAR",
+                &env,
+                &mut tokio::io::BufWriter::new(writer),
+            )
+            .await
+        });
+
+        let mut got_value = false;
+        loop {
+            let (type_id, data) = binproto::recv_msg(&mut reader).await.unwrap();
+            match type_id {
+                msg::EXEC_STDOUT => {
+                    let s = String::from_utf8_lossy(&data);
+                    if s.contains("streamed123") {
+                        got_value = true;
+                    }
+                }
+                msg::EXEC_STDERR => {}
+                msg::EXEC_EXIT => break,
+                _ => panic!("unexpected msg type 0x{:02x}", type_id),
+            }
+        }
+        assert!(got_value, "env var should appear in stream output");
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_stream_dangerous_env_var_blocked() {
+        use mrsh_core::binproto;
+
+        let (mut reader, writer) = tokio::io::duplex(65536);
+        let env = vec!["LD_PRELOAD=/evil.so".to_string()];
+        let handle = tokio::spawn(async move {
+            handle_exec_stream(
+                "printenv LD_PRELOAD",
+                &env,
+                &mut tokio::io::BufWriter::new(writer),
+            )
+            .await
+        });
+
+        let mut saw_evil = false;
+        let exit_code = loop {
+            let (type_id, data) = binproto::recv_msg(&mut reader).await.unwrap();
+            match type_id {
+                msg::EXEC_STDOUT => {
+                    let s = String::from_utf8_lossy(&data);
+                    if s.contains("/evil.so") {
+                        saw_evil = true;
+                    }
+                }
+                msg::EXEC_STDERR => {}
+                msg::EXEC_EXIT => {
+                    break u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                }
+                _ => panic!("unexpected msg type 0x{:02x}", type_id),
+            }
+        };
+        assert!(!saw_evil, "LD_PRELOAD should have been blocked");
+        // printenv for unset var exits non-zero
+        assert_eq!(exit_code, 1);
+        handle.await.unwrap().unwrap();
+    }
+
+    // ── handle_exec stderr capture ──────────────────────────────
+
+    #[tokio::test]
+    async fn exec_captures_stderr_in_output() {
+        let resp = handle_exec("echo stderr_test >&2", &[]).await;
+        // stderr is combined into output
+        assert!(resp.output.unwrap().contains("stderr_test"));
+    }
+
+    #[tokio::test]
+    async fn exec_combines_stdout_and_stderr() {
+        let resp =
+            handle_exec("echo OUT_PART && echo ERR_PART >&2", &[]).await;
+        let output = resp.output.unwrap();
+        assert!(output.contains("OUT_PART"), "should contain stdout");
+        assert!(output.contains("ERR_PART"), "should contain stderr");
+    }
 }

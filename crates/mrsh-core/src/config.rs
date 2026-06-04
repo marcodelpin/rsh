@@ -435,6 +435,57 @@ impl Config {
     }
 
     /// Save config to the default path (~/.mrsh/config).
+    /// Update a host's DeviceID and rendezvous server from auth response.
+    /// Creates a new Host block if none exists for this hostname.
+    /// Returns true if the config was modified.
+    pub fn update_host_relay_info(
+        &mut self,
+        hostname: &str,
+        device_id: Option<&str>,
+        rendezvous_server: Option<&str>,
+    ) -> bool {
+        if device_id.is_none() && rendezvous_server.is_none() {
+            return false;
+        }
+
+        // Find existing host by pattern or hostname
+        let existing = self.hosts.iter_mut().find(|h| {
+            h.pattern.eq_ignore_ascii_case(hostname)
+                || h.hostname.as_deref().map(|n| n.eq_ignore_ascii_case(hostname)).unwrap_or(false)
+        });
+
+        if let Some(host) = existing {
+            let mut changed = false;
+            if let Some(id) = device_id {
+                if host.device_id.as_deref() != Some(id) {
+                    host.device_id = Some(id.to_string());
+                    changed = true;
+                }
+            }
+            if let Some(rdv) = rendezvous_server {
+                if host.rendezvous_server.as_deref() != Some(rdv) {
+                    host.rendezvous_server = Some(rdv.to_string());
+                    changed = true;
+                }
+            }
+            changed
+        } else {
+            // Create new Host block
+            let mut host = HostConfig {
+                pattern: hostname.to_string(),
+                ..Default::default()
+            };
+            if let Some(id) = device_id {
+                host.device_id = Some(id.to_string());
+            }
+            if let Some(rdv) = rendezvous_server {
+                host.rendezvous_server = Some(rdv.to_string());
+            }
+            self.hosts.push(host);
+            true
+        }
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         let path = Self::default_path().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "cannot determine config path")

@@ -649,6 +649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array 0.14.7",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1793,7 +1794,7 @@ dependencies = [
 
 [[package]]
 name = "mrsh"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1806,6 +1807,7 @@ dependencies = [
  "mrsh-core",
  "mrsh-relay",
  "mrsh-server",
+ "mrsh-transfer",
  "nix",
  "notify",
  "quinn",
@@ -1826,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "mrsh-client"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1859,7 +1861,7 @@ dependencies = [
 
 [[package]]
 name = "mrsh-core"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
  "anyhow",
  "base64",
@@ -1887,8 +1889,9 @@ dependencies = [
 
 [[package]]
 name = "mrsh-relay"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "hex",
  "prost",
@@ -1898,11 +1901,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]
 name = "mrsh-server"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
  "adler32",
  "anyhow",
@@ -1939,7 +1943,7 @@ dependencies = [
 
 [[package]]
 name = "mrsh-transfer"
-version = "1.6.2"
+version = "1.7.9"
 dependencies = [
  "adler32",
  "anyhow",
@@ -4617,6 +4621,18 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
+]
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
 ]
 
 [[package]]

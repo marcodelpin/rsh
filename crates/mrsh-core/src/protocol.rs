@@ -51,7 +51,7 @@ pub struct TotpResponse {
 }
 
 /// Server auth result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +64,12 @@ pub struct AuthResult {
     pub caps: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub banner: Option<String>,
+    /// Server's DeviceID for relay rediscovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// Server's rendezvous server address (host:port).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendezvous_server: Option<String>,
 }
 
 /// Client command request.
@@ -271,6 +277,8 @@ mod tests {
             mux_enabled: Some(true),
             caps: Some(vec!["self-update".to_string()]),
             banner: None,
+            device_id: Some("749938928".to_string()),
+            rendezvous_server: Some("rendezvous.example.com:21116".to_string()),
         };
         let json = serde_json::to_string(&ar).unwrap();
         let decoded: AuthResult = serde_json::from_str(&json).unwrap();

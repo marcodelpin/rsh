@@ -143,6 +143,98 @@ where
     Ok(())
 }
 
+/// Run a persistent local TCP tunnel (ssh -L behavior).
+///
+/// Binds a local listener and for each accepted connection:
+/// 1. Calls `connect_fn` to establish a new authenticated mrsh stream
+/// 2. Sends a "connect" request for the remote target
+/// 3. Relays bidirectionally until the connection closes
+/// 4. Loops back to accept the next connection
+///
+/// This is the correct behavior for web UIs, databases, etc. where
+/// multiple sequential or concurrent connections are needed.
+pub async fn run_tunnel_persistent<F, Fut, S>(
+    connect_fn: F,
+    local_bind: &str,
+    remote_target: &str,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<S>>,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let listener = TcpListener::bind(local_bind)
+        .await
+        .with_context(|| format!("bind local tunnel endpoint: {}", local_bind))?;
+
+    let local_addr = listener.local_addr().context("get local address")?;
+    eprintln!(
+        "tunnel listening on {} → forwarding to {} (persistent, Ctrl+C to stop)",
+        local_addr, remote_target
+    );
+
+    loop {
+        let (local_stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("tunnel accept error: {}", e);
+                continue;
+            }
+        };
+        local_stream.set_nodelay(true).ok();
+        info!("tunnel: connection from {}", peer);
+
+        // Establish new mrsh connection for this tunnel
+        let mut stream = match connect_fn().await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("tunnel: failed to connect to server: {}", e);
+                continue;
+            }
+        };
+
+        // Send "connect" request
+        let connect_req = protocol::Request {
+            req_type: "connect".to_string(),
+            command: Some(remote_target.to_string()),
+            path: None,
+            content: None,
+            binary: None,
+            gzip: None,
+            sync_type: None,
+            delta: None,
+            signatures: None,
+            paths: None,
+            batch_patches: None,
+            env_vars: None,
+        };
+        if let Err(e) = wire::send_json(&mut stream, &connect_req).await {
+            error!("tunnel: send connect: {}", e);
+            continue;
+        }
+
+        let ack: protocol::Response = match wire::recv_json(&mut stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("tunnel: recv ack: {}", e);
+                continue;
+            }
+        };
+        if !ack.success {
+            error!("tunnel: server rejected: {}", ack.error.unwrap_or_default());
+            continue;
+        }
+
+        // Spawn relay in background — accept next connection immediately
+        let target = remote_target.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = relay_tunnel(&mut stream, local_stream).await {
+                debug!("tunnel relay to {} ended: {}", target, e);
+            }
+        });
+    }
+}
+
 /// Relay traffic between a local TCP stream and the mrsh wire protocol.
 ///
 /// - Local → rsh: read raw TCP bytes, send as length-prefixed frames

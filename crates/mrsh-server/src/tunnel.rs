@@ -9,7 +9,11 @@ use tracing::{debug, info};
 use mrsh_core::wire;
 
 /// Check if a tunnel target is blocked (SSRF protection).
-/// Blocks: loopback, unspecified, link-local, cloud metadata IPs, localhost names.
+/// Blocks: unspecified, link-local, cloud metadata IPs, metadata hostnames.
+/// NOTE: localhost/loopback is ALLOWED for authenticated tunnel requests.
+/// The main use case for tunnels IS forwarding to localhost services
+/// (databases, web UIs, Docker ports). Authentication + PermitOpen
+/// provide access control. Cloud metadata endpoints remain blocked.
 fn is_blocked_target(target: &str) -> bool {
     // Split host:port — handle both "host:port" and "[ipv6]:port"
     let host = if target.starts_with('[') {
@@ -23,21 +27,16 @@ fn is_blocked_target(target: &str) -> bool {
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         return match ip {
             std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_unspecified()
-                    || v4.is_link_local()
+                v4.is_unspecified()
                     // Cloud metadata: AWS/GCP/Azure 169.254.169.254
                     || v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
                     // Azure Wire Server
                     || v4 == std::net::Ipv4Addr::new(168, 63, 129, 16)
+                    // Link-local metadata range (169.254.x.x) but not all link-local
+                    || (v4.is_link_local() && v4.octets()[2] == 169)
             }
             std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    // IPv4-mapped loopback (::ffff:127.0.0.1)
-                    || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-                    // IPv4-mapped link-local
-                    || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
+                v6.is_unspecified()
                     // IPv4-mapped cloud metadata
                     || v6.to_ipv4_mapped().is_some_and(|v4| {
                         v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
@@ -46,10 +45,9 @@ fn is_blocked_target(target: &str) -> bool {
         };
     }
 
-    // Block "localhost" and metadata hostnames by name
+    // Block cloud metadata hostnames (but NOT localhost — legitimate tunnel target)
     let host_lower = host.to_ascii_lowercase();
-    host_lower == "localhost"
-        || host_lower == "metadata.google.internal"
+    host_lower == "metadata.google.internal"
         || host_lower == "metadata.google"
         || host_lower.ends_with(".internal")
             && host_lower.contains("metadata")
@@ -83,15 +81,25 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     if is_blocked_target(target) {
-        anyhow::bail!("tunnel target blocked (loopback/unspecified): {}", target);
+        anyhow::bail!("tunnel target blocked (cloud metadata/unspecified): {}", target);
     }
 
-    info!("tunnel connect to {}", target);
+    // Normalize "localhost" → "127.0.0.1" to avoid IPv6 ::1 resolution.
+    // Many services (WSL, Docker) listen on IPv4 only. DNS resolves localhost
+    // to ::1 first (AAAA before A), causing connection refused on IPv4-only listeners.
+    let resolved_target = if target.starts_with("localhost:") {
+        target.replacen("localhost", "127.0.0.1", 1)
+    } else {
+        target.to_string()
+    };
 
-    let target_stream = TcpStream::connect(target)
+    info!("tunnel connect to {} (resolved: {})", target, resolved_target);
+
+    let target_stream = TcpStream::connect(&resolved_target)
         .await
-        .context(format!("connect to {}", target))?;
+        .context(format!("connect to {}", resolved_target))?;
     target_stream.set_nodelay(true).ok();
+    info!("tunnel: connected to {}, starting relay", resolved_target);
 
     let (target_read, target_write) = tokio::io::split(target_stream);
 
@@ -127,9 +135,12 @@ where
                         }
                         target_write.write_all(&data).await
                             .context("write to target")?;
+                        target_write.flush().await
+                            .context("flush to target")?;
+                        debug!("tunnel: client→target {} bytes", data.len());
                     }
-                    Err(_) => {
-                        debug!("tunnel: client disconnected");
+                    Err(e) => {
+                        debug!("tunnel: client disconnected: {}", e);
                         break;
                     }
                 }
@@ -145,6 +156,7 @@ where
                         break;
                     }
                     Ok(n) => {
+                        debug!("tunnel: target→client {} bytes", n);
                         wire::send_message(rsh_stream, &target_buf[..n]).await
                             .context("send to client")?;
                     }
@@ -184,9 +196,10 @@ mod tests {
     // --- is_blocked_target unit tests ---
 
     #[test]
-    fn blocks_ipv4_loopback() {
-        assert!(is_blocked_target("127.0.0.1:8080"));
-        assert!(is_blocked_target("127.0.0.2:80"));
+    fn allows_ipv4_loopback() {
+        // Loopback is the primary tunnel use case (forward to local services)
+        assert!(!is_blocked_target("127.0.0.1:8080"));
+        assert!(!is_blocked_target("127.0.0.2:80"));
     }
 
     #[test]
@@ -195,20 +208,20 @@ mod tests {
     }
 
     #[test]
-    fn blocks_ipv6_loopback() {
-        assert!(is_blocked_target("[::1]:80"));
+    fn allows_ipv6_loopback() {
+        assert!(!is_blocked_target("[::1]:80"));
     }
 
     #[test]
-    fn blocks_localhost_name() {
-        assert!(is_blocked_target("localhost:80"));
-        assert!(is_blocked_target("LOCALHOST:443"));
+    fn allows_localhost_name() {
+        // localhost is the primary tunnel target (databases, web UIs, Docker)
+        assert!(!is_blocked_target("localhost:80"));
+        assert!(!is_blocked_target("LOCALHOST:443"));
     }
 
     #[test]
-    fn blocks_ipv4_link_local() {
-        assert!(is_blocked_target("169.254.1.1:80"));
-        assert!(is_blocked_target("169.254.255.255:80"));
+    fn blocks_cloud_metadata() {
+        assert!(is_blocked_target("169.254.169.254:80"));
     }
 
     #[test]
@@ -222,8 +235,8 @@ mod tests {
     }
 
     #[test]
-    fn blocks_ipv6_mapped_loopback() {
-        assert!(is_blocked_target("[::ffff:127.0.0.1]:80"));
+    fn allows_ipv6_mapped_loopback() {
+        assert!(!is_blocked_target("[::ffff:127.0.0.1]:80"));
     }
 
     #[test]
@@ -240,14 +253,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_connect_rejects_loopback() {
+    fn handle_connect_rejects_unspecified() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async {
             let (mut _client, mut server) = tokio::io::duplex(4096);
-            let result = handle_connect(&mut server, "127.0.0.1:80").await;
+            let result = handle_connect(&mut server, "0.0.0.0:80").await;
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains("blocked"));
         });

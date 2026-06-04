@@ -61,6 +61,16 @@ pub fn resolve_device_id(config: &mrsh_core::config::Config, data_dir: &std::pat
 
 /// Build the list of capabilities this server supports.
 /// Advertised to clients during auth handshake so they know what commands are available.
+pub fn build_server_caps_with_mode(tray_mode: bool) -> Vec<String> {
+    let mut caps = build_server_caps();
+    if tray_mode {
+        caps.push("tray".to_string());
+    } else {
+        caps.push("system".to_string());
+    }
+    caps
+}
+
 pub fn build_server_caps() -> Vec<String> {
     let mut caps = vec![
         "exec".to_string(),
@@ -150,7 +160,7 @@ pub async fn run_server_mode_inner(
         std::collections::HashSet::new()
     };
 
-    let caps = build_server_caps();
+    let caps = build_server_caps_with_mode(_with_tray);
 
     // Load TOTP secrets (optional — empty vec if file doesn't exist)
     let totp_path = data_dir.join("totp_secrets");
@@ -163,6 +173,20 @@ pub async fn run_server_mode_inner(
     let totp_recovery_path = {
         let p = data_dir.join("totp_recovery");
         if p.exists() { Some(p) } else { None }
+    };
+
+    // Resolve device_id and rendezvous server early (needed by ServerContext for auth response)
+    let preload_config = mrsh_core::config::Config::load();
+    let server_device_id = {
+        let id = resolve_device_id(&preload_config, &data_dir);
+        if id.is_empty() { None } else { Some(id) }
+    };
+    let server_rendezvous = {
+        let rdv = match option_env!("MRSH_RDV_SERVER") {
+            Some(rdv) if !rdv.is_empty() => vec![rdv.to_string()],
+            _ => preload_config.get_rendezvous_servers(),
+        };
+        rdv.into_iter().next() // first/primary rendezvous server
     };
 
     // Initialize connection notification channel (for tray toast notifications)
@@ -186,6 +210,8 @@ pub async fn run_server_mode_inner(
         totp_secrets,
         totp_recovery_path,
         server_key_path: Some(data_dir.join("server_key")),
+        device_id: server_device_id.clone(),
+        rendezvous_server: server_rendezvous.clone(),
     });
 
     // Clone TLS acceptor and ctx for relay handler before moving into ServerConfig.
@@ -252,7 +278,28 @@ pub async fn run_server_mode_inner(
             // Registration + relay notification listener.
             let cancel_reg = cancel.clone();
             let svc_port = port;
+            let enrollment_token_for_crypto = user_config.enrollment_token.clone().unwrap_or_default();
+            let reg_hostname = hostname.clone();
             tokio::spawn(async move {
+                // Build encrypted network info for LAN discovery
+                let net_info_blob = if !enrollment_token_for_crypto.is_empty() {
+                    let info = mrsh_relay::net_crypto::collect_network_info(
+                        &reg_hostname, svc_port, crate::TRAY_PORT,
+                    );
+                    let (_, group_pub) = mrsh_relay::net_crypto::derive_group_keypair(
+                        &enrollment_token_for_crypto,
+                    );
+                    let gh = {
+                        use sha2::Digest;
+                        let d = sha2::Sha256::digest(enrollment_token_for_crypto.as_bytes());
+                        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    };
+                    mrsh_relay::net_crypto::encrypt_network_info(&info, &[(gh, group_pub)])
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 let client = mrsh_relay::rendezvous::Client {
                     servers: rdv_servers,
                     licence_key: rdv_key.clone(),
@@ -261,6 +308,7 @@ pub async fn run_server_mode_inner(
                     hostname,
                     platform,
                     service_port: svc_port,
+                    encrypted_net_info: net_info_blob,
                 };
                 client.run_registration_loop(cancel_reg, relay_tx).await;
             });
@@ -310,12 +358,26 @@ pub async fn run_server_mode_inner(
         let tray_handle =
             tokio::task::spawn_blocking(move || tray::run_tray(tray_cancel, tray_port, tray_id));
 
-        // Wait for either to finish
+        // Wait for either to finish — log which side exited and why
         tokio::select! {
             result = server_handle => {
+                match &result {
+                    Ok(Ok(())) => tracing::warn!("tray: server listener exited cleanly — shutting down"),
+                    Ok(Err(e)) => tracing::error!("tray: server listener failed: {} — shutting down", e),
+                    Err(e) => tracing::error!("tray: server listener panicked: {} — shutting down", e),
+                }
+                cancel.cancel(); // signal tray to exit gracefully
+                // Give tray a moment to process WM_QUIT from cancel check
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 result??;
             }
             result = tray_handle => {
+                match &result {
+                    Ok(Ok(())) => tracing::info!("tray: message loop exited cleanly"),
+                    Ok(Err(e)) => tracing::error!("tray: message loop failed: {}", e),
+                    Err(e) => tracing::error!("tray: message loop panicked: {}", e),
+                }
+                cancel.cancel(); // stop server listener
                 result??;
             }
         }
@@ -354,7 +416,48 @@ pub async fn accept_relay_connection(
         .await
         .context("relay: connect to hbbr")?;
 
-    info!("relay accept: connected to hbbr, waiting for TLS handshake");
+    info!("relay accept: connected to hbbr (target_port={})", notif.target_port);
+
+    // Route BEFORE TLS accept — proxy forwards raw TCP so the target port
+    // (e.g. tray) handles its own TLS handshake with the client.
+    //
+    // target_port == 0:            tray-first — try tray, fallback to SYSTEM.
+    // target_port == DEFAULT_PORT: explicit service — TLS accept here (SYSTEM).
+    // target_port == other:        explicit port — proxy raw stream to that port.
+
+    // Explicit non-default port (e.g. 9822 = tray) — proxy raw stream directly.
+    if notif.target_port != 0 && notif.target_port != crate::DEFAULT_PORT {
+        info!("relay accept: proxying raw stream to explicit port {}", notif.target_port);
+        let local_stream = tokio::net::TcpStream::connect(
+            format!("127.0.0.1:{}", notif.target_port),
+        )
+        .await
+        .context(format!("connect to local port {}", notif.target_port))?;
+
+        return relay_proxy_bidirectional(relay_stream, local_stream).await;
+    }
+
+    // Tray-first (target_port == 0): single connect attempt to tray.
+    // If tray is up, proxy raw stream. If not, fall through to SYSTEM context.
+    if notif.target_port == 0 {
+        let tray_addr = format!("127.0.0.1:{}", crate::TRAY_PORT);
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(&tray_addr),
+        ).await {
+            Ok(Ok(tray_stream)) => {
+                info!("relay accept: tray available, routing to port {}", crate::TRAY_PORT);
+                return relay_proxy_bidirectional(relay_stream, tray_stream).await;
+            }
+            _ => {
+                info!("relay accept: tray not available, handling in SYSTEM context");
+            }
+        }
+    }
+
+    // SYSTEM context (target_port == DEFAULT_PORT, or tray-first fallback).
+    // TLS accept and handle the connection ourselves.
+    info!("relay accept: TLS handshake for SYSTEM context");
 
     let tls_result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -374,34 +477,28 @@ pub async fn accept_relay_connection(
         Ok(Ok(s)) => s,
     };
 
-    info!("relay accept: TLS established (target_port={})", notif.target_port);
-
-    // If client requested a different port (e.g. 9822 = tray), proxy to that port locally
-    // instead of handling in our SYSTEM context.
-    if notif.target_port != 0 && notif.target_port != crate::DEFAULT_PORT {
-        info!("relay accept: proxying to local port {}", notif.target_port);
-        let local_addr = format!("127.0.0.1:{}", notif.target_port);
-        let local_stream = tokio::net::TcpStream::connect(&local_addr)
-            .await
-            .context(format!("connect to local tray port {}", notif.target_port))?;
-
-        // Bidirectional proxy: relay TLS stream ↔ local tray port
-        let (mut relay_read, mut relay_write) = tokio::io::split(tls_stream);
-        let (mut local_read, mut local_write) = tokio::io::split(local_stream);
-
-        tokio::select! {
-            r = tokio::io::copy(&mut relay_read, &mut local_write) => {
-                if let Err(e) = r { tracing::debug!("relay→local: {}", e); }
-            }
-            r = tokio::io::copy(&mut local_read, &mut relay_write) => {
-                if let Err(e) = r { tracing::debug!("local→relay: {}", e); }
-            }
-        }
-        return Ok(());
-    }
-
     mrsh_server::handler::handle_connection(tls_stream, &ctx, None).await?;
 
+    Ok(())
+}
+
+/// Bidirectional proxy between a relay stream and a local TCP stream.
+/// Used to forward relay connections to a different local port (e.g. tray).
+async fn relay_proxy_bidirectional(
+    relay_stream: tokio::net::TcpStream,
+    local_stream: tokio::net::TcpStream,
+) -> Result<()> {
+    let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
+    let (mut local_read, mut local_write) = tokio::io::split(local_stream);
+
+    tokio::select! {
+        r = tokio::io::copy(&mut relay_read, &mut local_write) => {
+            if let Err(e) = r { tracing::debug!("relay→local: {}", e); }
+        }
+        r = tokio::io::copy(&mut local_read, &mut relay_write) => {
+            if let Err(e) = r { tracing::debug!("local→relay: {}", e); }
+        }
+    }
     Ok(())
 }
 

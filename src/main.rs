@@ -54,15 +54,15 @@ struct Cli {
     verbose: u8,
 
     /// Install as system service (Windows: SCM service, Linux: systemd unit)
-    #[arg(long = "install", hide = true)]
+    #[arg(long = "install")]
     install: bool,
 
     /// Uninstall system service
-    #[arg(long = "uninstall", hide = true)]
+    #[arg(long = "uninstall")]
     uninstall: bool,
 
     /// Run server in foreground (debug mode)
-    #[arg(long = "console", hide = true)]
+    #[arg(long = "console")]
     console: bool,
 
     /// Internal: launched by SCM as service (Windows only)
@@ -70,14 +70,14 @@ struct Cli {
     #[arg(long = "service", hide = true)]
     service: bool,
 
-    /// Run as tray (skip SCM dispatch, go directly to tray mode on port 9822)
+    /// Run as tray app (user session, port 9822, system tray icon)
     #[cfg(target_os = "windows")]
-    #[arg(long = "tray", hide = true)]
+    #[arg(long = "tray")]
     tray: bool,
 
     /// Run as background daemon (Linux only)
     #[cfg(not(target_os = "windows"))]
-    #[arg(long = "daemon", hide = true)]
+    #[arg(long = "daemon")]
     daemon: bool,
 
     /// Delete remote files not present locally (mirror mode, push only)
@@ -158,7 +158,6 @@ pub(crate) const DEFAULT_PORT: u16 = match option_env!("MRSH_DEFAULT_PORT") {
 };
 
 /// Known local subcommands that don't require -h (used in server mode detection).
-#[cfg(target_os = "windows")]
 const LOCAL_COMMANDS: &[&str] = &["version", "fleet", "wake", "cfg", "config-edit", "connect", "log", "logs", "dash", "dashboard", "keygen", "keys", "totp-setup", "totp-verify", "pack", "install-pack", "relay", "rdv", "rendezvous", "discover", "nat"];
 
 /// Returns the effective operation timeout in seconds.
@@ -650,12 +649,20 @@ async fn async_main(cli: Cli) -> Result<()> {
         return mrsh_client::mux::stop_master(host, cli.port.unwrap_or(DEFAULT_PORT)).await;
     }
 
-    // ── Server mode: no -h, no local command, on Windows ────
-    #[cfg(target_os = "windows")]
+    // ── Server mode: no -h, no local command ────────────────
     if cli.host.is_none() && !LOCAL_COMMANDS.contains(&cmd) {
-        // No host specified, unknown command → default to tray server mode
-        info!("no -h flag, launching tray server mode");
-        return server_mode::run_server_mode(TRAY_PORT, true).await;
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: default to tray server mode (user session, port 9822)
+            info!("no -h flag, launching tray server mode");
+            return server_mode::run_server_mode(TRAY_PORT, true).await;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Linux: default to foreground server mode (port 8822)
+            info!("no -h flag, launching server mode");
+            return server_mode::run_server_mode(DEFAULT_PORT, false).await;
+        }
     }
 
     // ── Client commands (require -h) ─────────────────────────
@@ -1171,10 +1178,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             key_path: cli.key.clone(),
             server_name: resolved_host.clone(),
             port: resolved_port,
+            target_port: if auto_try_ports { 0 } else { resolved_port },
+            force_relay: false,
+            enrollment_token: config.enrollment_token.clone().unwrap_or_default(),
         };
         mrsh_client::relay_connect::connect_via_relay(&relay_opts).await?
     } else if auto_try_ports {
-        // Auto-try ports: try 8822 → 9822 → 22
+        // Auto-try ports: try 9822 (tray) → 8822 (service) → 22 (SSH)
         let opts = ConnectOptions {
             host: resolved_host.clone(),
             port: resolved_port,
@@ -1220,6 +1230,44 @@ async fn async_main(cli: Cli) -> Result<()> {
         };
         mrsh_client::client::connect(&opts).await?
     };
+
+    // ── Save server's DeviceID + rendezvous to client config ───
+    if client.server_device_id.is_some() || client.server_rendezvous.is_some() {
+        let mut cfg = mrsh_core::config::Config::load();
+        if cfg.update_host_relay_info(
+            &host,
+            client.server_device_id.as_deref(),
+            client.server_rendezvous.as_deref(),
+        ) {
+            if let Err(e) = cfg.save() {
+                tracing::debug!("failed to save relay info to config: {}", e);
+            } else {
+                tracing::debug!(
+                    "saved relay info for {}: device_id={:?}, rdv={:?}",
+                    host, client.server_device_id, client.server_rendezvous
+                );
+            }
+        }
+    }
+
+    // ── Show server instance info ──────────────────────────────
+    // Always show for interactive commands; with -v for others.
+    let is_interactive_cmd = matches!(cmd, "shell" | "attach" | "browse" | "sftp" | "connect" | "dash" | "logs");
+    if cli.verbose > 0 || is_interactive_cmd {
+        eprintln!("{}", client.describe_instance(resolved_port));
+    }
+
+    // Warn if running desktop-dependent command on SYSTEM service
+    if client.is_system() {
+        let desktop_cmds = ["screenshot", "ss", "window", "clip"];
+        if desktop_cmds.contains(&cmd) {
+            eprintln!(
+                "warning: {} may not work on SYSTEM service (no desktop).\n\
+                 \x20 Use tray instead: mrsh -h {} -p 9822 {}",
+                cmd, host, args.join(" ")
+            );
+        }
+    }
 
     // ── Control master mode (-M) ──────────────────────────────
     if cli.master {
@@ -1500,7 +1548,57 @@ async fn async_main(cli: Cli) -> Result<()> {
             let (local_bind, remote_target) =
                 mrsh_client::tunnel::parse_tunnel_spec(&args[1], &args[2])?;
             eprintln!("tunnel: {} → {} via {}", local_bind, remote_target, resolved_host);
-            mrsh_client::tunnel::run_tunnel(client.stream_mut(), &local_bind, &remote_target).await?;
+
+            // Persistent tunnel: reconnects for each accepted local connection.
+            // Must use the same connection method (relay vs direct) as the original.
+            let tunnel_device_id = device_id.clone();
+            let tunnel_config = config.clone();
+            let tunnel_host = resolved_host.clone();
+            let tunnel_auto_try = auto_try_ports;
+            let tunnel_port = resolved_port;
+            let tunnel_key = cli.key.clone();
+            mrsh_client::tunnel::run_tunnel_persistent(
+                move || {
+                    let dev_id = tunnel_device_id.clone();
+                    let cfg = tunnel_config.clone();
+                    let host = tunnel_host.clone();
+                    let port = tunnel_port;
+                    let key = tunnel_key.clone();
+                    async move {
+                        let client = if let Some(ref did) = dev_id {
+                            // Relay path
+                            let relay_opts = mrsh_client::relay_connect::RelayConnectOptions {
+                                device_id: did.clone(),
+                                rendezvous_server: cfg
+                                    .rendezvous_server
+                                    .as_deref()
+                                    .unwrap_or("localhost:21116")
+                                    .to_string(),
+                                rendezvous_key: cfg.rendezvous_key.clone().unwrap_or_default(),
+                                key_path: key,
+                                server_name: host,
+                                port,
+                                target_port: if tunnel_auto_try { 0 } else { port },
+                                force_relay: true, // skip 5s P2P timeout on tunnel reconnects
+                                enrollment_token: cfg.enrollment_token.clone().unwrap_or_default(),
+                            };
+                            mrsh_client::relay_connect::connect_via_relay(&relay_opts).await?
+                        } else {
+                            // Direct path
+                            let opts = ConnectOptions {
+                                host,
+                                port,
+                                key_path: key,
+                                password_user: None,
+                            };
+                            mrsh_client::client::connect(&opts).await?
+                        };
+                        Ok(client.into_stream())
+                    }
+                },
+                &local_bind,
+                &remote_target,
+            ).await?;
         }
         "recording" => {
             // Only "list" reaches here (export handled in local section)

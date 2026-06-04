@@ -36,6 +36,8 @@ pub struct ResolveResult {
     pub relay_server: String,
     /// UUID for relay pairing (empty if P2P).
     pub uuid: String,
+    /// Encrypted network info blob (from server's RegisterPeer, forwarded by hbbs).
+    pub encrypted_net_info: Vec<u8>,
 }
 
 /// A discovered peer from a group query.
@@ -77,6 +79,8 @@ pub struct Client {
     pub platform: String,
     /// mrsh command listener port — included in RegisterPeer so hbbs can report it.
     pub service_port: u16,
+    /// Encrypted network info blob (envelope encryption). Opaque to hbbs.
+    pub encrypted_net_info: Vec<u8>,
 }
 
 /// Check whether a string looks like a device ID rather than a hostname/IP.
@@ -221,6 +225,8 @@ struct PeerEntry {
     platform: String,
     /// mrsh command listener port (0 = default 8822).
     service_port: u16,
+    /// Encrypted network info blob (opaque, forwarded to clients).
+    encrypted_net_info: Vec<u8>,
     /// Persistent TCP notification stream (for NAT-ed peers that can't receive UDP).
     tcp_notify: Option<Arc<tokio::sync::Mutex<tokio::net::TcpStream>>>,
 }
@@ -350,6 +356,7 @@ impl RendezvousServer {
                             hostname: rp.hostname.clone(),
                             platform: rp.platform.clone(),
                             service_port: rp.service_port as u16,
+                            encrypted_net_info: rp.encrypted_net_info.clone(),
                             tcp_notify: existing_tcp,
                         },
                     );
@@ -453,6 +460,7 @@ impl RendezvousServer {
                         proto::PunchHoleResponse {
                             socket_addr: encoded_addr,
                             relay_server: self.relay_server.clone(),
+                            encrypted_net_info: entry.encrypted_net_info.clone(),
                             ..Default::default()
                         },
                     )),
@@ -892,6 +900,7 @@ impl Client {
                     hostname: self.hostname.clone(),
                     platform: self.platform.clone(),
                     service_port: self.service_port as i32,
+                    ..Default::default()
                 },
             )),
         };
@@ -990,6 +999,7 @@ impl Client {
                             addr: Some(addr),
                             relay_server: relay,
                             uuid: String::new(),
+                            encrypted_net_info: Vec::new(),
                         });
                     }
                     if !relay.is_empty() {
@@ -997,6 +1007,7 @@ impl Client {
                             addr: None,
                             relay_server: relay,
                             uuid: String::new(),
+                            encrypted_net_info: Vec::new(),
                         });
                     }
                 }
@@ -1029,6 +1040,7 @@ impl Client {
                 addr: Some(addr),
                 relay_server: phr.relay_server,
                 uuid: String::new(),
+                encrypted_net_info: phr.encrypted_net_info,
             });
         }
 
@@ -1042,6 +1054,7 @@ impl Client {
                 addr: None,
                 relay_server: phr.relay_server,
                 uuid: String::new(),
+                encrypted_net_info: phr.encrypted_net_info,
             });
         }
 
@@ -1169,6 +1182,7 @@ impl Client {
                     hostname: self.hostname.clone(),
                     platform: self.platform.clone(),
                     service_port: self.service_port as i32,
+                    encrypted_net_info: self.encrypted_net_info.clone(),
                 },
             )),
         };
@@ -1372,6 +1386,7 @@ async fn handle_tcp_relay_request(
                     hostname: rp.hostname.clone(),
                     platform: rp.platform.clone(),
                     service_port: rp.service_port as u16,
+                    encrypted_net_info: rp.encrypted_net_info.clone(),
                     tcp_notify: Some(tcp_stream),
                 },
             );
@@ -1552,6 +1567,7 @@ mod tests {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
+                encrypted_net_info: Vec::new(),
             };
             assert!(c.resolve("123456789").await.is_err());
         });
@@ -1785,7 +1801,9 @@ mod tests {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         let msg = proto::RendezvousMessage {
@@ -1822,7 +1840,9 @@ mod tests {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         let punch = proto::PunchHoleRequest {
@@ -1867,7 +1887,9 @@ mod tests {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         let punch = proto::PunchHoleRequest {
@@ -1946,7 +1968,9 @@ mod tests {
                 hostname: String::new(),
                 platform: String::new(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         let punch = proto::PunchHoleRequest {
@@ -1978,6 +2002,7 @@ mod tests {
             hostname: "test-host".to_string(),
             platform: "linux".to_string(),
             service_port: 8822,
+            encrypted_net_info: Vec::new(),
         }
     }
 
@@ -2279,6 +2304,7 @@ mod tests {
             hostname: "test".to_string(),
             platform: "linux".to_string(),
             service_port: 8822,
+            encrypted_net_info: Vec::new(),
         };
 
         let cancel_clone = cancel.clone();
@@ -2315,7 +2341,9 @@ mod tests {
                 hostname: "host-a".to_string(),
                 platform: "windows".to_string(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
         peers.lock().unwrap().insert(
             "222".to_string(),
@@ -2326,7 +2354,9 @@ mod tests {
                 hostname: "host-b".to_string(),
                 platform: "linux".to_string(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         // Valid key → should get both peers
@@ -2363,7 +2393,9 @@ mod tests {
                 hostname: "host-a".to_string(),
                 platform: "windows".to_string(),
                 service_port: 0,
-            },
+                tcp_notify: None,
+                encrypted_net_info: Vec::new(),
+                },
         );
 
         let msg = proto::RendezvousMessage {
@@ -2392,6 +2424,7 @@ mod tests {
                     hostname: "CUSTOM-PORT".to_string(),
                     platform: "windows".to_string(),
                     service_port: 9822,
+                    encrypted_net_info: Vec::new(),
                 },
             )),
         };
@@ -2408,6 +2441,7 @@ mod tests {
                     hostname: "DEFAULT-PORT".to_string(),
                     platform: "linux".to_string(),
                     service_port: 0,
+                    encrypted_net_info: Vec::new(),
                 },
             )),
         };
