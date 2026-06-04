@@ -50,6 +50,8 @@ pub struct GroupPeerInfo {
     pub last_seen_secs: u64,
     /// mrsh command listener port (0 means default 8822).
     pub service_port: u16,
+    /// Raw encrypted network info blob (for client-side decryption).
+    pub encrypted_net_info: Vec<u8>,
 }
 
 /// A relay notification received from hbbs: a client wants to connect via relay.
@@ -514,6 +516,7 @@ impl RendezvousServer {
                     last_seen_secs,
                     service_port: entry.service_port as i32,
                     ports: entry.ports.clone(),
+                    encrypted_net_info: entry.encrypted_net_info.clone(),
                 }
             })
             .collect();
@@ -603,6 +606,7 @@ impl RendezvousServer {
                     last_seen_secs,
                     service_port: entry.service_port as i32,
                     ports: entry.ports.clone(),
+                    encrypted_net_info: entry.encrypted_net_info.clone(),
                 }
             })
             .collect();
@@ -770,6 +774,7 @@ impl Client {
                         addr,
                         last_seen_secs: p.last_seen_secs,
                         service_port: p.service_port as u16,
+                        encrypted_net_info: p.encrypted_net_info,
                     }
                 }).collect();
                 return Ok(peers);
@@ -836,6 +841,7 @@ impl Client {
                         addr,
                         last_seen_secs: p.last_seen_secs,
                         service_port: p.service_port as u16,
+                        encrypted_net_info: p.encrypted_net_info,
                     }
                 }).collect();
                 return Ok(peers);

@@ -65,6 +65,11 @@ struct Cli {
     #[arg(long = "console")]
     console: bool,
 
+    /// Debug server: foreground, verbose logging to console+file, no relay/rdv registration.
+    /// Listens on specified port (-p) or default 8822. Use for diagnostics and recovery.
+    #[arg(short = 'd', long = "debug")]
+    debug: bool,
+
     /// Internal: launched by SCM as service (Windows only)
     #[cfg(target_os = "windows")]
     #[arg(long = "service", hide = true)]
@@ -277,6 +282,7 @@ fn main() -> Result<()> {
 
     // Determine if we're running in server mode (needs audit log to file)
     let is_server_mode = cli.console
+        || cli.debug
         || cli.install
         || cli.uninstall
         || {
@@ -295,12 +301,19 @@ fn main() -> Result<()> {
         std::fs::create_dir_all(&data_dir).ok();
         // Use different log file for tray vs service to avoid lock contention
         #[cfg(target_os = "windows")]
-        let log_prefix = if std::env::args().any(|a| a == "--tray") { "audit-tray.log" } else { "audit.log" };
+        let log_prefix = if cli.debug {
+            "audit-debug.log"
+        } else if std::env::args().any(|a| a == "--tray") {
+            "audit-tray.log"
+        } else {
+            "audit.log"
+        };
         #[cfg(not(target_os = "windows"))]
-        let log_prefix = "audit.log";
-        let filter = tracing_subscriber::EnvFilter::new(match cli.verbose {
-            0 => "info",
-            1 => "info",
+        let log_prefix = if cli.debug { "audit-debug.log" } else { "audit.log" };
+        let filter = tracing_subscriber::EnvFilter::new(match (cli.debug, cli.verbose) {
+            (true, _) => "debug", // -d always verbose
+            (_, 0) => "info",
+            (_, 1) => "info",
             _ => "debug",
         });
 
@@ -358,6 +371,16 @@ fn main() -> Result<()> {
     if cli.console {
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(server_mode::run_server_mode(cli.port.unwrap_or(DEFAULT_PORT), false));
+    }
+    if cli.debug {
+        let port = cli.port.unwrap_or(DEFAULT_PORT);
+        eprintln!("=== mrsh debug server on port {} ===", port);
+        eprintln!("  auth: ed25519 (authorized_keys)");
+        eprintln!("  relay/rdv: disabled");
+        eprintln!("  log: console + audit-debug.log");
+        eprintln!("  Ctrl+C to stop");
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(server_mode::run_debug_mode(port));
     }
 
     // ── Explicit tray mode (Windows) ─────────────────────────

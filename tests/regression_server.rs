@@ -313,47 +313,34 @@ fn selfupdate_validate_large_file_succeeds() {
 fn selfupdate_bat_template_has_retry_and_timeout() {
     let selfupdate_src = include_str!("../crates/mrsh-server/src/selfupdate.rs");
 
-    // Verify the bat template contains retry logic:
-    // The format string must have two "copy /y \"{new}\" \"{exe}\"" patterns
-    // (first attempt + retry after timeout).
+    // v1.9.6+: uses rename-swap instead of stop+taskkill+copy.
+    // Verify the bat template uses ren (rename running binary) + copy new.
+    assert!(
+        selfupdate_src.contains(r#"ren "{exe}" "{backup_name}""#),
+        "bat template must rename running binary before copy"
+    );
+
     assert!(
         selfupdate_src.contains(r#"copy /y "{new}" "{exe}""#),
         "bat template must contain copy command for new binary"
     );
 
-    // Verify timeout between attempts: "timeout /t 5" appears in the retry block
+    // Verify fallback: if rename fails, stop service first then retry rename
     assert!(
-        selfupdate_src.contains("timeout /t 5 /nobreak >nul"),
-        "bat template must have 5-second timeout (was 3s in buggy version)"
+        selfupdate_src.contains("net stop {svc}"),
+        "bat template must stop service as fallback when rename fails"
     );
 
-    // Verify retry block: IF ERRORLEVEL 1 followed by second copy attempt
+    // Verify service restart after swap
     assert!(
-        selfupdate_src.contains("IF ERRORLEVEL 1"),
-        "bat template must have ERRORLEVEL check for copy retry"
+        selfupdate_src.contains("net start {svc}"),
+        "bat template must restart service after swap"
     );
 
-    // Verify rollback message
+    // Verify logging
     assert!(
-        selfupdate_src.contains("ROLLBACK: restored from backup"),
-        "bat template must contain rollback message"
-    );
-
-    // Verify the copy retry: the format string has two copy lines for new→exe.
-    // Count occurrences in the bat format string (inside the r#"..."# block).
-    let copy_count = selfupdate_src
-        .matches(r#"copy /y "{new}" "{exe}""#)
-        .count();
-    assert_eq!(
-        copy_count, 2,
-        "bat template must have 2 copy commands (original + retry), got {}",
-        copy_count
-    );
-
-    // Verify taskkill timeout is present (3 seconds)
-    assert!(
-        selfupdate_src.contains("timeout /t 3 /nobreak >nul"),
-        "bat template must have 3-second timeout after taskkill"
+        selfupdate_src.contains("self-update starting"),
+        "bat template must log start of update"
     );
 }
 

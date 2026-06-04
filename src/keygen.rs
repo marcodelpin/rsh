@@ -319,10 +319,38 @@ fn keys_show() -> Result<()> {
     Ok(())
 }
 
+/// Find a writable authorized_keys path.
+/// Tries the primary data_dir first; if not writable (non-admin user on ProgramData),
+/// falls back to user-level ~/.mrsh/authorized_keys.
+fn writable_authorized_keys_path() -> Result<std::path::PathBuf> {
+    let primary = crate::server_data_dir().join("authorized_keys");
+
+    // Try to open primary for append to test writability
+    if let Ok(_) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&primary)
+    {
+        return Ok(primary);
+    }
+
+    // Fallback: user home dir
+    let home_dir = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".mrsh");
+    std::fs::create_dir_all(&home_dir)?;
+    let user_path = home_dir.join("authorized_keys");
+    eprintln!(
+        "note: {} not writable, using {}",
+        primary.display(),
+        user_path.display()
+    );
+    Ok(user_path)
+}
+
 /// Add a public key to the server's authorized_keys.
 fn keys_add(key_input: &str) -> Result<()> {
-    let data_dir = crate::server_data_dir();
-    let ak_path = data_dir.join("authorized_keys");
+    let ak_path = writable_authorized_keys_path()?;
 
     // Determine if input is a file path or a key string
     let key_line = if std::path::Path::new(key_input.trim()).exists() {
@@ -340,19 +368,16 @@ fn keys_add(key_input: &str) -> Result<()> {
                Or provide a path to a .pub file.");
     }
 
-    // Ensure data dir exists
-    std::fs::create_dir_all(&data_dir)?;
-
-    // Check for duplicates
-    if ak_path.exists() {
-        let existing = std::fs::read_to_string(&ak_path)?;
-        // Compare key data (second field)
-        let new_parts: Vec<&str> = key_line.splitn(3, char::is_whitespace).collect();
-        if new_parts.len() >= 2 {
-            for line in existing.lines() {
-                let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
-                if parts.len() >= 2 && parts[1] == new_parts[1] {
-                    bail!("Key already exists in authorized_keys.");
+    // Check for duplicates across ALL authorized_keys paths
+    let new_parts: Vec<&str> = key_line.splitn(3, char::is_whitespace).collect();
+    if new_parts.len() >= 2 {
+        for path in &crate::all_authorized_keys_paths() {
+            if let Ok(existing) = std::fs::read_to_string(path) {
+                for line in existing.lines() {
+                    let parts: Vec<&str> = line.splitn(3, char::is_whitespace).collect();
+                    if parts.len() >= 2 && parts[1] == new_parts[1] {
+                        bail!("Key already exists in {}", path.display());
+                    }
                 }
             }
         }
@@ -380,63 +405,70 @@ fn keys_add(key_input: &str) -> Result<()> {
 }
 
 /// Remove a key from authorized_keys by fingerprint or comment match.
+/// Searches ALL authorized_keys paths and removes from whichever contains the key.
 fn keys_remove(query: &str) -> Result<()> {
     use mrsh_core::auth;
 
-    let data_dir = crate::server_data_dir();
-    let ak_path = data_dir.join("authorized_keys");
-
-    if !ak_path.exists() {
-        bail!("No authorized_keys file at {}", ak_path.display());
-    }
-
-    let content = std::fs::read_to_string(&ak_path)?;
-    let keys = auth::load_authorized_keys(&ak_path, false)?;
-
-    // Find matching key
-    let mut found_idx = None;
-    for (i, key) in keys.iter().enumerate() {
-        let fp = auth::key_fingerprint(&key.key_data);
-        let comment = key.comment.as_deref().unwrap_or("");
-        if fp == query || fp.ends_with(query) || comment == query {
-            found_idx = Some(i);
-            break;
-        }
-    }
-
-    let idx = found_idx.ok_or_else(|| anyhow::anyhow!(
-        "No key matching '{}' found in authorized_keys.\n\
-         Use 'mrsh keys list' to see available keys.",
-        query
-    ))?;
-
-    let removed = &keys[idx];
-    let removed_fp = auth::key_fingerprint(&removed.key_data);
-    let removed_comment = removed.comment.as_deref().unwrap_or("no comment");
-
-    // Rebuild the file without the matched line
-    let mut non_blank_idx = 0;
-    let mut new_lines = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            new_lines.push(line.to_string());
+    // Search all paths for the matching key
+    for ak_path in &crate::all_authorized_keys_paths() {
+        if !ak_path.exists() {
             continue;
         }
-        if non_blank_idx == idx {
-            non_blank_idx += 1;
-            continue; // skip this line
+
+        let keys = match auth::load_authorized_keys(ak_path, false) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+
+        // Find matching key in this file
+        let mut found_idx = None;
+        for (i, key) in keys.iter().enumerate() {
+            let fp = auth::key_fingerprint(&key.key_data);
+            let comment = key.comment.as_deref().unwrap_or("");
+            if fp == query || fp.ends_with(query) || comment == query {
+                found_idx = Some(i);
+                break;
+            }
         }
-        non_blank_idx += 1;
-        new_lines.push(line.to_string());
+
+        let Some(idx) = found_idx else { continue };
+
+        let removed = &keys[idx];
+        let removed_fp = auth::key_fingerprint(&removed.key_data);
+        let removed_comment = removed.comment.as_deref().unwrap_or("no comment");
+
+        // Try to write — may fail if file is not writable
+        let content = std::fs::read_to_string(ak_path)?;
+        let mut non_blank_idx = 0;
+        let mut new_lines = Vec::new();
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                new_lines.push(line.to_string());
+                continue;
+            }
+            if non_blank_idx == idx {
+                non_blank_idx += 1;
+                continue; // skip this line
+            }
+            non_blank_idx += 1;
+            new_lines.push(line.to_string());
+        }
+
+        std::fs::write(ak_path, new_lines.join("\n") + "\n")
+            .with_context(|| format!("write {}", ak_path.display()))?;
+
+        eprintln!("Removed: {} ({})", removed_fp, removed_comment);
+        eprintln!("From: {}", ak_path.display());
+        eprintln!("{} key(s) remaining.", keys.len() - 1);
+        return Ok(());
     }
 
-    std::fs::write(&ak_path, new_lines.join("\n") + "\n")?;
-
-    eprintln!("Removed: {} ({})", removed_fp, removed_comment);
-    eprintln!("{} key(s) remaining.", keys.len() - 1);
-
-    Ok(())
+    bail!(
+        "No key matching '{}' found in any authorized_keys.\n\
+         Use 'mrsh keys list' to see available keys.",
+        query
+    );
 }
 
 /// Format key permissions for display.

@@ -173,33 +173,48 @@ fn schedule_update_windows(new_binary: &str) -> Result<String> {
         .to_string_lossy()
         .to_string();
 
-    // Write update bat script
+    // Write update bat script.
+    // Strategy: rename running binary (Windows allows this), copy new, restart.
+    // The old stop+taskkill+copy approach fails because Windows doesn't release
+    // the file handle immediately after taskkill, causing copy to fail and ROLLBACK.
     let bat_content = format!(
         r#"@echo off
-net stop {svc}
-timeout /t 5 /nobreak >nul
-taskkill /F /IM {exe_name} 2>nul
-timeout /t 3 /nobreak >nul
-copy /y "{exe}" "{backup}"
-copy /y "{new}" "{exe}"
+echo [%date% %time%] self-update starting >> "{exe}.update.log"
+del /f /q "{backup}" 2>nul
+ren "{exe}" "{backup_name}"
 IF ERRORLEVEL 1 (
-    timeout /t 5 /nobreak >nul
-    copy /y "{new}" "{exe}"
+    echo [%date% %time%] rename failed, trying stop first >> "{exe}.update.log"
+    net stop {svc} 2>nul
+    timeout /t 3 /nobreak >nul
+    ren "{exe}" "{backup_name}"
     IF ERRORLEVEL 1 (
-        copy /y "{backup}" "{exe}"
-        echo ROLLBACK: restored from backup >> "{exe}.update.log"
-        net start {svc}
+        echo [%date% %time%] FAILED: cannot rename running binary >> "{exe}.update.log"
+        net start {svc} 2>nul
         exit /b 1
     )
 )
+copy /y "{new}" "{exe}"
+IF ERRORLEVEL 1 (
+    echo [%date% %time%] FAILED: copy new binary >> "{exe}.update.log"
+    ren "{backup}" "{exe_name}"
+    net start {svc} 2>nul
+    exit /b 1
+)
+echo [%date% %time%] binary swapped, restarting service >> "{exe}.update.log"
+net stop {svc} 2>nul
+timeout /t 2 /nobreak >nul
 net start {svc}
-del "{new}"
-del "{bat}" 2>nul
+del /q "{new}" 2>nul
+del /q "{bat}" 2>nul
 "#,
         svc = svc_name,
         exe_name = exe_name,
         exe = exe_path,
         backup = backup_path,
+        backup_name = std::path::Path::new(&backup_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
         new = new_binary,
         bat = bat_path,
     );

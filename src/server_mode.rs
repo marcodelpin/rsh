@@ -455,6 +455,95 @@ pub async fn run_server_mode_inner(
     Ok(())
 }
 
+/// Debug mode: listener only, no relay/rdv/discovery/tray.
+/// Foreground, verbose logging, for diagnostics and recovery.
+pub async fn run_debug_mode(port: u16) -> Result<()> {
+    use mrsh_core::{auth, tls};
+    use mrsh_server::{handler::ServerContext, listener, session};
+    use tokio_rustls::TlsAcceptor;
+
+    let data_dir = crate::server_data_dir();
+    std::fs::create_dir_all(&data_dir)?;
+
+    info!("debug server starting on port {}", port);
+
+    let (certs, key) = tls::load_or_generate_cert(&data_dir)?;
+    let tls_config = tls::server_config(certs, key)?;
+    let tls_acceptor = TlsAcceptor::from(tls_config);
+
+    // Load authorized keys from ALL locations
+    let authorized_keys = {
+        let mut all_keys: Vec<auth::AuthorizedKey> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for ak_path in &crate::all_authorized_keys_paths() {
+            if ak_path.exists() {
+                if let Ok(keys) = auth::load_authorized_keys(ak_path, false) {
+                    for key in keys {
+                        if seen.insert(key.key_data.clone()) {
+                            all_keys.push(key);
+                        }
+                    }
+                    info!("loaded keys from {}", ak_path.display());
+                }
+            }
+        }
+        info!("{} authorized key(s) total", all_keys.len());
+        all_keys
+    };
+
+    let revoked_keys = {
+        let rk_path = data_dir.join("revoked_keys");
+        if rk_path.exists() { auth::load_revoked_keys(&rk_path)? }
+        else { std::collections::HashSet::new() }
+    };
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let ctx = std::sync::Arc::new(ServerContext {
+        authorized_keys,
+        revoked_keys,
+        server_version: format!("{}-debug", env!("CARGO_PKG_VERSION")),
+        banner: Some("mrsh debug server".to_string()),
+        caps: vec![
+            "exec".to_string(), "push".to_string(), "pull".to_string(),
+            "shell".to_string(), "screenshot".to_string(), "self-update".to_string(),
+            "stream-exec".to_string(), "keys".to_string(),
+        ],
+        session_store: session::SessionStore::new(),
+        rate_limiter: mrsh_server::ratelimit::AuthRateLimiter::new(),
+        allowed_tunnels: vec![],
+        totp_secrets: vec![],
+        totp_recovery_path: None,
+        server_key_path: Some(data_dir.join("server_key")),
+        device_id: None,
+        rendezvous_server: None,
+        authorized_keys_paths: crate::all_authorized_keys_paths(),
+    });
+
+    let config = listener::ServerConfig {
+        command_port: port,
+        tls_acceptor,
+        ctx,
+        ip_acl: load_ip_acl(&data_dir),
+        #[cfg(feature = "quic")]
+        tls_config: {
+            let (certs2, key2) = tls::load_or_generate_cert(&data_dir)?;
+            tls::server_config(certs2, key2)?
+        },
+    };
+
+    // Ctrl+C handler
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Ctrl+C received, shutting down debug server");
+        cancel_clone.cancel();
+    });
+
+    listener::run_server(config, cancel).await?;
+    Ok(())
+}
+
 /// Accept an incoming relay connection: connect to hbbr, TLS accept, dispatch.
 ///
 /// Called when hbbs sends a RelayResponse notification indicating a client

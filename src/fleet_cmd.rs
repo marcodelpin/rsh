@@ -213,36 +213,43 @@ pub async fn run_fleet(args: &[String]) -> Result<()> {
             // Detect which peers are on the same LAN
             let local_addrs = crate::get_local_addrs();
 
-            println!("{:<15} {:<20} {:<10} {:<22} {:<8} LAST SEEN",
-                "DEVICE ID", "HOSTNAME", "PLATFORM", "ADDRESS", "NETWORK");
-            println!("{}", "-".repeat(90));
+            println!("{:<15} {:<20} {:<10} {:<22} {:<8} LAN IPs",
+                "DEVICE ID", "HOSTNAME", "PLATFORM", "WAN ADDRESS", "NETWORK");
+            println!("{}", "-".repeat(100));
 
+            let mut lan_count = 0;
             for peer in &peers {
                 let addr_str = peer.addr
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "relay-only".to_string());
 
                 let is_lan = peer.addr.is_some_and(|a| crate::is_same_lan(a, &local_addrs));
+                if is_lan { lan_count += 1; }
                 let net_label = if is_lan { "LAN" } else { "WAN/Relay" };
 
-                let ago = {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let diff = now.saturating_sub(peer.last_seen_secs);
-                    if diff < 60 { format!("{}s ago", diff) }
-                    else if diff < 3600 { format!("{}m ago", diff / 60) }
-                    else { format!("{}h ago", diff / 3600) }
+                // Decrypt network info blob to show LAN IPs
+                let lan_ips = if !peer.encrypted_net_info.is_empty() {
+                    match mrsh_relay::net_crypto::decrypt_network_info(
+                        &peer.encrypted_net_info, &token,
+                    ) {
+                        Ok(Some(info)) => {
+                            info.interfaces.iter()
+                                .map(|iface| iface.ip.clone())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
                 };
 
+                let lan_display = if lan_ips.is_empty() { "(no blob)".to_string() } else { lan_ips };
+
                 println!("{:<15} {:<20} {:<10} {:<22} {:<8} {}",
-                    peer.device_id, peer.hostname, peer.platform, addr_str, net_label, ago);
+                    peer.device_id, peer.hostname, peer.platform, addr_str, net_label, lan_display);
             }
 
-            let lan_count = peers.iter()
-                .filter(|p| p.addr.is_some_and(|a| crate::is_same_lan(a, &local_addrs)))
-                .count();
             println!("\n{} peer(s) total, {} on LAN", peers.len(), lan_count);
         }
         other => bail!("unknown fleet action: {} (use status|update|config|discover)", other),

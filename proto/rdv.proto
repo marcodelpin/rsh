@@ -291,6 +291,7 @@ message GroupPeer {
   uint64 last_seen_secs = 5;  // seconds since UNIX epoch
   int32 service_port = 6;  // rsh command listener port (0 = default 8822) — compat
   repeated PortInfo ports = 7;  // all listening ports with capabilities
+  bytes encrypted_net_info = 8; // ECIES-encrypted LAN IPs, ports, hostname
 }
 
 // --- Fleet peer list (rsh extension) ---

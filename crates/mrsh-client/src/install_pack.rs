@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
+
 /// Options for generating an install pack.
 pub struct InstallPackOptions {
     /// Target platform: "windows" or "linux".
@@ -46,6 +47,9 @@ pub fn generate(opts: &InstallPackOptions) -> Result<PathBuf> {
     let auth_keys_content = build_authorized_keys(&opts.extra_keys)?;
     let key_count = auth_keys_content.lines().count();
     println!("  authorized_keys: {} key(s)", key_count);
+
+    // Load AI usage guide from disk (next to binary, or data dir, or docs/)
+    let ai_usage = find_ai_usage_md();
 
     let install_script = if is_windows {
         generate_windows_script(opts.port, &opts.nas_auth)
@@ -102,10 +106,11 @@ pub fn generate(opts: &InstallPackOptions) -> Result<PathBuf> {
     // Generate single output file
     let out_path = if is_windows {
         generate_nsis_installer(opts, version, &binary_data, &auth_keys_content,
-                                &install_script, startup_bat.as_deref(), config_content.as_deref())?
+                                &install_script, startup_bat.as_deref(), config_content.as_deref(),
+                                &ai_usage)?
     } else {
         generate_self_extracting_sh(opts, version, &binary_data, &auth_keys_content,
-                                     &install_script, config_content.as_deref())?
+                                     &install_script, config_content.as_deref(), &ai_usage)?
     };
 
     let file_size = std::fs::metadata(&out_path)?.len();
@@ -135,6 +140,7 @@ fn generate_self_extracting_sh(
     auth_keys: &str,
     install_script: &str,
     config: Option<&str>,
+    ai_usage: &str,
 ) -> Result<PathBuf> {
     let out_path = match &opts.output {
         Some(p) => p.clone(),
@@ -153,6 +159,11 @@ fn generate_self_extracting_sh(
 
             // Add authorized_keys
             add_tar_entry(&mut ar, "authorized_keys", auth_keys.as_bytes(), 0o600)?;
+
+            // Add AI usage guide (if found)
+            if !ai_usage.is_empty() {
+                add_tar_entry(&mut ar, "AI_USAGE.md", ai_usage.as_bytes(), 0o644)?;
+            }
 
             // Add install.sh (the inner installer, used by the wrapper)
             add_tar_entry(&mut ar, "install.sh", install_script.as_bytes(), 0o755)?;
@@ -252,6 +263,7 @@ fn generate_nsis_installer(
     install_script: &str,
     startup_bat: Option<&str>,
     config: Option<&str>,
+    ai_usage: &str,
 ) -> Result<PathBuf> {
     let out_path = match &opts.output {
         Some(p) => p.clone(),
@@ -269,6 +281,10 @@ fn generate_nsis_installer(
         .context("write mrsh.exe to temp")?;
     std::fs::write(src_dir.join("authorized_keys"), auth_keys.as_bytes())
         .context("write authorized_keys to temp")?;
+    if !ai_usage.is_empty() {
+        std::fs::write(src_dir.join("AI_USAGE.md"), ai_usage.as_bytes())
+            .context("write AI_USAGE.md to temp")?;
+    }
     std::fs::write(src_dir.join("install.bat"), install_script.as_bytes())
         .context("write install.bat to temp")?;
 
@@ -363,6 +379,7 @@ fn generate_nsi_script(version: &str, port: u16, has_startup: bool, has_config: 
     s.push_str("    DetailPrint \"Extracting files...\"\n");
     s.push_str("    File \"${SRCDIR}\\mrsh.exe\"\n");
     s.push_str("    File \"${SRCDIR}\\authorized_keys\"\n");
+    s.push_str("    File \"${SRCDIR}\\AI_USAGE.md\"\n");
     s.push_str("    File \"${SRCDIR}\\install.bat\"\n");
     if has_startup {
         s.push_str("    File \"${SRCDIR}\\startup.bat\"\n");
@@ -483,7 +500,9 @@ fn find_makensis() -> Result<PathBuf> {
 }
 
 /// Find the mrsh binary to bundle.
-fn find_binary(explicit: &Option<PathBuf>, is_windows: bool) -> Result<PathBuf> {
+/// Default: use the running binary itself (current_exe). This ensures the
+/// installer always bundles the exact version that generated it.
+fn find_binary(explicit: &Option<PathBuf>, _is_windows: bool) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if p.exists() {
             return Ok(p.clone());
@@ -491,35 +510,44 @@ fn find_binary(explicit: &Option<PathBuf>, is_windows: bool) -> Result<PathBuf> 
         bail!("specified binary not found: {}", p.display());
     }
 
-    let binary_name = if is_windows { "mrsh.exe" } else { "mrsh" };
-    let deploy_name = format!("deploy/{binary_name}");
-
-    // Check deploy/ relative to CWD
-    let deploy_path = PathBuf::from(&deploy_name);
-    if deploy_path.exists() {
-        return Ok(deploy_path);
-    }
-
-    // Check relative to the running executable's directory
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent() {
-            let near_exe = exe_dir.join(format!("../deploy/{binary_name}"));
-            if near_exe.exists() {
-                return Ok(near_exe);
-            }
-        }
-
-    if !is_windows {
-        let self_exe = std::env::current_exe().context("get current executable path")?;
-        if self_exe.exists() {
-            return Ok(self_exe);
-        }
+    // Use the running binary — the installer should bundle the same version
+    let self_exe = std::env::current_exe().context("get current executable path")?;
+    if self_exe.exists() {
+        return Ok(self_exe);
     }
 
     bail!(
-        "cannot find mrsh binary. Specify with --binary or place in {}",
-        deploy_name
+        "cannot find mrsh binary. Specify with --binary=PATH"
     );
+}
+
+/// Find AI_USAGE.md on disk. Searches: CWD/docs/, exe dir/../docs/, data dir.
+/// Returns content if found, empty string if not (non-fatal — installer works without it).
+fn find_ai_usage_md() -> String {
+    let candidates = [
+        PathBuf::from("docs/AI_USAGE.md"),
+        PathBuf::from("AI_USAGE.md"),
+    ];
+
+    // Also try relative to exe
+    let exe_candidates: Vec<PathBuf> = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+        .map(|dir| vec![
+            dir.join("../docs/AI_USAGE.md"),
+            dir.join("AI_USAGE.md"),
+        ])
+        .unwrap_or_default();
+
+    for path in candidates.iter().chain(exe_candidates.iter()) {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            println!("  AI_USAGE.md: {} bytes (from {})", content.len(), path.display());
+            return content;
+        }
+    }
+
+    eprintln!("  AI_USAGE.md: not found (installer will skip it)");
+    String::new()
 }
 
 /// Build authorized_keys content from the user's SSH public keys.
@@ -670,8 +698,22 @@ fn generate_windows_script(port: u16, nas_auth: &Option<String>) -> String {
         "copy /Y \"%~dp0mrsh.exe\" \"{}\\mrsh.exe\"\r\n",
         data_dir
     ));
+    // Merge new keys with existing authorized_keys (never overwrite/lose existing keys)
     script.push_str(&format!(
-        "copy /Y \"%~dp0authorized_keys\" \"{}\\authorized_keys\"\r\n",
+        "if exist \"{}\\authorized_keys\" (\r\n\
+         \x20   echo Merging authorized_keys...\r\n\
+         \x20   for /f \"usebackq delims=\" %%L in (\"%~dp0authorized_keys\") do (\r\n\
+         \x20       findstr /x /c:\"%%L\" \"{}\\authorized_keys\" >nul 2>&1 || echo %%L>>\"{}\\authorized_keys\"\r\n\
+         \x20   )\r\n\
+         ) else (\r\n\
+         \x20   copy /Y \"%~dp0authorized_keys\" \"{}\\authorized_keys\"\r\n\
+         )\r\n",
+        data_dir, data_dir, data_dir, data_dir
+    ));
+
+    // Copy AI usage guide
+    script.push_str(&format!(
+        "if exist \"%~dp0AI_USAGE.md\" copy /Y \"%~dp0AI_USAGE.md\" \"{}\\AI_USAGE.md\"\r\n",
         data_dir
     ));
 
@@ -767,9 +809,19 @@ fn generate_linux_script(port: u16) -> String {
     script.push_str(&format!("echo \"Binary installed: {}/mrsh\"\n\n", bin_dir));
 
     script.push_str(&format!("mkdir -p \"{}\"\n", conf_dir));
+    // Merge new keys with existing authorized_keys (never overwrite/lose existing keys)
     script.push_str(&format!(
-        "install -m 600 \"$(dirname \"$0\")/authorized_keys\" \"{}/authorized_keys\"\n",
-        conf_dir
+        "if [ -f \"{conf}/authorized_keys\" ]; then\n\
+         \x20   echo \"Merging authorized_keys...\"\n\
+         \x20   while IFS= read -r line; do\n\
+         \x20       [ -z \"$line\" ] && continue\n\
+         \x20       grep -qxF \"$line\" \"{conf}/authorized_keys\" || echo \"$line\" >> \"{conf}/authorized_keys\"\n\
+         \x20   done < \"$(dirname \"$0\")/authorized_keys\"\n\
+         \x20   chmod 600 \"{conf}/authorized_keys\"\n\
+         else\n\
+         \x20   install -m 600 \"$(dirname \"$0\")/authorized_keys\" \"{conf}/authorized_keys\"\n\
+         fi\n",
+        conf = conf_dir
     ));
     script.push_str(&format!(
         "if [ -f \"$(dirname \"$0\")/config\" ]; then\n\
@@ -779,6 +831,14 @@ fn generate_linux_script(port: u16) -> String {
          \x20   cp \"{conf}/config\" /root/.mrsh/config\n\
          \x20   chmod 600 /root/.mrsh/config\n\
          \x20   echo \"Fleet enrollment config installed.\"\n\
+         fi\n",
+        conf = conf_dir
+    ));
+
+    // Copy AI usage guide
+    script.push_str(&format!(
+        "if [ -f \"$(dirname \"$0\")/AI_USAGE.md\" ]; then\n\
+         \x20   install -m 644 \"$(dirname \"$0\")/AI_USAGE.md\" \"{conf}/AI_USAGE.md\"\n\
          fi\n",
         conf = conf_dir
     ));
