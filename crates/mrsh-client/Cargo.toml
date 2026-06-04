@@ -32,6 +32,9 @@ tempfile = "3"
 quinn = { workspace = true, optional = true }
 russh = { version = "0.58", default-features = false, features = ["flate2", "ring"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 quic = ["quinn"]
 ssh-client = ["russh"]

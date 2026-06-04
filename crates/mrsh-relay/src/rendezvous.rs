@@ -1106,7 +1106,10 @@ impl Client {
         };
         let reg_bytes = reg_msg.encode_to_vec();
 
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        // 10s keepalive — must be well under typical NAT UDP timeout (30-60s)
+        // to keep the UDP mapping alive for relay notifications from hbbs.
+        // Aggressive keepalive is critical for NAT traversal reliability.
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
         let mut buf = vec![0u8; 65535];
 
         if !self.group_hash.is_empty() {

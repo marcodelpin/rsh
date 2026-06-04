@@ -96,15 +96,58 @@ impl Config {
         dirs::home_dir().map(|h| h.join(".mrsh").join("config"))
     }
 
-    /// Load config from the default path. Returns empty config if file doesn't exist.
+    /// Load config with fallback chain:
+    /// 1. ~/.mrsh/config (user config)
+    /// 2. C:\ProgramData\mrsh\config.enrollment (installer enrollment config)
+    /// 3. ~/.rsh/config (legacy)
+    /// If user config exists but lacks rendezvous fields, merges from enrollment config.
     pub fn load() -> Self {
-        let Some(path) = Self::default_path() else {
-            return Self::default();
-        };
-        match std::fs::read_to_string(&path) {
-            Ok(content) => Self::parse(&content),
-            Err(_) => Self::default(),
+        // Primary: user config
+        let user_cfg = Self::default_path()
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .map(|c| Self::parse(&c));
+
+        // Enrollment config from data dir (installer writes here)
+        let enrollment_cfg = Self::load_enrollment();
+
+        match (user_cfg, enrollment_cfg) {
+            (Some(mut u), Some(e)) => {
+                // Merge: user config wins, but fill missing rendezvous fields from enrollment
+                if u.rendezvous_server.is_none() {
+                    u.rendezvous_server = e.rendezvous_server;
+                }
+                if u.rendezvous_key.is_none() {
+                    u.rendezvous_key = e.rendezvous_key;
+                }
+                if u.enrollment_token.is_none() {
+                    u.enrollment_token = e.enrollment_token;
+                }
+                u
+            }
+            (Some(u), None) => u,
+            (None, Some(e)) => e,
+            (None, None) => {
+                // Legacy: ~/.rsh/config
+                dirs::home_dir()
+                    .map(|h| h.join(".rsh").join("config"))
+                    .and_then(|p| std::fs::read_to_string(&p).ok())
+                    .map(|c| Self::parse(&c))
+                    .unwrap_or_default()
+            }
         }
+    }
+
+    /// Load enrollment config from the service data directory.
+    /// Windows: C:\ProgramData\mrsh\config.enrollment
+    /// Linux: /etc/rsh/config.enrollment
+    fn load_enrollment() -> Option<Self> {
+        #[cfg(target_os = "windows")]
+        let data_dir = std::path::PathBuf::from(r"C:\ProgramData\mrsh");
+        #[cfg(not(target_os = "windows"))]
+        let data_dir = std::path::PathBuf::from("/etc/rsh");
+
+        let path = data_dir.join("config.enrollment");
+        std::fs::read_to_string(&path).ok().map(|c| Self::parse(&c))
     }
 
     /// Parse config from string content.

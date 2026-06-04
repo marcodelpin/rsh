@@ -366,6 +366,8 @@ fn generate_nsi_script(version: &str, port: u16, has_startup: bool, has_config: 
         // SYSTEM profile for service mode
         s.push_str("    CreateDirectory \"C:\\Windows\\System32\\config\\systemprofile\\.mrsh\"\n");
         s.push_str("    CopyFiles /SILENT \"$INSTDIR\\config\" \"C:\\Windows\\System32\\config\\systemprofile\\.mrsh\\config\"\n");
+        // Also copy to ProgramData (service data dir — belt + suspenders)
+        s.push_str("    CopyFiles /SILENT \"$INSTDIR\\config\" \"$INSTDIR\\config.enrollment\"\n");
     }
     s.push_str("\n");
 
