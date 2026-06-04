@@ -44,8 +44,9 @@ SSH is great, but it wasn't designed for modern fleet management. **rsh** is bui
 | **GUI** | Mouse control, keyboard input, window management, screen capture (MJPEG), multi-display, remote UI test automation |
 | **System** | `reboot`, `shutdown`, `sleep`, `lock`, `wake` (WoL), `info`, `service` management, `ps`/`kill` |
 | **Server** | Windows service (SCM), system tray with notifications, console mode, auto-tray launch (WTS), DLL plugins |
-| **Fleet** | Multi-host commands, rendezvous relay, auto-discovery, self-update, fleet enrollment, `install-pack` (NSIS) |
-| **Config** | SSH-style config file, Ratatui TUI editor, TUI host picker (fuzzy search), `--log-file` |
+| **Fleet** | Multi-host status, rendezvous relay, hbbs peer discovery, self-update, fleet enrollment, `install-pack` (NSIS) |
+| **Dashboard** | TUI fleet dashboard (`rsh dash`), TUI log viewer (`rsh log`), real-time status with action menu |
+| **Config** | SSH-style config file, Ratatui TUI editor, TUI host picker (fuzzy search), auto-DeviceID, `--log-file` |
 | **SSH** | Transparent SSH fallback, SFTP, agent forwarding (`-A`), local/reverse port forwarding (`-L`/`-R`) |
 
 ## Quick Start
@@ -53,7 +54,7 @@ SSH is great, but it wasn't designed for modern fleet management. **rsh** is bui
 ### Client (Linux/macOS/Windows)
 
 ```bash
-# Test connection
+# Test connection (auto-tries ports 8822, 9822, 22)
 rsh -h 192.168.1.100 ping
 
 # Interactive shell
@@ -73,7 +74,7 @@ rsh -h 192.168.1.100 pull C:\logs\app.log ./local/
 
 ```powershell
 # Install as Windows service
-.\rsh.exe -install
+.\rsh.exe --install
 net start rsh
 
 # Or run as tray icon
@@ -239,11 +240,20 @@ rsh -h target -J jumphost:9822 exec "hostname"
 ### Fleet Management
 
 ```bash
-# Execute on multiple hosts
-rsh fleet exec "hostname" --hosts host1,host2,host3
+# Fleet status (probes all configured hosts + hbbs-discovered peers)
+rsh fleet status
 
-# Update all hosts
-rsh fleet update --hosts host1,host2,host3
+# Interactive TUI dashboard (live refresh, Enter for action menu)
+rsh dash
+
+# TUI log viewer (filter, search, tail mode)
+rsh log
+
+# Update all outdated hosts (push binary + self-update)
+rsh fleet update
+
+# Discover peers enrolled in a group
+rsh fleet discover --group myteam
 
 # Create installer package with pre-configured connection
 rsh install-pack --server 192.168.1.100 --key ~/.ssh/id_ed25519.pub -o installer.exe
@@ -327,10 +337,12 @@ RendezvousServer rdv.example.com:21116
 # Per-host settings
 Host myserver
     Hostname 192.168.1.100
-    Port 8822
+    Port 8822                 # Explicit port (skips auto-try)
     MAC aa:bb:cc:dd:ee:ff    # For Wake-on-LAN
     DeviceID 118855822        # For relay connections
 ```
+
+**Port resolution order**: (1) explicit `-p` flag, (2) config `Port` field, (3) auto-try 8822 → 9822 → 22 with 3s timeout per port.
 
 ### Server Configuration
 
@@ -349,7 +361,7 @@ C:\ProgramData\remote-shell\
 
 ## Building
 
-Requires Rust 1.75+ and `x86_64-pc-windows-gnu` target for cross-compilation.
+Requires Rust 1.85+ (edition 2024) and `x86_64-pc-windows-gnu` target for cross-compilation.
 
 ```bash
 # Linux client
@@ -406,7 +418,7 @@ rsh (workspace root)
 
 ### Wire Protocol
 
-- **Command port** (default 8822): Length-prefixed binary framing (4-byte BE header) over TLS
+- **Command port** (default 8822, auto-tries 8822 → 9822 → 22 when `-p` omitted): Length-prefixed binary framing (4-byte BE header) over TLS
 - **Stream port** (command port + 1): JSON + raw streams for push/pull
 - **SSH detection**: First byte peek &mdash; `0x16` routes to TLS, `0x53` routes to SSH handler
 - **Multiplexing**: Multiple logical channels over single TLS connection
@@ -463,7 +475,7 @@ rsh includes several measures to prevent misuse as a covert remote access tool:
 
 | Measure | Description |
 |---------|-------------|
-| **Mandatory tray icon** | Service installation (`-install`) registers a logon task that launches the tray companion at every user login. Users always see a system tray icon indicating rsh is active. |
+| **Mandatory tray icon** | Service installation (`--install`) registers a logon task that launches the tray companion at every user login. Users always see a system tray icon indicating rsh is active. |
 | **Connection toast notifications** | When a client authenticates, the tray icon displays a Windows balloon notification showing the client IP and key comment. Every remote connection has user-visible evidence. |
 | **Failed auth rate limiting** | IPs that fail authentication 5 times within 60 seconds are banned for 5 minutes. Prevents brute-force key guessing. |
 | **Exec safety guards** | Server blocks commands that would kill/stop/delete the rsh process (see table above). Prevents both accidental and deliberate self-destruction. |
@@ -497,6 +509,8 @@ rsh stands on the shoulders of these projects and ideas:
 
 - **GUI automation is Windows-only** — ConPTY shell, service SCM, tray icon, mouse/keyboard/window control require Windows. Server daemon mode (exec, file transfer, relay) works on all platforms
 - **QUIC transport** — server + client behind `--features quic`; supports `ping` and `exec` over QUIC (`rsh --quic -h host exec 'cmd'`)
+- **No server-side capability negotiation** — clients don't know which commands a server supports until they try. Fleet status shows version but not available features
+- **Go→Rust migration** — self-update on old Go rsh machines breaks the Windows service (single-dash vs double-dash CLI flags). Manual service reinstall required
 
 ## License
 

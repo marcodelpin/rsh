@@ -10,6 +10,19 @@ use rsh_core::{auth, protocol, wire};
 
 use crate::{dispatch, ratelimit, session, shell, sync, tunnel};
 
+/// Send a response, using zstd compression if the client supports it.
+async fn send_resp<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    resp: &protocol::Response,
+    use_zstd: bool,
+) -> Result<()> {
+    if use_zstd {
+        wire::send_json_compressed(writer, resp).await
+    } else {
+        wire::send_json(writer, resp).await
+    }
+}
+
 /// Server-side configuration for connection handling.
 pub struct ServerContext {
     pub authorized_keys: Vec<auth::AuthorizedKey>,
@@ -95,6 +108,8 @@ where
         crate::notify::notify_connection(addr, client.key_comment.clone());
     }
 
+    let use_zstd = client.caps.iter().any(|c| c == "zstd");
+
     // Phase 2: MUX or standard request loop
     #[cfg(windows)]
     if client.mux_enabled {
@@ -136,7 +151,7 @@ where
                 binary: None,
                 gzip: None,
             };
-            wire::send_json(&mut stream, &resp).await?;
+            send_resp(&mut stream, &resp, use_zstd).await?;
             continue;
         }
 
@@ -149,7 +164,7 @@ where
 
         match dispatch::dispatch(&req, &ctx.session_store).await {
             dispatch::DispatchResult::Response(response) => {
-                wire::send_json(&mut stream, &response).await?;
+                send_resp(&mut stream, &response, use_zstd).await?;
             }
             dispatch::DispatchResult::SyncStream(action) => {
                 match action {
@@ -279,8 +294,39 @@ fn check_permission(req: &protocol::Request, perms: &auth::KeyPermissions) -> Op
                 }
             }
         }
+        // Native commands — check specific permissions based on command content
+        "native" => {
+            let cmd = req.command.as_deref().unwrap_or("");
+            if cmd.starts_with("clip-") && !perms.allow_clipboard {
+                return Some("clipboard not permitted for this key".to_string());
+            }
+            if (cmd == "reboot" || cmd == "shutdown" || cmd == "sleep" || cmd == "lock") && !perms.allow_reboot {
+                return Some("reboot/shutdown not permitted for this key".to_string());
+            }
+            if cmd == "screenshot" && !perms.allow_screenshot {
+                return Some("screenshot not permitted for this key".to_string());
+            }
+        }
+        // Input (GUI automation) commands
+        "input" => {
+            if !perms.allow_gui {
+                return Some("GUI automation not permitted for this key".to_string());
+            }
+        }
+        // Screenshot
+        "screenshot" => {
+            if !perms.allow_screenshot {
+                return Some("screenshot not permitted for this key".to_string());
+            }
+        }
+        // Self-update
+        "self-update" => {
+            if !perms.allow_self_update {
+                return Some("self-update not permitted for this key".to_string());
+            }
+        }
         // Utility/info commands: always allowed
-        "ping" | "screenshot" | "native" | "self-update" | "session" | "input" | "info" => {}
+        "ping" | "session" | "info" => {}
         // Unknown request types: deny by default
         other => {
             return Some(format!("unknown request type '{}' denied by default", other));
@@ -799,6 +845,11 @@ mod tests {
             allow_pull: false,
             allow_shell: false,
             allow_tunnel: false,
+            allow_gui: false,
+            allow_clipboard: false,
+            allow_reboot: false,
+            allow_screenshot: false,
+            allow_self_update: false,
             forced_command: None,
             require_totp: false,
         };
@@ -812,11 +863,12 @@ mod tests {
         assert!(check_permission(&make_req("shell"), &perms).is_some());
         assert!(check_permission(&make_req("shell-persistent"), &perms).is_some());
         assert!(check_permission(&make_req("connect"), &perms).is_some());
+        assert!(check_permission(&make_req("input"), &perms).is_some());
+        assert!(check_permission(&make_req("screenshot"), &perms).is_some());
+        assert!(check_permission(&make_req("self-update"), &perms).is_some());
 
         // Utility commands always allowed
         assert!(check_permission(&make_req("ping"), &perms).is_none());
-        assert!(check_permission(&make_req("screenshot"), &perms).is_none());
-        assert!(check_permission(&make_req("self-update"), &perms).is_none());
     }
 
     #[test]
@@ -827,8 +879,7 @@ mod tests {
             allow_pull: true,
             allow_shell: false,
             allow_tunnel: false,
-            forced_command: None,
-            require_totp: false,
+            ..Default::default()
         };
 
         let mut req = make_req("sync");
@@ -847,8 +898,7 @@ mod tests {
             allow_pull: true,
             allow_shell: false,
             allow_tunnel: false,
-            forced_command: None,
-            require_totp: false,
+            ..Default::default()
         };
 
         assert!(check_permission(&make_req("exec"), &perms).is_none());

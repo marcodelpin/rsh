@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use rsh_client::client::ConnectOptions;
 use tracing::info;
@@ -130,7 +130,7 @@ struct Cli {
 
 /// Known local subcommands that don't require -h (used in server mode detection).
 #[cfg(target_os = "windows")]
-const LOCAL_COMMANDS: &[&str] = &["version", "fleet", "wake", "config-edit", "connect", "log", "keygen", "totp-setup", "totp-verify", "install-pack", "relay", "rendezvous"];
+const LOCAL_COMMANDS: &[&str] = &["version", "fleet", "wake", "cfg", "config-edit", "connect", "log", "logs", "dash", "dashboard", "keygen", "totp-setup", "totp-verify", "pack", "install-pack", "relay", "rdv", "rendezvous", "discover", "nat"];
 
 /// Returns the effective operation timeout in seconds.
 /// Explicit `--timeout N` (N > 0) overrides everything.
@@ -153,6 +153,10 @@ fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         let is_tray_mode = std::env::args().any(|a| a == "--tray");
+        // TUI commands need a visible, fully functional console
+        let is_tui_cmd = std::env::args().any(|a| {
+            matches!(a.as_str(), "dash" | "dashboard" | "logs" | "cfg" | "config-edit" | "browse" | "sftp" | "connect")
+        });
         if !is_tray_mode {
             unsafe {
                 use windows::Win32::System::Console::{
@@ -162,10 +166,40 @@ fn main() -> Result<()> {
                 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
                 if AttachConsole(ATTACH_PARENT_PROCESS).is_err() {
                     if AllocConsole().is_ok() {
-                        let hwnd = GetConsoleWindow();
-                        if !hwnd.is_invalid() {
-                            let _ = ShowWindow(hwnd, SW_HIDE);
+                        // TUI commands need a visible console; other commands hide it
+                        if !is_tui_cmd {
+                            let hwnd = GetConsoleWindow();
+                            if !hwnd.is_invalid() {
+                                let _ = ShowWindow(hwnd, SW_HIDE);
+                            }
                         }
+                    }
+                }
+                // After attach/alloc, reopen std handles so Rust's stdin/stdout
+                // point to the (re)attached console — required for crossterm TUI.
+                if is_tui_cmd {
+                    use windows::Win32::Storage::FileSystem::{
+                        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+                        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+                    };
+                    use windows::Win32::System::Console::{
+                        SetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                        STD_ERROR_HANDLE,
+                    };
+                    use windows::core::w;
+                    // Reopen CONIN$/CONOUT$ to get fresh handles to the console
+                    if let Ok(h) = CreateFileW(
+                        w!("CONIN$"), FILE_GENERIC_READ.0,
+                        FILE_SHARE_READ, None, OPEN_EXISTING, Default::default(), None,
+                    ) {
+                        let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+                    }
+                    if let Ok(h) = CreateFileW(
+                        w!("CONOUT$"), FILE_GENERIC_WRITE.0,
+                        FILE_SHARE_WRITE, None, OPEN_EXISTING, Default::default(), None,
+                    ) {
+                        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                        let _ = SetStdHandle(STD_ERROR_HANDLE, h);
                     }
                 }
             }
@@ -278,15 +312,27 @@ fn main() -> Result<()> {
     // blocks the main thread and spawns service_main on a new thread.
     #[cfg(target_os = "windows")]
     {
+        // Explicit --service flag: SCM launched us with this flag, go straight to dispatch.
+        if cli.service {
+            let port = cli.port.unwrap_or(8822);
+            rsh_server::service::run_as_service(move |cancel| {
+                let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+                rt.block_on(async {
+                    if let Err(e) = run_server_mode_with_cancel(port, cancel).await {
+                        tracing::error!("server error: {}", e);
+                    }
+                });
+            })?;
+            return Ok(());
+        }
+
         // Auto-detect service mode:
         // If no -h and no local subcommand → try SCM dispatch first.
         // If SCM dispatch fails → fall through to tray mode.
-        let is_local_cmd = cli.args.first().map_or(false, |a| {
-            LOCAL_COMMANDS.contains(&a.as_str()) || a == "help" || a == "recording" || a == "config-edit"
+        let is_local_cmd = cli.args.first().map_or(true, |a| {
+            LOCAL_COMMANDS.contains(&a.as_str()) || a == "help" || a == "recording"
         });
         if cli.host.is_none() && !is_local_cmd {
-            // Try service mode — service_dispatcher::start() blocks if SCM launched us,
-            // returns error immediately if we're not a service.
             let port = cli.port.unwrap_or(8822);
             let result = rsh_server::service::run_as_service(move |cancel| {
                 let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
@@ -338,6 +384,43 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         "fleet" => {
             return run_fleet(&args[1..]).await;
+        }
+        "discover" => {
+            let timeout_secs: u64 = args.get(1)
+                .and_then(|s| s.strip_prefix("--timeout=").or(Some(s.as_str())))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3);
+            let config = rsh_core::config::Config::load();
+            let local_id = config.device_id.clone().unwrap_or_default();
+            eprintln!("Scanning LAN for rsh peers ({timeout_secs}s)...");
+            let peers = rsh_relay::discovery::discover_lan(
+                rsh_relay::discovery::DISCOVERY_PORT,
+                std::time::Duration::from_secs(timeout_secs),
+                &local_id,
+            ).await;
+            if peers.is_empty() {
+                println!("No peers found.");
+            } else {
+                println!("{:<20} {:<16} {:<10} {:<6}", "HOSTNAME", "IP", "PLATFORM", "PORT");
+                println!("{}", "-".repeat(54));
+                for p in &peers {
+                    let port = if p.service_port > 0 { p.service_port.to_string() } else { "-".to_string() };
+                    println!("{:<20} {:<16} {:<10} {:<6}", p.hostname, p.addr.ip(), p.platform, port);
+                }
+                println!("\nFound {} peer(s)", peers.len());
+            }
+            return Ok(());
+        }
+        "nat" => {
+            eprintln!("Detecting NAT type (querying STUN servers)...");
+            let info = rsh_relay::stun::detect_nat_type(
+                std::time::Duration::from_secs(3),
+            ).await;
+            println!("NAT type: {}", info.nat_type);
+            if let Some(addr) = info.external_addr {
+                println!("External address: {}", addr);
+            }
+            return Ok(());
         }
         "wake" => {
             if args.len() < 2 {
@@ -401,7 +484,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             return run_totp_verify(&args[1], &args[2]);
         }
-        "config-edit" => {
+        "cfg" | "config-edit" => {
             rsh_client::config_tui::run_config_tui()?;
             return Ok(());
         }
@@ -429,13 +512,21 @@ async fn async_main(cli: Cli) -> Result<()> {
         "log" => {
             return run_log_query(&args[1..]);
         }
-        "install-pack" => {
+        "logs" => {
+            rsh_client::log_viewer::run_log_viewer()?;
+            return Ok(());
+        }
+        "dash" | "dashboard" => {
+            rsh_client::dashboard::run_dashboard().await?;
+            return Ok(());
+        }
+        "pack" | "install-pack" => {
             return run_install_pack(&args[1..]);
         }
         "relay" => {
             return run_relay_server(&args[1..]).await;
         }
-        "rendezvous" => {
+        "rdv" | "rendezvous" => {
             return run_rendezvous_server(&args[1..]).await;
         }
         _ => {}
@@ -671,7 +762,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 )).await?;
                 println!("{}", output);
             }
-            "screenshot" => {
+            "ss" | "screenshot" => {
                 let display: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
                 let quality: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(75);
                 // Use PowerShell .NET to capture screen and return base64
@@ -700,7 +791,228 @@ async fn async_main(cli: Cli) -> Result<()> {
                 std::fs::write(&out_path, &data)?;
                 eprintln!("saved {} ({} bytes)", out_path, data.len());
             }
-            _ => bail!("command {:?} is not supported over QUIC (omit --quic)", cmd),
+            // ── Clipboard ────────────────────────────────────────────
+            "clip" | "clipboard" => {
+                let action = args.get(1).map(|s| s.as_str()).unwrap_or("get");
+                match action {
+                    "get" | "read" => {
+                        let output = quic.exec("Get-Clipboard").await?;
+                        print!("{}", output);
+                    }
+                    "set" | "write" | "copy" => {
+                        if args.len() < 3 {
+                            bail!("clip set requires text");
+                        }
+                        let text = args[2..].join(" ");
+                        let escaped = text.replace('\'', "''");
+                        quic.exec(&format!("Set-Clipboard '{}'", escaped)).await?;
+                        eprintln!("clipboard set");
+                    }
+                    other => bail!("unknown clip action: {} (use get|set)", other),
+                }
+            }
+            // ── Service management ───────────────────────────────────
+            "service" | "svc" => {
+                if args.len() < 2 {
+                    bail!("service requires: list|status|start|stop|restart [name]");
+                }
+                let action = args[1].as_str();
+                let name = args.get(2).map(|s| s.as_str());
+                let ps_cmd = match (action, name) {
+                    ("list", _) => "Get-Service | Select-Object Status,Name,DisplayName | ConvertTo-Json".to_string(),
+                    ("status", Some(n)) => format!("Get-Service '{}' | Select-Object Status,Name,DisplayName,StartType | ConvertTo-Json", n),
+                    ("start", Some(n)) => format!("Start-Service '{}'; Get-Service '{}' | Select-Object Status,Name | ConvertTo-Json", n, n),
+                    ("stop", Some(n)) => format!("Stop-Service '{}' -Force; Get-Service '{}' | Select-Object Status,Name | ConvertTo-Json", n, n),
+                    ("restart", Some(n)) => format!("Restart-Service '{}'; Get-Service '{}' | Select-Object Status,Name | ConvertTo-Json", n, n),
+                    (_, None) => bail!("service {} requires a service name", action),
+                    (other, _) => bail!("unknown service action: {} (use list|status|start|stop|restart)", other),
+                };
+                let output = quic.exec(&ps_cmd).await?;
+                println!("{}", output);
+            }
+            // ── Write file ───────────────────────────────────────────
+            "write" => {
+                if args.len() < 3 {
+                    bail!("write requires <remote-path> <content>");
+                }
+                let content = args[2..].join(" ");
+                let written = quic.push(&args[1], content.as_bytes()).await?;
+                eprintln!("wrote {} bytes to {}", written, args[1]);
+            }
+            // ── Self-update ──────────────────────────────────────────
+            "self-update" => {
+                if args.len() < 2 {
+                    bail!("self-update requires <remote-binary-path>");
+                }
+                let escaped = args[1].replace('\'', "''");
+                let output = quic.exec(&format!(
+                    "$src = '{}'; \
+                     $exe = (Get-Process -Id $PID).Path; \
+                     $bak = $exe + '.old'; \
+                     if (Test-Path $bak) {{ Remove-Item $bak -Force }}; \
+                     Rename-Item $exe $bak; \
+                     Copy-Item $src $exe; \
+                     Remove-Item $src -Force; \
+                     'OK: restart service to apply'",
+                    escaped
+                )).await?;
+                eprintln!("{}", output);
+            }
+            // ── GUI automation ───────────────────────────────────────
+            "input" | "mouse" | "key" | "window" => {
+                if args.len() < 3 {
+                    bail!("{} requires <action> <args>", cmd);
+                }
+                // Forward as native exec — server handles via input handler
+                let full_cmd = args.join(" ");
+                let output = quic.exec(&full_cmd).await?;
+                if !output.is_empty() {
+                    println!("{}", output);
+                }
+            }
+            // ── Power management ─────────────────────────────────────
+            "reboot" => {
+                let force = args.get(1).map(|s| s == "-f" || s == "--force").unwrap_or(false);
+                if !force {
+                    eprint!("Reboot {}:{}? [y/N] ", resolved_host, resolved_port);
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    let a = answer.trim().to_lowercase();
+                    if a != "y" && a != "yes" && a != "si" {
+                        return Ok(());
+                    }
+                }
+                eprintln!("Rebooting {}:{}...", resolved_host, resolved_port);
+                quic.exec("Restart-Computer -Force").await.ok();
+            }
+            "shutdown" => {
+                let force = args.get(1).map(|s| s == "-f" || s == "--force").unwrap_or(false);
+                if !force {
+                    eprint!("Shutdown {}:{}? [y/N] ", resolved_host, resolved_port);
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    let a = answer.trim().to_lowercase();
+                    if a != "y" && a != "yes" && a != "si" {
+                        return Ok(());
+                    }
+                }
+                eprintln!("Shutting down {}:{}...", resolved_host, resolved_port);
+                quic.exec("Stop-Computer -Force").await.ok();
+                eprintln!("Shutdown command sent.");
+            }
+            "sleep" => {
+                let force = args.get(1).map(|s| s == "-f" || s == "--force").unwrap_or(false);
+                if !force {
+                    eprint!("Sleep {}:{}? [y/N] ", resolved_host, resolved_port);
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    let a = answer.trim().to_lowercase();
+                    if a != "y" && a != "yes" && a != "si" {
+                        return Ok(());
+                    }
+                }
+                eprintln!("Putting {}:{} to sleep...", resolved_host, resolved_port);
+                quic.exec(
+                    "Add-Type -Assembly System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $true, $false)"
+                ).await.ok();
+                eprintln!("Sleep command sent.");
+            }
+            "lock" => {
+                eprintln!("Locking workstation on {}:{}...", resolved_host, resolved_port);
+                quic.exec("rundll32.exe user32.dll,LockWorkStation").await?;
+                eprintln!("Workstation locked.");
+            }
+            // ── Status (multi-ping with RTT stats) ───────────────────
+            "status" => {
+                let count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5);
+                let mut rtts = Vec::with_capacity(count);
+                let mut failures = 0usize;
+                println!("--- {} (QUIC) ---", resolved_host);
+                for i in 0..count {
+                    let start = std::time::Instant::now();
+                    match quic.exec("echo PONG").await {
+                        Ok(_) => {
+                            let elapsed = start.elapsed();
+                            eprintln!("  ping {}: {:.1?}", i + 1, elapsed);
+                            rtts.push(elapsed);
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            eprintln!("  ping {}: FAILED ({})", i + 1, e);
+                        }
+                    }
+                    if i < count - 1 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
+                if !rtts.is_empty() {
+                    let avg = rtts.iter().sum::<std::time::Duration>() / rtts.len() as u32;
+                    let min = rtts.iter().min().unwrap();
+                    let max = rtts.iter().max().unwrap();
+                    let mut sorted = rtts.clone();
+                    sorted.sort();
+                    let p50 = sorted[sorted.len() / 2];
+                    let loss = (failures as f64 / count as f64) * 100.0;
+                    println!("rtt min/avg/max/p50 = {:.1?}/{:.1?}/{:.1?}/{:.1?}", min, avg, max, p50);
+                    if failures > 0 {
+                        println!("packet loss: {:.0}%", loss);
+                    }
+                }
+            }
+            // ── Cache management ─────────────────────────────────────
+            "cache" => {
+                if args.len() < 2 {
+                    bail!("cache requires: stats|index [path]");
+                }
+                match args[1].as_str() {
+                    "stats" => {
+                        let output = quic.exec("if (Test-Path 'C:\\ProgramData\\remote-shell\\cache') { Get-ChildItem 'C:\\ProgramData\\remote-shell\\cache' -Recurse | Measure-Object -Property Length -Sum | Select-Object Count,Sum | ConvertTo-Json } else { '{\"Count\":0,\"Sum\":0}' }").await?;
+                        println!("{}", output);
+                    }
+                    "index" => {
+                        if args.len() < 3 {
+                            bail!("cache index requires <remote-path>");
+                        }
+                        let escaped = args[2].replace('\'', "''");
+                        let output = quic.exec(&format!(
+                            "Get-ChildItem '{}' -Recurse | Select-Object FullName,Length,LastWriteTime | ConvertTo-Json",
+                            escaped
+                        )).await?;
+                        println!("{}", output);
+                    }
+                    other => bail!("unknown cache action: {} (use stats|index)", other),
+                }
+            }
+            // ── Plugin management ────────────────────────────────────
+            "plugin" => {
+                if args.len() < 2 {
+                    bail!("plugin requires <action> [args...]");
+                }
+                let plugin_cmd = args[1..].join(" ");
+                let output = quic.exec(&format!("rsh plugin {}", plugin_cmd)).await?;
+                if !output.is_empty() {
+                    println!("{}", output);
+                }
+            }
+            // ── Recording list ───────────────────────────────────────
+            "recording" => {
+                let output = quic.exec("if (Test-Path 'C:\\ProgramData\\remote-shell\\recordings') { Get-ChildItem 'C:\\ProgramData\\remote-shell\\recordings' -Filter '*.cast' | Select-Object Name,Length,LastWriteTime | ConvertTo-Json } else { '[]' }").await?;
+                println!("{}", output);
+            }
+            // ── Server version ───────────────────────────────────────
+            "server-version" => {
+                println!("{}", quic.server_version.as_deref().unwrap_or("unknown"));
+            }
+            // ── TUI-only commands (not applicable over QUIC) ─────────
+            "sessions" | "attach" | "browse" | "sftp" => {
+                bail!("command {:?} requires TUI mode (omit --quic)", cmd);
+            }
+            // ── Unknown → try as exec ────────────────────────────────
+            _ => {
+                let command = args.join(" ");
+                let output = quic.exec(&command).await?;
+                print!("{}", output);
+            }
         }
         quic.close();
         return Ok(());
@@ -1094,7 +1406,17 @@ async fn async_main(cli: Cli) -> Result<()> {
                     let result = rsh_client::commands::clip_set(&mut client, &text).await?;
                     println!("{}", result);
                 }
-                other => bail!("unknown clip action: {} (use get|set)", other),
+                "sync" => {
+                    let interval_ms: u64 = args.get(2)
+                        .and_then(|s| s.strip_prefix("--interval=").or(Some(s.as_str())))
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(500);
+                    rsh_client::commands::clip_sync(
+                        &mut client,
+                        std::time::Duration::from_millis(interval_ms),
+                    ).await?;
+                }
+                other => bail!("unknown clip action: {} (use get|set|sync)", other),
             }
         }
         "service" | "svc" => {
@@ -1898,8 +2220,9 @@ async fn run_fleet(args: &[String]) -> Result<()> {
 
     match action {
         "status" => {
+            let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
             let statuses = rsh_client::fleet::status(&config).await;
-            println!("{}", rsh_client::fleet::format_status_table(&statuses));
+            println!("{}", rsh_client::fleet::format_status_table_inner(&statuses, verbose));
         }
         "update" => {
             let binary_path = args.get(1).map(|s| s.as_str()).unwrap_or("deploy/rsh.exe");
@@ -2004,6 +2327,7 @@ async fn run_fleet(args: &[String]) -> Result<()> {
                 group_hash: String::new(),
                 hostname: String::new(),
                 platform: String::new(),
+                service_port: 0,
             };
 
             eprintln!("Querying {} for group '{}'...", rdv_server, group_name);
@@ -2299,6 +2623,94 @@ async fn run_server_mode_with_cancel(
     run_server_mode_inner(port, false, cancel).await
 }
 
+/// Resolve the DeviceID with fallback chain:
+/// 1. Config `device_id` field (if set) → use it
+/// 2. Legacy `device_id` file in data_dir (from old Go installs) → use it
+/// 3. Neither → generate a new 9-digit numeric ID, save to config
+fn resolve_device_id(config: &rsh_core::config::Config, data_dir: &std::path::Path) -> String {
+    let config_id = config.device_id.clone().unwrap_or_default();
+    if !config_id.is_empty() {
+        return config_id;
+    }
+
+    // Fallback 1: read device_id file from data dir (legacy Go installs)
+    let file_id = std::fs::read_to_string(data_dir.join("device_id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let id = if file_id.is_empty() {
+        // Fallback 2: generate a new 9-digit numeric device ID
+        use rand::Rng;
+        let n: u32 = rand::thread_rng().gen_range(100_000_000..999_999_999);
+        n.to_string()
+    } else {
+        file_id
+    };
+
+    // Persist to config so it's stable across restarts
+    let mut cfg = rsh_core::config::Config::load();
+    cfg.device_id = Some(id.clone());
+    if let Err(e) = cfg.save() {
+        tracing::warn!("could not save device_id to config: {}", e);
+    } else {
+        tracing::info!("generated and saved DeviceID {}", id);
+    }
+
+    id
+}
+
+/// Build the list of capabilities this server supports.
+/// Advertised to clients during auth handshake so they know what commands are available.
+fn build_server_caps() -> Vec<String> {
+    let mut caps = vec![
+        "exec".to_string(),
+        "push".to_string(),
+        "pull".to_string(),
+        "self-update".to_string(),
+        "bin-patch".to_string(),
+        "info".to_string(),
+        "ps".to_string(),
+        "kill".to_string(),
+        "ls".to_string(),
+        "cat".to_string(),
+        "tail".to_string(),
+        "clip".to_string(),
+        "screenshot".to_string(),
+    ];
+
+    #[cfg(windows)]
+    {
+        caps.extend([
+            "shell".to_string(),
+            "session".to_string(),
+            "recording".to_string(),
+            "mouse".to_string(),
+            "keyboard".to_string(),
+            "window".to_string(),
+            "service".to_string(),
+            "reboot".to_string(),
+            "shutdown".to_string(),
+            "sleep".to_string(),
+            "lock".to_string(),
+        ]);
+    }
+
+    #[cfg(not(windows))]
+    {
+        caps.push("shell".to_string());
+        caps.push("reboot".to_string());
+        caps.push("shutdown".to_string());
+    }
+
+    #[cfg(feature = "quic")]
+    caps.push("quic".to_string());
+
+    caps.push("zstd".to_string());
+
+    caps
+}
+
 async fn run_server_mode_inner(
     port: u16,
     _with_tray: bool,
@@ -2337,11 +2749,7 @@ async fn run_server_mode_inner(
         std::collections::HashSet::new()
     };
 
-    let caps = vec![
-        "shell".to_string(),
-        "self-update".to_string(),
-        "bin-patch".to_string(),
-    ];
+    let caps = build_server_caps();
 
     // Load TOTP secrets (optional — empty vec if file doesn't exist)
     let totp_path = data_dir.join("totp_secrets");
@@ -2372,6 +2780,10 @@ async fn run_server_mode_inner(
         totp_recovery_path,
     });
 
+    // Clone TLS acceptor and ctx for relay handler before moving into ServerConfig.
+    let relay_tls_acceptor = tls_acceptor.clone();
+    let relay_ctx = ctx.clone();
+
     let config = listener::ServerConfig {
         command_port: port,
         tls_acceptor,
@@ -2381,11 +2793,11 @@ async fn run_server_mode_inner(
         tls_config: tls_config_for_quic,
     };
 
-    // Spawn rendezvous registration loop (if configured).
+    // Spawn rendezvous registration loop with relay notification support.
     {
         let user_config = rsh_core::config::Config::load();
         let rdv_servers = user_config.get_rendezvous_servers();
-        let device_id = user_config.device_id.clone().unwrap_or_default();
+        let device_id = resolve_device_id(&user_config, &data_dir);
         let rdv_key = user_config.rendezvous_key.clone().unwrap_or_default();
         // Compute group_hash from enrollment_token (if present in config).
         let group_hash = if let Some(ref token) = user_config.enrollment_token {
@@ -2404,31 +2816,59 @@ async fn run_server_mode_inner(
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let platform = std::env::consts::OS.to_string();
+
+        // Spawn LAN discovery responder (non-fatal if port busy).
+        {
+            let cancel_disc = cancel.clone();
+            let disc_id = device_id.clone();
+            let disc_host = hostname.clone();
+            let disc_platform = platform.clone();
+            let disc_port = port;
+            tokio::spawn(async move {
+                rsh_relay::discovery::run_discovery_responder(
+                    cancel_disc, disc_id, disc_host, disc_platform, disc_port,
+                ).await;
+            });
+        }
+
         if !rdv_servers.is_empty() && !device_id.is_empty() {
-            let cancel = cancel.clone();
+            let (relay_tx, mut relay_rx) =
+                tokio::sync::mpsc::channel::<rsh_relay::rendezvous::RelayNotification>(16);
+
+            // Registration + relay notification listener.
+            let cancel_reg = cancel.clone();
+            let svc_port = port;
             tokio::spawn(async move {
                 let client = rsh_relay::rendezvous::Client {
                     servers: rdv_servers,
-                    licence_key: rdv_key,
-                    local_id: device_id.clone(),
-                    group_hash: group_hash.clone(),
+                    licence_key: rdv_key.clone(),
+                    local_id: device_id,
+                    group_hash,
                     hostname,
                     platform,
+                    service_port: svc_port,
                 };
-                if !group_hash.is_empty() {
-                    info!("rendezvous registration started for DeviceID {} (group enrolled)", device_id);
-                } else {
-                    info!("rendezvous registration started for DeviceID {}", device_id);
-                }
-                // Register immediately on startup, then every 30s.
+                client.run_registration_loop(cancel_reg, relay_tx).await;
+            });
+
+            // Relay acceptance handler: receives notifications from hbbs and
+            // connects to hbbr to complete the relay pairing.
+            let cancel_relay = cancel.clone();
+            let relay_key = user_config.rendezvous_key.clone().unwrap_or_default();
+            tokio::spawn(async move {
                 loop {
-                    match client.register_once().await {
-                        Ok(()) => tracing::debug!("rendezvous registered"),
-                        Err(e) => tracing::warn!("rendezvous registration failed: {}", e),
-                    }
                     tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+                        _ = cancel_relay.cancelled() => break,
+                        Some(notif) = relay_rx.recv() => {
+                            let acceptor = relay_tls_acceptor.clone();
+                            let ctx = relay_ctx.clone();
+                            let key = relay_key.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = accept_relay_connection(notif, acceptor, ctx, &key).await {
+                                    tracing::warn!("relay accept: {}", e);
+                                }
+                            });
+                        }
                     }
                 }
             });
@@ -2464,6 +2904,49 @@ async fn run_server_mode_inner(
 
     // Service, console, or daemon mode — listener blocks, no tray
     listener::run_server(config, cancel).await?;
+
+    Ok(())
+}
+
+/// Accept an incoming relay connection: connect to hbbr, TLS accept, dispatch.
+///
+/// Called when hbbs sends a RelayResponse notification indicating a client
+/// wants to connect to this server via relay. We connect to hbbr with the
+/// same UUID so hbbr can pair us with the client.
+async fn accept_relay_connection(
+    notif: rsh_relay::rendezvous::RelayNotification,
+    acceptor: tokio_rustls::TlsAcceptor,
+    ctx: Arc<rsh_server::handler::ServerContext>,
+    licence_key: &str,
+) -> Result<()> {
+    let relay_addr = if notif.relay_server.contains(':') {
+        notif.relay_server.clone()
+    } else {
+        format!("{}:21117", notif.relay_server)
+    };
+
+    info!(
+        "relay accept: connecting to hbbr {} uuid={}",
+        relay_addr, notif.uuid
+    );
+
+    let relay_stream = rsh_relay::relay::connect_relay(&relay_addr, &notif.uuid, licence_key)
+        .await
+        .context("relay: connect to hbbr")?;
+
+    tracing::debug!("relay accept: connected, waiting for TLS handshake");
+
+    let tls_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        acceptor.accept(relay_stream),
+    )
+    .await
+    .context("relay: TLS accept timeout")?
+    .context("relay: TLS accept")?;
+
+    info!("relay accept: TLS established, dispatching");
+
+    rsh_server::handler::handle_connection(tls_stream, &ctx, None).await?;
 
     Ok(())
 }
@@ -2536,7 +3019,7 @@ USAGE:
 
 OPTIONS:
   -h <host>     Remote host (IP, hostname, or DeviceID)
-  -p <port>     Remote port (default: 8822)
+  -p <port>     Remote port (omit to auto-try: 8822 → 9822 → 22)
   -i <key>      SSH key file
   -v, -vv       Verbose output
 
@@ -2549,16 +3032,18 @@ LOCAL COMMANDS (no -h needed):
                   Uses enrollment token HMAC for authentication.
                   Returns: DeviceID, hostname, platform, LAN status
   wake <host|mac>  Send Wake-on-LAN packet (MAC from config or argument)
-  config-edit   Interactive config editor (TUI)
+  cfg           Interactive config editor (TUI)
   connect       Pick a known host from TUI list and connect
   log           Session log report (hours per host)
                   --host=X  --since=YYYY-MM-DD  --until=YYYY-MM-DD
                   --detail  --json
+  logs          Interactive log viewer (TUI) — browse, filter, summarize
+  dash          Fleet dashboard (TUI) — live host status, auto-refresh
   keygen [path] Generate ed25519 key pair
   totp-setup [fp] Generate TOTP secret + recovery codes for a key
   totp-verify <secret|fp> <code>  Verify a TOTP code
   recording export <file.log> [output.cast]  Convert session log to asciicast
-  install-pack  Generate single-file installer for target machine
+  pack          Generate single-file installer for target machine
                   Linux:   self-extracting .sh (bash header + tar.gz)
                   Windows: NSIS installer .exe (requires makensis on build host)
                   --platform=windows|linux  --output=FILE  --binary=PATH
@@ -2568,7 +3053,7 @@ LOCAL COMMANDS (no -h needed):
                   installed server registers with SHA256(token) as group_hash.
   relay         Run relay server (hbbr) for connection pairing
                   --port=PORT (default: 21117)  --key=KEY
-  rendezvous    Run rendezvous server (hbbs) for device discovery
+  rdv           Run rendezvous server (hbbs) for device discovery
                   --port=PORT (default: 21116)  --key=KEY  --relay=HOST:PORT
                   Stores peer group_hash for fleet group discovery.
   help          This help
@@ -2596,7 +3081,7 @@ TRANSFER OPTIONS:
   ls [path]     List directory
   cat <path>    Read file
   write <r> <c> Write content to file
-  screenshot    Capture screen
+  ss            Capture screen (alias: screenshot)
   watch <l> <r> Watch dir, auto-push changes
   status [n]    RTT statistics (n pings)
   ps            List processes
@@ -2911,5 +3396,88 @@ mod tests {
             fast,
         ).await;
         assert_eq!(result.unwrap(), 42);
+    }
+
+    // --- build_server_caps ---
+
+    #[test]
+    fn caps_contains_common_capabilities() {
+        let caps = build_server_caps();
+        for expected in &["exec", "push", "pull", "self-update", "info", "ps", "kill", "ls", "cat", "tail", "clip", "screenshot"] {
+            assert!(caps.iter().any(|c| c == expected), "missing common cap: {}", expected);
+        }
+    }
+
+    #[test]
+    fn caps_contains_shell_on_all_platforms() {
+        let caps = build_server_caps();
+        assert!(caps.contains(&"shell".to_string()), "shell must be in caps on all platforms");
+    }
+
+    #[test]
+    fn caps_contains_reboot_shutdown_on_all_platforms() {
+        let caps = build_server_caps();
+        assert!(caps.contains(&"reboot".to_string()));
+        assert!(caps.contains(&"shutdown".to_string()));
+    }
+
+    #[test]
+    fn caps_no_duplicates() {
+        let caps = build_server_caps();
+        let mut seen = std::collections::HashSet::new();
+        for cap in &caps {
+            assert!(seen.insert(cap), "duplicate cap: {}", cap);
+        }
+    }
+
+    // --- resolve_device_id ---
+
+    #[test]
+    fn device_id_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = rsh_core::config::Config::default();
+        config.device_id = Some("123456789".to_string());
+        let id = resolve_device_id(&config, tmp.path());
+        assert_eq!(id, "123456789");
+    }
+
+    #[test]
+    fn device_id_from_legacy_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("device_id"), "987654321\n").unwrap();
+        let config = rsh_core::config::Config::default(); // no device_id set
+        let id = resolve_device_id(&config, tmp.path());
+        assert_eq!(id, "987654321");
+    }
+
+    #[test]
+    fn device_id_generated_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = rsh_core::config::Config::default();
+        let id = resolve_device_id(&config, tmp.path());
+        // Should be 9 digits
+        assert_eq!(id.len(), 9, "generated ID should be 9 digits: {}", id);
+        assert!(id.chars().all(|c| c.is_ascii_digit()), "ID should be all digits: {}", id);
+        let n: u32 = id.parse().unwrap();
+        assert!(n >= 100_000_000 && n < 999_999_999);
+    }
+
+    #[test]
+    fn device_id_config_takes_precedence_over_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("device_id"), "111111111").unwrap();
+        let mut config = rsh_core::config::Config::default();
+        config.device_id = Some("222222222".to_string());
+        let id = resolve_device_id(&config, tmp.path());
+        assert_eq!(id, "222222222", "config should take precedence over file");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn caps_linux_excludes_windows_only() {
+        let caps = build_server_caps();
+        for win_only in &["mouse", "keyboard", "window", "service", "session", "recording", "sleep", "lock"] {
+            assert!(!caps.iter().any(|c| c == win_only), "Linux caps should not contain {}", win_only);
+        }
     }
 }

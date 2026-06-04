@@ -36,17 +36,44 @@ const MAX_CONCURRENT: usize = 10;
 /// Probe timeout per host.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Get status of all configured hosts.
+/// Max age (seconds) for hbbs registration to count as "online".
+/// Peers register every 30s, so 90s = 3 missed heartbeats.
+const HBBS_ONLINE_THRESHOLD_SECS: u64 = 90;
+
+/// Get status of all fleet hosts.
+///
+/// Merges two sources:
+/// 1. Config hosts (local `~/.rsh/config` Host blocks) — probed via TCP, enriched with hbbs
+/// 2. hbbs peers (dynamic, via `ListPeers` query) — online status from registration freshness
+///
+/// Config hosts take precedence: if a config host's DeviceID matches an hbbs peer,
+/// the config entry is used (with its alias name and hostname override).
+/// If TCP probe fails but hbbs says the peer registered recently, it's marked online via "hbbs".
+/// hbbs peers not covered by config use registration freshness (no TCP probe needed).
 pub async fn status(config: &Config) -> Vec<HostStatus> {
-    let hosts: Vec<&HostConfig> = config.hosts.iter().collect();
-    if hosts.is_empty() {
-        return Vec::new();
-    }
+    let config_hosts: Vec<&HostConfig> = config.hosts.iter().collect();
+
+    // Query hbbs for dynamic peers (best-effort, non-blocking)
+    let hbbs_peers = discover_from_hbbs(config).await;
+
+    // Index hbbs peers by device_id for fast lookup
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let hbbs_map: std::collections::HashMap<String, &rsh_relay::rendezvous::GroupPeerInfo> =
+        hbbs_peers.iter().map(|p| (p.device_id.clone(), p)).collect();
+
+    let config_device_ids: std::collections::HashSet<String> = config_hosts
+        .iter()
+        .filter_map(|h| h.device_id.clone())
+        .collect();
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
 
-    for host in &hosts {
+    // Probe config hosts (TCP), with hbbs fallback info
+    for host in &config_hosts {
         let sem = semaphore.clone();
         let name = host.pattern.clone();
         let hostname = host
@@ -59,9 +86,59 @@ pub async fn status(config: &Config) -> Vec<HostStatus> {
         let rdv_key = config.rendezvous_key.clone();
         let quic_port = host.quic_port;
 
+        // Check if hbbs knows this peer is recently active
+        let hbbs_online = device_id.as_ref()
+            .and_then(|did| hbbs_map.get(did))
+            .map(|p| now_secs.saturating_sub(p.last_seen_secs) < HBBS_ONLINE_THRESHOLD_SECS)
+            .unwrap_or(false);
+
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.ok();
-            probe_host(&name, &hostname, port, device_id, rdv_server, rdv_key, quic_port).await
+            let mut result = probe_host(&name, &hostname, port, device_id, rdv_server, rdv_key, quic_port).await;
+            // If probe failed but hbbs says online, trust hbbs
+            if !result.online && hbbs_online {
+                result.online = true;
+                result.transport = "hbbs";
+                result.error = None;
+            }
+            result
+        }));
+    }
+
+    // hbbs peers not in config — use registration freshness, no TCP probe
+    for peer in &hbbs_peers {
+        if config_device_ids.contains(&peer.device_id) {
+            continue; // config host takes precedence
+        }
+        let name = if peer.hostname.is_empty() {
+            peer.device_id.clone()
+        } else {
+            peer.hostname.clone()
+        };
+        let hostname = peer.addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| name.clone());
+        let port = if peer.service_port > 0 { peer.service_port } else { 8822 };
+        let online = now_secs.saturating_sub(peer.last_seen_secs) < HBBS_ONLINE_THRESHOLD_SECS;
+        let device_id = Some(peer.device_id.clone());
+        let rdv_server = config.rendezvous_server.clone();
+        let rdv_key = config.rendezvous_key.clone();
+        handles.push(tokio::spawn(async move {
+            HostStatus {
+                name,
+                hostname,
+                port,
+                online,
+                version: None,
+                caps: Vec::new(),
+                latency_ms: 0,
+                error: if online { None } else { Some("not registered".to_string()) },
+                device_id,
+                rendezvous_server: rdv_server,
+                rendezvous_key: rdv_key,
+                quic_port: None,
+                transport: if online { "hbbs" } else { "none" },
+            }
         }));
     }
 
@@ -74,6 +151,36 @@ pub async fn status(config: &Config) -> Vec<HostStatus> {
     }
 
     results
+}
+
+/// Query hbbs for all registered peers (best-effort).
+async fn discover_from_hbbs(config: &Config) -> Vec<rsh_relay::rendezvous::GroupPeerInfo> {
+    let rdv_server = match &config.rendezvous_server {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => return Vec::new(),
+    };
+    let rdv_key = config.rendezvous_key.clone().unwrap_or_default();
+
+    let client = rsh_relay::rendezvous::Client {
+        servers: vec![rdv_server],
+        licence_key: rdv_key,
+        local_id: String::new(),
+        group_hash: String::new(),
+        hostname: String::new(),
+        platform: String::new(),
+        service_port: 0,
+    };
+
+    match client.list_peers().await {
+        Ok(peers) => {
+            debug!("hbbs: discovered {} peers", peers.len());
+            peers
+        }
+        Err(e) => {
+            debug!("hbbs: list_peers failed (non-fatal): {}", e);
+            Vec::new()
+        }
+    }
 }
 
 /// Probe a single host for version and capabilities.
@@ -244,16 +351,29 @@ pub fn hosts_with_cap<'a>(statuses: &'a [HostStatus], cap: &str) -> Vec<&'a Host
 
 /// Format fleet status as a table string.
 pub fn format_status_table(statuses: &[HostStatus]) -> String {
+    format_status_table_inner(statuses, false)
+}
+
+/// Format fleet status table. If `show_caps` is true, include a CAPS column.
+pub fn format_status_table_inner(statuses: &[HostStatus], show_caps: bool) -> String {
     if statuses.is_empty() {
         return "No hosts configured.".to_string();
     }
 
     let mut lines = Vec::new();
-    lines.push(format!(
-        "{:<20} {:<6} {:<10} {:<12} {:<8}",
-        "HOST", "PORT", "STATUS", "VERSION", "LATENCY"
-    ));
-    lines.push("-".repeat(60));
+    if show_caps {
+        lines.push(format!(
+            "{:<20} {:<6} {:<10} {:<12} {:<8} {}",
+            "HOST", "PORT", "STATUS", "VERSION", "LATENCY", "CAPS"
+        ));
+        lines.push("-".repeat(100));
+    } else {
+        lines.push(format!(
+            "{:<20} {:<6} {:<10} {:<12} {:<8}",
+            "HOST", "PORT", "STATUS", "VERSION", "LATENCY"
+        ));
+        lines.push("-".repeat(60));
+    }
 
     for s in statuses {
         let status = if s.online { "online" } else { "offline" };
@@ -263,10 +383,22 @@ pub fn format_status_table(statuses: &[HostStatus]) -> String {
         } else {
             "-".to_string()
         };
-        lines.push(format!(
-            "{:<20} {:<6} {:<10} {:<12} {:<8}",
-            s.name, s.port, status, version, latency
-        ));
+        if show_caps {
+            let caps = if s.caps.is_empty() {
+                "-".to_string()
+            } else {
+                s.caps.join(",")
+            };
+            lines.push(format!(
+                "{:<20} {:<6} {:<10} {:<12} {:<8} {}",
+                s.name, s.port, status, version, latency, caps
+            ));
+        } else {
+            lines.push(format!(
+                "{:<20} {:<6} {:<10} {:<12} {:<8}",
+                s.name, s.port, status, version, latency
+            ));
+        }
     }
 
     lines.join("\n")
@@ -761,5 +893,33 @@ mod tests {
         assert!(s.device_id.is_none());
         assert!(s.rendezvous_server.is_none());
         assert!(s.rendezvous_key.is_none());
+    }
+
+    #[test]
+    fn format_status_table_verbose_shows_caps() {
+        let mut s = mock_status("myhost", true, Some("1.2.0"));
+        s.caps = vec!["exec".to_string(), "shell".to_string(), "push".to_string()];
+        let table = format_status_table_inner(&[s], true);
+        assert!(table.contains("CAPS"), "verbose table must have CAPS header");
+        assert!(table.contains("exec,shell,push"), "caps should be comma-separated");
+    }
+
+    #[test]
+    fn format_status_table_verbose_empty_caps_shows_dash() {
+        let mut s = mock_status("no-caps-host", true, Some("1.0.0"));
+        s.caps = Vec::new();
+        let table = format_status_table_inner(&[s], true);
+        assert!(table.contains("CAPS"));
+        let lines: Vec<&str> = table.lines().collect();
+        let host_line = lines.iter().find(|l| l.contains("no-caps-host")).unwrap();
+        assert!(host_line.trim().ends_with('-'), "empty caps should show '-', got: {}", host_line);
+    }
+
+    #[test]
+    fn format_status_table_non_verbose_hides_caps() {
+        let mut s = mock_status("myhost", true, Some("1.2.0"));
+        s.caps = vec!["exec".to_string()];
+        let table = format_status_table_inner(&[s], false);
+        assert!(!table.contains("CAPS"), "non-verbose table must not have CAPS column");
     }
 }

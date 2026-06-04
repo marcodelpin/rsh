@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{Duration, Instant, timeout};
 
 use crate::codec;
@@ -46,6 +46,17 @@ pub struct GroupPeerInfo {
     pub platform: String,
     pub addr: Option<SocketAddr>,
     pub last_seen_secs: u64,
+    /// rsh command listener port (0 means default 8822).
+    pub service_port: u16,
+}
+
+/// A relay notification received from hbbs: a client wants to connect via relay.
+#[derive(Debug, Clone)]
+pub struct RelayNotification {
+    /// UUID for relay pairing (both sides connect to hbbr with this UUID).
+    pub uuid: String,
+    /// Relay server address (hbbr host:port).
+    pub relay_server: String,
 }
 
 /// Client for hbbs rendezvous protocol.
@@ -62,6 +73,8 @@ pub struct Client {
     pub hostname: String,
     /// Platform (e.g. "windows", "linux") — included in RegisterPeer.
     pub platform: String,
+    /// rsh command listener port — included in RegisterPeer so hbbs can report it.
+    pub service_port: u16,
 }
 
 /// Check whether a string looks like a device ID rather than a hostname/IP.
@@ -204,6 +217,8 @@ struct PeerEntry {
     hostname: String,
     /// Platform: "windows" or "linux".
     platform: String,
+    /// rsh command listener port (0 = default 8822).
+    service_port: u16,
 }
 
 /// Default peer expiry time (5 minutes without re-registration).
@@ -229,6 +244,11 @@ impl RendezvousServer {
     }
 
     /// Start the rendezvous server on the given UDP address.
+    ///
+    /// Listens on both UDP (registration, punch-hole, group queries) and TCP
+    /// (RequestRelay forwarding). When a client sends RequestRelay via TCP,
+    /// hbbs looks up the target device and sends RelayResponse via UDP to its
+    /// registered address, enabling server-side relay acceptance.
     pub async fn listen_and_serve(&self, addr: &str) -> Result<()> {
         let sock = Arc::new(UdpSocket::bind(addr).await.context("bind UDP")?);
 
@@ -249,6 +269,40 @@ impl RendezvousServer {
                 if removed > 0 {
                     tracing::debug!("rdv: expired {removed} peers, {} remaining", map.len());
                 }
+            }
+        });
+
+        // Spawn TCP listener for RequestRelay forwarding.
+        // TCP and UDP can share the same port number.
+        let tcp_listener = TcpListener::bind(addr)
+            .await
+            .context("bind TCP for relay forwarding")?;
+        tracing::info!("rdv: TCP relay forwarding on {}", addr);
+
+        let peers_tcp = peers.clone();
+        let sock_tcp = sock.clone();
+        let relay_server = self.relay_server.clone();
+        let key_tcp = self.key.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, peer) = match tcp_listener.accept().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!("rdv tcp accept: {}", e);
+                        continue;
+                    }
+                };
+                let peers = peers_tcp.clone();
+                let sock = sock_tcp.clone();
+                let relay = relay_server.clone();
+                let key = key_tcp.clone();
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        handle_tcp_relay_request(stream, peer, &peers, &sock, &relay, &key).await
+                    {
+                        tracing::debug!("rdv tcp relay from {}: {}", peer, e);
+                    }
+                });
             }
         });
 
@@ -289,6 +343,7 @@ impl RendezvousServer {
                             group_hash: rp.group_hash.clone(),
                             hostname: rp.hostname.clone(),
                             platform: rp.platform.clone(),
+                            service_port: rp.service_port as u16,
                         },
                     );
                     if has_group {
@@ -338,6 +393,10 @@ impl RendezvousServer {
 
             proto::rendezvous_message::Union::GroupQuery(gq) => {
                 self.handle_group_query(gq, peers)
+            }
+
+            proto::rendezvous_message::Union::ListPeers(lp) => {
+                self.handle_list_peers(lp, peers)
             }
 
             _ => None,
@@ -402,6 +461,48 @@ impl RendezvousServer {
                 )),
             }),
         }
+    }
+
+    /// Handle ListPeers: return ALL registered peers (auth'd by licence_key).
+    fn handle_list_peers(
+        &self,
+        lp: proto::ListPeers,
+        peers: &std::sync::Mutex<HashMap<String, PeerEntry>>,
+    ) -> Option<proto::RendezvousMessage> {
+        // Authenticate: licence_key must match server's key
+        if !self.key.is_empty() && lp.licence_key != self.key {
+            tracing::warn!("rdv: list_peers rejected — key mismatch");
+            return None;
+        }
+
+        let map = peers.lock().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+
+        let all_peers: Vec<proto::GroupPeer> = map
+            .iter()
+            .map(|(id, entry)| {
+                let last_seen_secs = now.as_secs()
+                    - entry.last_seen.elapsed().as_secs();
+                proto::GroupPeer {
+                    device_id: id.clone(),
+                    hostname: entry.hostname.clone(),
+                    platform: entry.platform.clone(),
+                    socket_addr: encode_socket_addr(&entry.addr),
+                    last_seen_secs,
+                    service_port: entry.service_port as i32,
+                }
+            })
+            .collect();
+
+        tracing::info!("rdv: list_peers — {} peers", all_peers.len());
+
+        Some(proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::ListPeersResponse(
+                proto::ListPeersResponse { peers: all_peers },
+            )),
+        })
     }
 
     /// Handle a GroupQuery: return all peers matching the group_hash,
@@ -478,6 +579,7 @@ impl RendezvousServer {
                     platform: entry.platform.clone(),
                     socket_addr: encode_socket_addr(&entry.addr),
                     last_seen_secs,
+                    service_port: entry.service_port as i32,
                 }
             })
             .collect();
@@ -626,6 +728,7 @@ impl Client {
                         platform: p.platform,
                         addr,
                         last_seen_secs: p.last_seen_secs,
+                        service_port: p.service_port as u16,
                     }
                 }).collect();
                 return Ok(peers);
@@ -635,6 +738,72 @@ impl Client {
         }
 
         bail!("group query failed on all servers; last: {}", last_err.unwrap_or_else(|| anyhow::anyhow!("no servers")));
+    }
+
+    /// List ALL peers registered at hbbs (authenticated by licence_key).
+    pub async fn list_peers(&self) -> Result<Vec<GroupPeerInfo>> {
+        if self.servers.is_empty() {
+            bail!("no rendezvous server configured");
+        }
+
+        let lp = proto::ListPeers {
+            licence_key: self.licence_key.clone(),
+        };
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::ListPeers(lp)),
+        };
+        let msg_bytes = msg.encode_to_vec();
+
+        let mut last_err = None;
+        for srv in &self.servers {
+            let sock = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => s,
+                Err(e) => { last_err = Some(anyhow::anyhow!("bind: {e}")); continue; }
+            };
+            if let Err(e) = sock.connect(srv).await {
+                last_err = Some(anyhow::anyhow!("connect {srv}: {e}"));
+                continue;
+            }
+            if let Err(e) = sock.send(&msg_bytes).await {
+                last_err = Some(anyhow::anyhow!("send to {srv}: {e}"));
+                continue;
+            }
+
+            let mut buf = vec![0u8; 65535];
+            let n = match timeout(Duration::from_secs(5), sock.recv(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => { last_err = Some(e.into()); continue; }
+                Err(_) => { last_err = Some(anyhow::anyhow!("timeout from {srv}")); continue; }
+            };
+
+            let resp = match proto::RendezvousMessage::decode(&buf[..n]) {
+                Ok(r) => r,
+                Err(e) => { last_err = Some(e.into()); continue; }
+            };
+
+            if let Some(proto::rendezvous_message::Union::ListPeersResponse(lpr)) = resp.union {
+                let peers = lpr.peers.into_iter().map(|p| {
+                    let addr = if p.socket_addr.is_empty() {
+                        None
+                    } else {
+                        decode_socket_addr(&p.socket_addr).ok()
+                    };
+                    GroupPeerInfo {
+                        device_id: p.device_id,
+                        hostname: p.hostname,
+                        platform: p.platform,
+                        addr,
+                        last_seen_secs: p.last_seen_secs,
+                        service_port: p.service_port as u16,
+                    }
+                }).collect();
+                return Ok(peers);
+            }
+
+            last_err = Some(anyhow::anyhow!("unexpected response from {srv}"));
+        }
+
+        bail!("list_peers failed on all servers; last: {}", last_err.unwrap_or_else(|| anyhow::anyhow!("no servers")));
     }
 
     /// Full resolution against a single server.
@@ -682,6 +851,7 @@ impl Client {
                     group_hash: self.group_hash.clone(),
                     hostname: self.hostname.clone(),
                     platform: self.platform.clone(),
+                    service_port: self.service_port as i32,
                 },
             )),
         };
@@ -876,6 +1046,187 @@ impl Client {
 
         Ok(uuid)
     }
+
+    /// Run a persistent registration loop that also listens for relay notifications.
+    ///
+    /// Unlike `register_once()` which creates ephemeral sockets, this maintains
+    /// a persistent UDP socket so hbbs can send RelayResponse notifications when
+    /// a client requests relay connection to this device.
+    ///
+    /// Relay notifications are sent to `relay_tx`. The caller should spawn a handler
+    /// that connects to hbbr with the UUID and accepts the incoming TLS connection.
+    pub async fn run_registration_loop(
+        &self,
+        cancel: tokio_util::sync::CancellationToken,
+        relay_tx: tokio::sync::mpsc::Sender<RelayNotification>,
+    ) {
+        if self.servers.is_empty() || self.local_id.is_empty() {
+            tracing::warn!("rendezvous loop: no servers or no device_id, not starting");
+            return;
+        }
+
+        let sock = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("rendezvous loop: bind failed: {}", e);
+                return;
+            }
+        };
+
+        // Resolve server addresses.
+        let mut server_addrs = Vec::new();
+        for srv in &self.servers {
+            match tokio::net::lookup_host(srv).await {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        server_addrs.push(addr);
+                    }
+                }
+                Err(e) => tracing::warn!("rendezvous loop: resolve {}: {}", srv, e),
+            }
+        }
+
+        if server_addrs.is_empty() {
+            tracing::warn!("rendezvous loop: no servers resolved");
+            return;
+        }
+
+        // Pre-encode the registration message.
+        let reg_msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RegisterPeer(
+                proto::RegisterPeer {
+                    id: self.local_id.clone(),
+                    serial: 0,
+                    group_hash: self.group_hash.clone(),
+                    hostname: self.hostname.clone(),
+                    platform: self.platform.clone(),
+                    service_port: self.service_port as i32,
+                },
+            )),
+        };
+        let reg_bytes = reg_msg.encode_to_vec();
+
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut buf = vec![0u8; 65535];
+
+        if !self.group_hash.is_empty() {
+            tracing::info!(
+                "rendezvous loop: DeviceID {} (group enrolled), listening for relay",
+                self.local_id
+            );
+        } else {
+            tracing::info!(
+                "rendezvous loop: DeviceID {}, listening for relay",
+                self.local_id
+            );
+        }
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::debug!("rendezvous loop: cancelled");
+                    return;
+                }
+                _ = interval.tick() => {
+                    for addr in &server_addrs {
+                        let _ = sock.send_to(&reg_bytes, addr).await;
+                    }
+                }
+                result = sock.recv_from(&mut buf) => {
+                    if let Ok((n, _src)) = result {
+                        if let Ok(msg) = proto::RendezvousMessage::decode(&buf[..n]) {
+                            match msg.union {
+                                Some(proto::rendezvous_message::Union::RegisterPeerResponse(_)) => {
+                                    tracing::debug!("rendezvous: registered");
+                                }
+                                Some(proto::rendezvous_message::Union::RegisterPkResponse(_)) => {
+                                    tracing::debug!("rendezvous: pk registered");
+                                }
+                                Some(proto::rendezvous_message::Union::RelayResponse(rr)) => {
+                                    if !rr.uuid.is_empty() {
+                                        tracing::info!(
+                                            "rendezvous: relay notification uuid={} relay={}",
+                                            rr.uuid, rr.relay_server
+                                        );
+                                        let _ = relay_tx.send(RelayNotification {
+                                            uuid: rr.uuid,
+                                            relay_server: rr.relay_server,
+                                        }).await;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a TCP RequestRelay: look up target device and forward RelayResponse via UDP.
+async fn handle_tcp_relay_request(
+    mut stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    peers: &std::sync::Mutex<HashMap<String, PeerEntry>>,
+    sock: &UdpSocket,
+    relay_server: &str,
+    key: &str,
+) -> Result<()> {
+    let data = timeout(
+        Duration::from_secs(10),
+        codec::decode_frame(&mut stream),
+    )
+    .await
+    .context("tcp relay read timeout")?
+    .context("tcp relay read")?;
+
+    let msg = proto::RendezvousMessage::decode(&data[..]).context("decode RequestRelay")?;
+
+    if let Some(proto::rendezvous_message::Union::RequestRelay(rr)) = msg.union {
+        // Validate key.
+        if !key.is_empty() && rr.licence_key != key {
+            tracing::debug!("rdv tcp: key mismatch from {}", peer);
+            return Ok(());
+        }
+
+        if rr.uuid.is_empty() {
+            tracing::debug!("rdv tcp: empty UUID from {}", peer);
+            return Ok(());
+        }
+
+        // Look up target device.
+        let target_addr = {
+            let map = peers.lock().unwrap();
+            map.get(&rr.id).map(|e| e.addr)
+        };
+
+        if let Some(addr) = target_addr {
+            let relay = if rr.relay_server.is_empty() {
+                relay_server.to_string()
+            } else {
+                rr.relay_server
+            };
+
+            // Forward RelayResponse to target device via UDP.
+            let response = proto::RendezvousMessage {
+                union: Some(proto::rendezvous_message::Union::RelayResponse(
+                    proto::RelayResponse {
+                        uuid: rr.uuid.clone(),
+                        relay_server: relay,
+                        socket_addr: encode_socket_addr(&peer),
+                        ..Default::default()
+                    },
+                )),
+            };
+            sock.send_to(&response.encode_to_vec(), addr).await?;
+            tracing::info!("rdv: relay {} → {} (uuid={})", rr.id, addr, rr.uuid);
+        } else {
+            tracing::debug!("rdv: relay for {} — not registered", rr.id);
+        }
+    }
+
+    Ok(())
 }
 
 /// Generate a random UUID v4 string.
@@ -972,6 +1323,7 @@ mod tests {
                 group_hash: String::new(),
                 hostname: String::new(),
                 platform: String::new(),
+                service_port: 0,
             };
             assert!(c.resolve("123456789").await.is_err());
         });
@@ -1067,10 +1419,7 @@ mod tests {
             union: Some(proto::rendezvous_message::Union::RegisterPeer(
                 proto::RegisterPeer {
                     id: "dev123".to_string(),
-                    serial: 0,
-                    group_hash: String::new(),
-                    hostname: String::new(),
-                    platform: String::new(),
+                    ..Default::default()
                 },
             )),
         };
@@ -1207,6 +1556,7 @@ mod tests {
                 group_hash: String::new(),
                 hostname: String::new(),
                 platform: String::new(),
+                service_port: 0,
             },
         );
 
@@ -1243,6 +1593,7 @@ mod tests {
                 group_hash: String::new(),
                 hostname: String::new(),
                 platform: String::new(),
+                service_port: 0,
             },
         );
 
@@ -1268,6 +1619,126 @@ mod tests {
         }
     }
 
+    // --- Protobuf zero-value / edge case tests (orin-0td) ---
+
+    /// PunchHoleResponse with failure=0 (IdNotExist, protobuf default) but valid
+    /// socket_addr should return the address, not an error.  Failure=0 is the
+    /// protobuf default so a "success" response has failure==0 implicitly.
+    #[tokio::test]
+    async fn rdv_server_success_response_has_failure_zero() {
+        let srv = RendezvousServer::new("", "relay.test:21117");
+        let peers: Arc<std::sync::Mutex<HashMap<String, PeerEntry>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        peers.lock().unwrap().insert(
+            "peer1".to_string(),
+            PeerEntry {
+                addr: "10.0.0.5:8822".parse().unwrap(),
+                last_seen: Instant::now(),
+                group_hash: String::new(),
+                hostname: String::new(),
+                platform: String::new(),
+                service_port: 0,
+            },
+        );
+
+        let punch = proto::PunchHoleRequest {
+            id: "peer1".to_string(),
+            ..Default::default()
+        };
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::PunchHoleRequest(punch)),
+        };
+        // Different IP so we get PunchHoleResponse (not FetchLocalAddr).
+        let src: SocketAddr = "203.0.113.1:9999".parse().unwrap();
+        let resp = srv.handle_message(msg, src, &peers).unwrap();
+        match resp.union {
+            Some(proto::rendezvous_message::Union::PunchHoleResponse(phr)) => {
+                // failure field is 0 (IdNotExist/default) — but socket_addr is populated,
+                // so the client should treat this as success.
+                assert_eq!(phr.failure, proto::punch_hole_response::Failure::IdNotExist as i32);
+                assert!(!phr.socket_addr.is_empty(), "socket_addr must be populated");
+                let decoded = decode_socket_addr(&phr.socket_addr).unwrap();
+                assert_eq!(decoded, "10.0.0.5:8822".parse::<SocketAddr>().unwrap());
+            }
+            other => panic!("expected PunchHoleResponse, got {:?}", other),
+        }
+    }
+
+    /// AddrMangle roundtrip with port 0 (edge case: port=0 after wrapping).
+    #[test]
+    fn addr_encode_decode_roundtrip_port_zero() {
+        let addr: SocketAddr = "192.168.1.1:0".parse().unwrap();
+        let encoded = encode_socket_addr_with_tm(&addr, 0);
+        let decoded = decode_socket_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    /// AddrMangle roundtrip with port 65535 (max u16).
+    #[test]
+    fn addr_encode_decode_roundtrip_port_max() {
+        let addr: SocketAddr = "10.0.0.1:65535".parse().unwrap();
+        let encoded = encode_socket_addr_with_tm(&addr, 0xFFFFFFFF);
+        let decoded = decode_socket_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    /// AddrMangle with 0.0.0.0 (all-zeros IP).
+    #[test]
+    fn addr_encode_decode_roundtrip_zero_ip() {
+        let addr: SocketAddr = "0.0.0.0:8822".parse().unwrap();
+        let encoded = encode_socket_addr_with_tm(&addr, 42);
+        let decoded = decode_socket_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    /// AddrMangle with 255.255.255.255 (broadcast).
+    #[test]
+    fn addr_encode_decode_roundtrip_broadcast() {
+        let addr: SocketAddr = "255.255.255.255:65535".parse().unwrap();
+        let encoded = encode_socket_addr_with_tm(&addr, 0xDEADCAFE);
+        let decoded = decode_socket_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    /// Port preservation: resolve result must carry the exact port registered.
+    #[tokio::test]
+    async fn rdv_server_preserves_registered_port() {
+        let srv = RendezvousServer::new("", "relay.test:21117");
+        let peers: Arc<std::sync::Mutex<HashMap<String, PeerEntry>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Register on non-default port.
+        peers.lock().unwrap().insert(
+            "custom-port".to_string(),
+            PeerEntry {
+                addr: "172.16.0.1:9822".parse().unwrap(),
+                last_seen: Instant::now(),
+                group_hash: String::new(),
+                hostname: String::new(),
+                platform: String::new(),
+                service_port: 0,
+            },
+        );
+
+        let punch = proto::PunchHoleRequest {
+            id: "custom-port".to_string(),
+            ..Default::default()
+        };
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::PunchHoleRequest(punch)),
+        };
+        let src: SocketAddr = "198.51.100.1:12345".parse().unwrap();
+        let resp = srv.handle_message(msg, src, &peers).unwrap();
+        match resp.union {
+            Some(proto::rendezvous_message::Union::PunchHoleResponse(phr)) => {
+                let decoded = decode_socket_addr(&phr.socket_addr).unwrap();
+                assert_eq!(decoded.port(), 9822, "port must be preserved through encode/decode");
+            }
+            other => panic!("expected PunchHoleResponse, got {:?}", other),
+        }
+    }
+
     // --- Network partition / unreachable server tests (rsh-a3o) ---
 
     fn make_client(servers: Vec<String>, local_id: &str) -> Client {
@@ -1278,6 +1749,7 @@ mod tests {
             group_hash: String::new(),
             hostname: "test-host".to_string(),
             platform: "linux".to_string(),
+            service_port: 8822,
         }
     }
 
@@ -1332,6 +1804,404 @@ mod tests {
         match result {
             Ok(inner) => assert!(inner.is_err(), "register_once must fail when server unreachable"),
             Err(_) => panic!("register_once hung beyond 7 seconds (deadline: 5s per server)"),
+        }
+    }
+
+    // --- Relay forwarding tests (beads-u8d) ---
+
+    /// hbbs TCP RequestRelay forwarding: registered device receives RelayResponse via UDP.
+    #[tokio::test]
+    async fn rdv_tcp_relay_forwarding_to_registered_device() {
+        use tokio::io::AsyncReadExt;
+
+        // Start hbbs (UDP + TCP) on random port.
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = udp_sock.local_addr().unwrap();
+        drop(udp_sock);
+
+        let srv = RendezvousServer::new("testkey", &format!("127.0.0.1:{}", srv_addr.port() + 1));
+
+        let srv_handle = tokio::spawn(async move {
+            // Will run until cancelled; we just let it run in background.
+            let _ = srv.listen_and_serve(&srv_addr.to_string()).await;
+        });
+
+        // Give server time to bind.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // "Server" device: register with hbbs and listen for messages on same socket.
+        let device_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let device_addr = device_sock.local_addr().unwrap();
+
+        // Register device "999888777" by sending RegisterPeer.
+        let reg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RegisterPeer(
+                proto::RegisterPeer {
+                    id: "999888777".to_string(),
+                    hostname: "test-device".to_string(),
+                    platform: "linux".to_string(),
+                    service_port: 8822,
+                    ..Default::default()
+                },
+            )),
+        };
+        device_sock
+            .send_to(&reg.encode_to_vec(), srv_addr)
+            .await
+            .unwrap();
+
+        // Read RegisterPeerResponse.
+        let mut buf = vec![0u8; 65535];
+        let (n, _) = timeout(Duration::from_secs(3), device_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let resp = proto::RendezvousMessage::decode(&buf[..n]).unwrap();
+        assert!(
+            matches!(
+                resp.union,
+                Some(proto::rendezvous_message::Union::RegisterPeerResponse(_))
+            ),
+            "should get RegisterPeerResponse"
+        );
+
+        // "Client": send RequestRelay via TCP to hbbs for device 999888777.
+        let mut tcp = tokio::net::TcpStream::connect(srv_addr).await.unwrap();
+        let relay_req = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RequestRelay(
+                proto::RequestRelay {
+                    id: "999888777".to_string(),
+                    uuid: "test-uuid-1234".to_string(),
+                    relay_server: "relay.test:21117".to_string(),
+                    licence_key: "testkey".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let frame = crate::codec::encode_frame(&relay_req.encode_to_vec());
+        use tokio::io::AsyncWriteExt;
+        tcp.write_all(&frame).await.unwrap();
+
+        // The "device" should receive RelayResponse via UDP.
+        let (n, _) = timeout(Duration::from_secs(3), device_sock.recv_from(&mut buf))
+            .await
+            .expect("device should receive RelayResponse within 3s")
+            .unwrap();
+        let notification = proto::RendezvousMessage::decode(&buf[..n]).unwrap();
+        match notification.union {
+            Some(proto::rendezvous_message::Union::RelayResponse(rr)) => {
+                assert_eq!(rr.uuid, "test-uuid-1234");
+                assert_eq!(rr.relay_server, "relay.test:21117");
+            }
+            other => panic!("expected RelayResponse, got {:?}", other),
+        }
+
+        srv_handle.abort();
+    }
+
+    /// hbbs TCP RequestRelay for unregistered device: no crash, no notification.
+    #[tokio::test]
+    async fn rdv_tcp_relay_unregistered_device_no_crash() {
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = udp_sock.local_addr().unwrap();
+        drop(udp_sock);
+
+        let srv = RendezvousServer::new("", "relay.test:21117");
+        let srv_handle = tokio::spawn(async move {
+            let _ = srv.listen_and_serve(&srv_addr.to_string()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send RequestRelay for non-existent device — should not crash.
+        let mut tcp = tokio::net::TcpStream::connect(srv_addr).await.unwrap();
+        let relay_req = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RequestRelay(
+                proto::RequestRelay {
+                    id: "nonexistent".to_string(),
+                    uuid: "test-uuid".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let frame = crate::codec::encode_frame(&relay_req.encode_to_vec());
+        use tokio::io::AsyncWriteExt;
+        tcp.write_all(&frame).await.unwrap();
+
+        // Give hbbs time to process.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Server should still be alive (try another TCP connection).
+        let tcp2 = tokio::net::TcpStream::connect(srv_addr).await;
+        assert!(tcp2.is_ok(), "hbbs should still accept connections");
+
+        srv_handle.abort();
+    }
+
+    /// hbbs TCP RequestRelay with key mismatch: silently rejected.
+    #[tokio::test]
+    async fn rdv_tcp_relay_key_mismatch_rejected() {
+        let udp_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = udp_sock.local_addr().unwrap();
+        drop(udp_sock);
+
+        let srv = RendezvousServer::new("correctkey", "relay.test:21117");
+        let srv_handle = tokio::spawn(async move {
+            let _ = srv.listen_and_serve(&srv_addr.to_string()).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Register a device.
+        let device_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RegisterPeer(
+                proto::RegisterPeer {
+                    id: "keytestdev".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        device_sock
+            .send_to(&reg.encode_to_vec(), srv_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 65535];
+        let _ = timeout(Duration::from_secs(2), device_sock.recv_from(&mut buf))
+            .await
+            .unwrap();
+
+        // Send RequestRelay with wrong key.
+        let mut tcp = tokio::net::TcpStream::connect(srv_addr).await.unwrap();
+        let relay_req = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RequestRelay(
+                proto::RequestRelay {
+                    id: "keytestdev".to_string(),
+                    uuid: "uuid-xyz".to_string(),
+                    licence_key: "wrongkey".to_string(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let frame = crate::codec::encode_frame(&relay_req.encode_to_vec());
+        use tokio::io::AsyncWriteExt;
+        tcp.write_all(&frame).await.unwrap();
+
+        // Device should NOT receive anything (key mismatch → silently rejected).
+        let result = timeout(Duration::from_millis(500), device_sock.recv_from(&mut buf)).await;
+        assert!(result.is_err(), "device should not receive notification on key mismatch");
+
+        srv_handle.abort();
+    }
+
+    /// run_registration_loop receives RelayResponse and forwards to channel.
+    #[tokio::test]
+    async fn registration_loop_receives_relay_notification() {
+        // Start a minimal hbbs.
+        let hbbs_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let hbbs_addr = hbbs_sock.local_addr().unwrap();
+
+        let hbbs_sock_clone = hbbs_sock.clone();
+        let hbbs_handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            // Read RegisterPeer, respond, then send a fake RelayResponse.
+            let (n, src) = hbbs_sock_clone.recv_from(&mut buf).await.unwrap();
+            let msg = proto::RendezvousMessage::decode(&buf[..n]).unwrap();
+            assert!(matches!(
+                msg.union,
+                Some(proto::rendezvous_message::Union::RegisterPeer(_))
+            ));
+
+            // Send RegisterPeerResponse.
+            let resp = proto::RendezvousMessage {
+                union: Some(proto::rendezvous_message::Union::RegisterPeerResponse(
+                    proto::RegisterPeerResponse { request_pk: false },
+                )),
+            };
+            hbbs_sock_clone
+                .send_to(&resp.encode_to_vec(), src)
+                .await
+                .unwrap();
+
+            // Now send a RelayResponse (simulating a client requesting relay).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let relay_resp = proto::RendezvousMessage {
+                union: Some(proto::rendezvous_message::Union::RelayResponse(
+                    proto::RelayResponse {
+                        uuid: "relay-uuid-abc".to_string(),
+                        relay_server: "hbbr.test:21117".to_string(),
+                        ..Default::default()
+                    },
+                )),
+            };
+            hbbs_sock_clone
+                .send_to(&relay_resp.encode_to_vec(), src)
+                .await
+                .unwrap();
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+
+        let client = Client {
+            servers: vec![hbbs_addr.to_string()],
+            licence_key: String::new(),
+            local_id: "testdev123".to_string(),
+            group_hash: String::new(),
+            hostname: "test".to_string(),
+            platform: "linux".to_string(),
+            service_port: 8822,
+        };
+
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            client.run_registration_loop(cancel_clone, tx).await;
+        });
+
+        // Wait for the relay notification.
+        let notif = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("should receive relay notification within 5s")
+            .expect("channel should not be closed");
+
+        assert_eq!(notif.uuid, "relay-uuid-abc");
+        assert_eq!(notif.relay_server, "hbbr.test:21117");
+
+        cancel.cancel();
+        hbbs_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rdv_list_peers_returns_all_registered() {
+        let srv = RendezvousServer::new("test-key", "relay.test:21117");
+        let peers: Arc<std::sync::Mutex<HashMap<String, PeerEntry>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Register two peers
+        peers.lock().unwrap().insert(
+            "111".to_string(),
+            PeerEntry {
+                addr: "10.0.0.1:8822".parse().unwrap(),
+                last_seen: Instant::now(),
+                group_hash: String::new(),
+                hostname: "host-a".to_string(),
+                platform: "windows".to_string(),
+                service_port: 0,
+            },
+        );
+        peers.lock().unwrap().insert(
+            "222".to_string(),
+            PeerEntry {
+                addr: "10.0.0.2:8822".parse().unwrap(),
+                last_seen: Instant::now(),
+                group_hash: String::new(),
+                hostname: "host-b".to_string(),
+                platform: "linux".to_string(),
+                service_port: 0,
+            },
+        );
+
+        // Valid key → should get both peers
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::ListPeers(
+                proto::ListPeers { licence_key: "test-key".to_string() },
+            )),
+        };
+        let src: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let resp = srv.handle_message(msg, src, &peers).unwrap();
+        match resp.union {
+            Some(proto::rendezvous_message::Union::ListPeersResponse(lpr)) => {
+                assert_eq!(lpr.peers.len(), 2);
+                let ids: Vec<&str> = lpr.peers.iter().map(|p| p.device_id.as_str()).collect();
+                assert!(ids.contains(&"111"));
+                assert!(ids.contains(&"222"));
+            }
+            other => panic!("expected ListPeersResponse, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rdv_list_peers_rejects_bad_key() {
+        let srv = RendezvousServer::new("correct-key", "relay.test:21117");
+        let peers: Arc<std::sync::Mutex<HashMap<String, PeerEntry>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        peers.lock().unwrap().insert(
+            "111".to_string(),
+            PeerEntry {
+                addr: "10.0.0.1:8822".parse().unwrap(),
+                last_seen: Instant::now(),
+                group_hash: String::new(),
+                hostname: "host-a".to_string(),
+                platform: "windows".to_string(),
+                service_port: 0,
+            },
+        );
+
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::ListPeers(
+                proto::ListPeers { licence_key: "wrong-key".to_string() },
+            )),
+        };
+        let src: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let resp = srv.handle_message(msg, src, &peers);
+        assert!(resp.is_none(), "bad key should be rejected");
+    }
+
+    #[tokio::test]
+    async fn rdv_service_port_round_trip() {
+        let srv = RendezvousServer::new("key", "relay.test:21117");
+        let peers: Arc<std::sync::Mutex<HashMap<String, PeerEntry>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // Register peer with non-default service_port
+        let reg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RegisterPeer(
+                proto::RegisterPeer {
+                    id: "test-9822".to_string(),
+                    serial: 0,
+                    group_hash: String::new(),
+                    hostname: "CUSTOM-PORT".to_string(),
+                    platform: "windows".to_string(),
+                    service_port: 9822,
+                },
+            )),
+        };
+        let src: SocketAddr = "10.0.0.5:12345".parse().unwrap();
+        let _resp = srv.handle_message(reg, src, &peers);
+
+        // Also register one with default port (0)
+        let reg2 = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RegisterPeer(
+                proto::RegisterPeer {
+                    id: "test-default".to_string(),
+                    serial: 0,
+                    group_hash: String::new(),
+                    hostname: "DEFAULT-PORT".to_string(),
+                    platform: "linux".to_string(),
+                    service_port: 0,
+                },
+            )),
+        };
+        let _resp2 = srv.handle_message(reg2, "10.0.0.6:12345".parse().unwrap(), &peers);
+
+        // Query via ListPeers
+        let lp = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::ListPeers(
+                proto::ListPeers { licence_key: "key".to_string() },
+            )),
+        };
+        let resp = srv.handle_message(lp, "127.0.0.1:9999".parse().unwrap(), &peers).unwrap();
+        match resp.union {
+            Some(proto::rendezvous_message::Union::ListPeersResponse(lpr)) => {
+                let custom = lpr.peers.iter().find(|p| p.device_id == "test-9822").unwrap();
+                assert_eq!(custom.service_port, 9822, "custom port must survive round-trip");
+                assert_eq!(custom.hostname, "CUSTOM-PORT");
+
+                let default = lpr.peers.iter().find(|p| p.device_id == "test-default").unwrap();
+                assert_eq!(default.service_port, 0, "default port=0 must survive round-trip");
+            }
+            other => panic!("expected ListPeersResponse, got {:?}", other),
         }
     }
 }
