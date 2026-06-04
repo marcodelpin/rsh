@@ -14,6 +14,8 @@ OPTIONS:
   -p <port>     Remote port (omit to auto-try: 9822 → 8822 → 22)
   -i <key>      SSH key file
   -v, -vv       Verbose output
+  --cmd         Use cmd.exe for exec (avoids PowerShell $var expansion)
+  --sh          Use sh/bash for exec (Git Bash on Windows, sh on Linux)
 
 LOCAL COMMANDS (no -h needed):
   version       Show version
@@ -32,9 +34,11 @@ LOCAL COMMANDS (no -h needed):
   logs          Interactive log viewer (TUI) — browse, filter, summarize
   dash          Fleet dashboard (TUI) — live host status, auto-refresh
   keygen [path] Generate ed25519 key pair
-  keys list     List authorized keys (fingerprint, type, comment)
+  keys list     List authorized keys from ALL locations (fingerprint, type, comment)
+                  Searches: system dir, user dir, legacy dir — deduplicates
   keys show     Show local client public key and fingerprint
   keys add <k>  Add public key (string or .pub file path)
+                  Added keys are recognized immediately (hot-reload on next auth)
   keys remove <fp|comment>  Remove key by fingerprint or comment
   totp-setup [fp] Generate TOTP secret + recovery codes for a key
   totp-verify <secret|fp> <code>  Verify a TOTP code
@@ -55,8 +59,8 @@ LOCAL COMMANDS (no -h needed):
   help          This help
 
 SERVER MODE (run mrsh as a server):
-  mrsh                  Start server (Windows: tray mode, Linux: foreground)
-  mrsh --tray           Run as tray app (port 9822, system tray icon, user session)
+  mrsh                  Start as tray (Windows default: port 9822, system tray icon)
+  mrsh --tray           Explicit tray mode (same as default, kept for compat)
   mrsh --console        Foreground server (both platforms, debug mode)
   mrsh --daemon         Background daemon (Linux, systemd signal handling)
   mrsh --install        Install system service (Windows SCM / Linux systemd)
@@ -65,8 +69,8 @@ SERVER MODE (run mrsh as a server):
 
   Windows runs TWO instances: service (port 8822, SYSTEM) + tray (port 9822, user).
   The service auto-starts the tray at boot via a scheduled task (mrsh-tray).
-  If the tray is not running, start it manually: mrsh --tray
-  Or from the service: schtasks /run /tn mrsh-tray
+  Default behavior: mrsh.exe without flags = tray mode (no --tray needed).
+  If the tray is not running, start it: schtasks /run /tn mrsh-tray
 
 CLIENT COMMANDS (require -h):
   ping          Test connectivity
@@ -149,6 +153,10 @@ AI USAGE:
     Use -p 8822 ONLY when: (a) you need SYSTEM privileges, or (b) no user is logged in.
   - AUTO-TRY PORTS: Without -p, mrsh tries 9822 → 8822 → 22 in sequence.
     Port 22 covers hosts running mrsh on the SSH port. No manual -p needed.
+  - SSH FALLBACK: If all TLS ports fail, mrsh automatically falls back to
+    standard SSH on port 22 (via russh). This makes mrsh a drop-in ssh
+    replacement for hosts that only have OpenSSH (Proxmox, generic Linux).
+    Supported over SSH: exec, push, pull, ping. No GUI/fleet/screenshot.
   - FIREWALL: On install (--install) or first startup, mrsh MUST open firewall
     for all ports it listens on. Without this, LAN clients get "connection refused".
     Windows: netsh advfirewall firewall add rule name="mrsh-inbound" dir=in action=allow protocol=TCP localport=8822 profile=private
@@ -171,6 +179,11 @@ AI USAGE:
   - mrsh exec runs commands via PowerShell (-NoProfile -Command), NOT CMD.
     Use PowerShell syntax: Get-ChildItem (not dir), Remove-Item (not del),
     Get-Content (not type), Set-Content (not echo >), Test-Path (not if exist).
+  - SHELL SELECTION: Use --cmd for cmd.exe or --sh for bash:
+      mrsh exec 'echo %PATH%'            ← PowerShell (default, $vars expanded)
+      mrsh --cmd exec 'echo %PATH%'      ← cmd.exe (no $var expansion)
+      mrsh --sh exec 'echo $PATH'        ← bash/sh (Unix syntax)
+    Useful when passing commands with $ that PowerShell would expand.
   - The destination path in push is resolved by the SERVER, not the client.
   - STREAMING: exec output is streamed in real-time (stdout/stderr chunks arrive
     as the command produces them). No timeout on streaming exec — output flow
@@ -280,6 +293,19 @@ AI USAGE:
        then: mrsh self-update "C:\Temp\mrsh-new.exe"
     4. The service auto-heals the tray task on restart (ensure_tray_task).
     5. Wait 15s, verify: mrsh -h <host> exec "hostname"
+
+  KEY MANAGEMENT:
+  - ALWAYS use `mrsh keys add/remove/list` — NEVER edit authorized_keys manually.
+  - keys add: appends to the primary authorized_keys file in the data directory.
+  - Hot-reload: keys added AFTER the server starts are recognized automatically.
+    The server re-reads all authorized_keys files from disk on auth miss.
+  - Multi-path search: the server loads keys from ALL possible locations:
+    Windows: C:\ProgramData\mrsh\ + %USERPROFILE%\.mrsh\ + legacy remote-shell\
+    Linux: /etc/rsh/ + ~/.mrsh/
+    A key in ANY location is accepted. Deduplicated by key data.
+  - Remote key management: mrsh -h <host> keys add '<pubkey-string>'
+    mrsh -h <host> keys list
+    mrsh -h <host> keys remove '<fingerprint-or-comment>'
 
   REMOTE EXECUTION — NO ORPHAN PROCESSES:
   - Use mrsh exec DIRECTLY for commands. Do NOT create intermediate .bat/.ps1 wrappers

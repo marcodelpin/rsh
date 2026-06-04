@@ -170,6 +170,7 @@ async fn discover_from_hbbs(config: &Config) -> Vec<mrsh_relay::rendezvous::Grou
         platform: String::new(),
         service_port: 0,
         encrypted_net_info: Vec::new(),
+        ports: Vec::new(),
     };
 
     match client.list_peers().await {

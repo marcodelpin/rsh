@@ -143,6 +143,8 @@ fn replace_binary_linux(new_binary: &str) -> Result<String> {
 }
 
 /// Schedule the actual binary replacement on Windows.
+/// Strategy: try schtask first (clean, isolated process). If schtask fails
+/// (non-admin, Group Policy), fall back to direct spawn from SYSTEM process.
 #[cfg(target_os = "windows")]
 fn schedule_update_windows(new_binary: &str) -> Result<String> {
     use std::process::Command;
@@ -153,7 +155,7 @@ fn schedule_update_windows(new_binary: &str) -> Result<String> {
         .to_string();
 
     let backup_path = format!("{}.bak", exe_path);
-    let bat_path = format!("{}\\rsh-update.bat", std::env::temp_dir().to_string_lossy());
+    let bat_path = format!("{}\\mrsh-update.bat", std::env::temp_dir().to_string_lossy());
 
     // Detect actual service name (mrsh or legacy rsh)
     let svc_name = {
@@ -161,7 +163,7 @@ fn schedule_update_windows(new_binary: &str) -> Result<String> {
         if check.map(|o| o.status.success()).unwrap_or(false) {
             "mrsh"
         } else {
-            "rsh" // legacy service name
+            "rsh"
         }
     };
 
@@ -179,7 +181,6 @@ timeout /t 5 /nobreak >nul
 taskkill /F /IM {exe_name} 2>nul
 timeout /t 3 /nobreak >nul
 copy /y "{exe}" "{backup}"
-REM Try copy with retry (file may still be locked briefly)
 copy /y "{new}" "{exe}"
 IF ERRORLEVEL 1 (
     timeout /t 5 /nobreak >nul
@@ -188,68 +189,77 @@ IF ERRORLEVEL 1 (
         copy /y "{backup}" "{exe}"
         echo ROLLBACK: restored from backup >> "{exe}.update.log"
         net start {svc}
-        schtasks /delete /tn mrsh-self-update /f
         exit /b 1
     )
 )
 net start {svc}
 del "{new}"
-schtasks /delete /tn mrsh-self-update /f
+del "{bat}" 2>nul
 "#,
         svc = svc_name,
         exe_name = exe_name,
         exe = exe_path,
         backup = backup_path,
         new = new_binary,
+        bat = bat_path,
     );
 
     std::fs::write(&bat_path, &bat_content).context("write update bat")?;
 
-    // Delete existing task (idempotent)
+    // Try schtask first (cleanest approach)
+    if try_schtask_update(&bat_path) {
+        return Ok("update scheduled via schtask, service will restart in ~10 seconds".to_string());
+    }
+
+    // Schtask failed (non-admin, Group Policy). Fall back to direct spawn.
+    // We're running as SYSTEM — spawn detached cmd.exe to run the bat.
+    info!("schtask failed, using direct spawn for self-update");
+    use std::os::windows::process::CommandExt;
+    let child = Command::new("cmd")
+        .args(["/c", "start", "/b", "cmd", "/c", &bat_path])
+        .creation_flags(0x08000000 | 0x00000008) // CREATE_NO_WINDOW | DETACHED_PROCESS
+        .spawn();
+
+    match child {
+        Ok(_) => Ok("update spawned directly, service will restart in ~10 seconds".to_string()),
+        Err(e) => anyhow::bail!("direct spawn failed: {}", e),
+    }
+}
+
+/// Try to create and run a schtask for the update. Returns true on success.
+#[cfg(target_os = "windows")]
+fn try_schtask_update(bat_path: &str) -> bool {
+    use std::process::Command;
+
     let _ = Command::new("schtasks")
-        .args(["/delete", "/tn", "rsh-self-update", "/f"])
+        .args(["/delete", "/tn", "mrsh-self-update", "/f"])
         .output();
 
-    // Create scheduled task
-    let output = Command::new("schtasks")
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let future = now + 120;
+    let secs_of_day = future % 86400;
+    let st = format!("{:02}:{:02}", secs_of_day / 3600, (secs_of_day % 3600) / 60);
+
+    let create = Command::new("schtasks")
         .args([
-            "/create",
-            "/tn",
-            "rsh-self-update",
-            "/tr",
-            &format!("cmd /c \"{}\"", bat_path),
-            "/sc",
-            "once",
-            "/st",
-            "00:00",
-            "/f",
-            "/ru",
-            "SYSTEM",
+            "/create", "/tn", "mrsh-self-update",
+            "/tr", &format!("cmd /c \"{}\"", bat_path),
+            "/sc", "once", "/st", &st, "/f", "/ru", "SYSTEM",
         ])
-        .output()
-        .context("create schtask")?;
+        .output();
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "schtasks create failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if !create.map(|o| o.status.success()).unwrap_or(false) {
+        return false;
     }
 
-    // Run the task
-    let output = Command::new("schtasks")
-        .args(["/run", "/tn", "rsh-self-update"])
-        .output()
-        .context("run schtask")?;
+    let run = Command::new("schtasks")
+        .args(["/run", "/tn", "mrsh-self-update"])
+        .output();
 
-    if !output.status.success() {
-        anyhow::bail!(
-            "schtasks run failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok("update scheduled, service will restart in ~10 seconds".to_string())
+    run.map(|o| o.status.success()).unwrap_or(false)
 }
 
 #[cfg(test)]

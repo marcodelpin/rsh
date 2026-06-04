@@ -66,63 +66,72 @@ pub async fn connect(opts: &ConnectOptions) -> Result<TlsClient> {
 /// Ports to try when no port is specified (-p omitted, no config port).
 /// Order: tray (9822) first — user session has mapped drives, GUI, screenshots.
 /// Then service (8822) — SYSTEM, for admin ops or when no user is logged in.
-/// Finally SSH (22) — fallback for hosts running mrsh on the SSH port.
+/// Then SSH (22) — TLS first (mrsh may listen on 22), SSH fallback handled by caller.
 pub const AUTO_TRY_PORTS: &[u16] = &[9822, 8822, 22];
 
 /// Short timeout per port during auto-try (seconds).
 const AUTO_TRY_TIMEOUT_SECS: u64 = 3;
 
-/// Connect with auto-try: attempt multiple ports sequentially with short timeouts.
-/// Returns the first successful connection. On failure, returns the error from the
-/// first port attempted (9822/tray) for a clear error message.
+/// Connect with auto-try: race all ports in parallel, return first success.
+/// Prefers tray (9822) over service (8822) over SSH (22) when both connect
+/// within the same timeout window.
 pub async fn connect_auto_try(opts: &ConnectOptions) -> Result<(TlsClient, u16)> {
-    let mut primary_error = None;
+    use tokio::sync::mpsc;
+
+    let (tx, mut rx) = mpsc::channel::<(TlsClient, u16)>(1);
+    let mut handles = Vec::new();
 
     for &port in AUTO_TRY_PORTS {
-        debug!("auto-try: attempting {}:{}", opts.host, port);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(AUTO_TRY_TIMEOUT_SECS),
-            async {
-                let stream = tcp_connect(&opts.host, port).await?;
-                let tls_stream = tls_wrap(stream, &opts.host).await?;
-                if let Some(ref user) = opts.password_user {
-                    auth_password(tls_stream, user, &opts.host).await
-                } else {
-                    auth_client(tls_stream, &opts.key_path).await
-                }
-            },
-        )
-        .await;
+        let host = opts.host.clone();
+        let key_path = opts.key_path.clone();
+        let password_user = opts.password_user.clone();
+        let tx = tx.clone();
 
-        match result {
-            Ok(Ok(client)) => {
-                if port != AUTO_TRY_PORTS[0] {
-                    info!("connected on port {} (auto-try)", port);
-                }
-                return Ok((client, port));
+        let handle = tokio::spawn(async move {
+            debug!("auto-try: attempting {}:{}", host, port);
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(AUTO_TRY_TIMEOUT_SECS),
+                async {
+                    let stream = tcp_connect(&host, port).await?;
+                    let tls_stream = tls_wrap(stream, &host).await?;
+                    if let Some(ref user) = password_user {
+                        auth_password(tls_stream, user, &host).await
+                    } else {
+                        auth_client(tls_stream, &key_path).await
+                    }
+                },
+            )
+            .await;
+
+            match result {
+                Ok(Ok(client)) => { let _ = tx.send((client, port)).await; }
+                Ok(Err(e)) => { debug!("auto-try port {} failed: {}", port, e); }
+                Err(_) => { debug!("auto-try port {} timed out", port); }
             }
-            Ok(Err(e)) => {
-                debug!("auto-try port {} failed: {}", port, e);
-                if primary_error.is_none() {
-                    primary_error = Some(e);
-                }
-            }
-            Err(_) => {
-                debug!("auto-try port {} timed out", port);
-                if primary_error.is_none() {
-                    primary_error = Some(anyhow::anyhow!(
-                        "connection to {}:{} timed out",
-                        opts.host,
-                        port
-                    ));
-                }
-            }
-        }
+        });
+        handles.push(handle);
     }
+    drop(tx); // Close sender so rx completes when all tasks done
 
-    Err(primary_error.unwrap_or_else(|| {
-        anyhow::anyhow!("failed to connect to {} on any port", opts.host)
-    }))
+    // Wait for first successful connection or all failures
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(AUTO_TRY_TIMEOUT_SECS + 1),
+        rx.recv(),
+    )
+    .await
+    {
+        Ok(Some((client, port))) => {
+            if port != AUTO_TRY_PORTS[0] {
+                info!("connected on port {} (auto-try)", port);
+            }
+            Ok((client, port))
+        }
+        _ => Err(anyhow::anyhow!(
+            "failed to connect to {} on any port ({:?})",
+            opts.host,
+            AUTO_TRY_PORTS
+        )),
+    }
 }
 
 /// Connect and authenticate over an existing TCP stream (e.g. from relay).

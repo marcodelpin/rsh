@@ -2,7 +2,7 @@
 //! Extracted from main.rs to reduce its size.
 
 use std::sync::Arc;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use tracing::info;
 
 // ── Server mode (cross-platform) ──────────────────────────────
@@ -143,13 +143,54 @@ pub async fn run_server_mode_inner(
     let tls_config_for_quic = tls_config.clone();
     let tls_acceptor = TlsAcceptor::from(tls_config);
 
-    // Load authorized keys
-    let ak_path = data_dir.join("authorized_keys");
-    let authorized_keys = if ak_path.exists() {
-        auth::load_authorized_keys(&ak_path, true)?
-    } else {
-        tracing::warn!("no authorized_keys file at {}", ak_path.display());
-        Vec::new()
+    // Load authorized keys from ALL possible locations (service + user + legacy)
+    let authorized_keys = {
+        let mut all_keys: Vec<auth::AuthorizedKey> = Vec::new();
+        let mut seen_key_data: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let ak_paths = crate::all_authorized_keys_paths();
+        let mut loaded_any = false;
+
+        for ak_path in &ak_paths {
+            if ak_path.exists() {
+                // Use strict=true only for the primary data_dir path
+                let strict = ak_path.starts_with(&data_dir);
+                match auth::load_authorized_keys(ak_path, strict) {
+                    Ok(keys) => {
+                        let count_before = all_keys.len();
+                        for key in keys {
+                            if seen_key_data.insert(key.key_data.clone()) {
+                                all_keys.push(key);
+                            }
+                        }
+                        let added = all_keys.len() - count_before;
+                        if added > 0 {
+                            tracing::info!(
+                                "loaded {} key(s) from {}",
+                                added,
+                                ak_path.display()
+                            );
+                        }
+                        loaded_any = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to load authorized_keys from {}: {}",
+                            ak_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        if !loaded_any {
+            tracing::warn!(
+                "no authorized_keys found in any location: {:?}",
+                ak_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+            );
+        }
+
+        all_keys
     };
 
     // Load revoked keys (optional — empty set if file doesn't exist)
@@ -212,6 +253,7 @@ pub async fn run_server_mode_inner(
         server_key_path: Some(data_dir.join("server_key")),
         device_id: server_device_id.clone(),
         rendezvous_server: server_rendezvous.clone(),
+        authorized_keys_paths: crate::all_authorized_keys_paths(),
     });
 
     // Clone TLS acceptor and ctx for relay handler before moving into ServerConfig.
@@ -300,6 +342,28 @@ pub async fn run_server_mode_inner(
                     Vec::new()
                 };
 
+                // Build port info for registration
+                let this_caps = build_server_caps_with_mode(_with_tray);
+                let mut reg_ports = vec![
+                    mrsh_relay::proto::PortInfo {
+                        port: svc_port as u32,
+                        instance_type: if _with_tray { "tray".into() } else { "system".into() },
+                        caps: this_caps,
+                    },
+                ];
+                // On Windows, both instances register — tray includes the other port too
+                #[cfg(windows)]
+                if _with_tray {
+                    // Tray instance also reports service port (8822)
+                    let mut sys_caps = build_server_caps_with_mode(false);
+                    // system caps differ from tray caps
+                    reg_ports.push(mrsh_relay::proto::PortInfo {
+                        port: crate::DEFAULT_PORT as u32,
+                        instance_type: "system".into(),
+                        caps: sys_caps.drain(..).collect(),
+                    });
+                }
+
                 let client = mrsh_relay::rendezvous::Client {
                     servers: rdv_servers,
                     licence_key: rdv_key.clone(),
@@ -309,6 +373,7 @@ pub async fn run_server_mode_inner(
                     platform,
                     service_port: svc_port,
                     encrypted_net_info: net_info_blob,
+                    ports: reg_ports,
                 };
                 client.run_registration_loop(cancel_reg, relay_tx).await;
             });

@@ -61,7 +61,7 @@ pub async fn dispatch(
         "exec" => {
             let cmd = req.command.as_deref().unwrap_or("");
             let env_vars = req.env_vars.as_deref().unwrap_or(&[]);
-            DispatchResult::Response(exec::handle_exec(cmd, env_vars).await)
+            DispatchResult::Response(exec::handle_exec_with_shell(cmd, env_vars, None).await)
         }
 
         "exec-as-user" => {

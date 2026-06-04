@@ -33,10 +33,20 @@ message RegisterPeer {
   string group_hash = 3;   // SHA256(enrollment_token), hex-encoded
   string hostname = 4;
   string platform = 5;     // "windows" or "linux"
-  int32 service_port = 6;  // rsh command listener port (e.g. 8822)
+  int32 service_port = 6;  // rsh command listener port (e.g. 8822) — kept for compat
   // Encrypted network info for LAN discovery (envelope encryption).
   // Opaque to hbbs — only group members with the private key can decrypt.
   bytes encrypted_net_info = 7;
+  // All ports this server listens on, with type and capabilities.
+  // Supersedes service_port (field 6) when non-empty.
+  repeated PortInfo ports = 8;
+}
+
+// Describes a single listening port and its capabilities.
+message PortInfo {
+  uint32 port = 1;
+  string instance_type = 2;     // "system" or "tray"
+  repeated string caps = 3;     // capability strings (same as auth caps)
 }
 
 message RegisterPeerResponse {
@@ -119,6 +129,8 @@ message PunchHoleResponse {
   string other_failure = 7;
   // Forwarded from RegisterPeer — encrypted network info for LAN discovery.
   bytes encrypted_net_info = 8;
+  // Forwarded from RegisterPeer — all listening ports with capabilities.
+  repeated PortInfo ports = 9;
 }
 
 // --- Relay ---
@@ -277,7 +289,8 @@ message GroupPeer {
   string platform = 3;
   bytes socket_addr = 4;   // AddrMangle-encoded
   uint64 last_seen_secs = 5;  // seconds since UNIX epoch
-  int32 service_port = 6;  // rsh command listener port (0 = default 8822)
+  int32 service_port = 6;  // rsh command listener port (0 = default 8822) — compat
+  repeated PortInfo ports = 7;  // all listening ports with capabilities
 }
 
 // --- Fleet peer list (rsh extension) ---

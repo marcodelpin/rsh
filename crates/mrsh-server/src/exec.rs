@@ -14,9 +14,29 @@ use tracing::debug;
 use crate::safety;
 
 /// Execute a command and return the response.
-/// On Windows: `powershell -NoProfile -Command <cmd>`
-/// On Linux: `sh -c <cmd>` (for testing)
+/// On Windows: `powershell -NoProfile -Command <cmd>` (default)
+///             `cmd /c <cmd>` (shell="cmd")
+/// On Linux: `sh -c <cmd>`
 pub async fn handle_exec(command: &str, env_vars: &[String]) -> Response {
+    handle_exec_with_shell(command, env_vars, None).await
+}
+
+/// Execute with explicit shell selection.
+/// Shell can be specified via `shell` param or command prefix:
+///   `CMD:dir /b`  → cmd.exe
+///   `SH:ls -la`   → sh/bash
+///   `echo hello`  → default (PowerShell on Windows, sh on Linux)
+pub async fn handle_exec_with_shell(command: &str, env_vars: &[String], shell: Option<&str>) -> Response {
+    // Auto-detect shell from command prefix
+    let (effective_shell, effective_command) = if let Some(rest) = command.strip_prefix("CMD:") {
+        (Some("cmd"), rest)
+    } else if let Some(rest) = command.strip_prefix("SH:") {
+        (Some("sh"), rest)
+    } else {
+        (shell, command)
+    };
+    let command = effective_command;
+    let shell = effective_shell;
     debug!("exec: {}", command);
 
     if command.is_empty() {
@@ -42,7 +62,7 @@ pub async fn handle_exec(command: &str, env_vars: &[String]) -> Response {
         };
     }
 
-    let result = run_command(command, env_vars).await;
+    let result = run_command_with_shell(command, env_vars, shell).await;
 
     match result {
         Ok((output, success)) => Response {
@@ -66,7 +86,12 @@ pub async fn handle_exec(command: &str, env_vars: &[String]) -> Response {
 
 /// Run a command, returning (output, success).
 async fn run_command(command: &str, env_vars: &[String]) -> anyhow::Result<(String, bool)> {
-    let mut cmd = build_command(command);
+    run_command_with_shell(command, env_vars, None).await
+}
+
+/// Run with explicit shell.
+async fn run_command_with_shell(command: &str, env_vars: &[String], shell: Option<&str>) -> anyhow::Result<(String, bool)> {
+    let mut cmd = build_command_with_shell(command, shell);
 
     // Add environment variables (with sanitization)
     if !env_vars.is_empty() {
@@ -94,16 +119,52 @@ async fn run_command(command: &str, env_vars: &[String]) -> anyhow::Result<(Stri
 
 #[cfg(target_os = "windows")]
 pub fn build_command(command: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-Command", command]);
-    // HideWindow equivalent via creation flags
+    build_command_with_shell(command, None)
+}
+
+#[cfg(target_os = "windows")]
+pub fn build_command_with_shell(command: &str, shell: Option<&str>) -> tokio::process::Command {
+    let mut cmd = match shell {
+        Some("cmd") => {
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/c", command]);
+            c
+        }
+        Some("sh") | Some("bash") => {
+            // Use Git Bash if available, otherwise fall back to PowerShell
+            let bash = if std::path::Path::new("C:\\Program Files\\Git\\bin\\bash.exe").exists() {
+                "C:\\Program Files\\Git\\bin\\bash.exe"
+            } else {
+                "bash"
+            };
+            let mut c = tokio::process::Command::new(bash);
+            c.args(["-c", command]);
+            c
+        }
+        _ => {
+            // Default: PowerShell
+            let mut c = tokio::process::Command::new("powershell");
+            c.args(["-NoProfile", "-Command", command]);
+            c
+        }
+    };
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     cmd
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn build_command(command: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("sh");
+    build_command_with_shell(command, None)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn build_command_with_shell(command: &str, shell: Option<&str>) -> tokio::process::Command {
+    let shell_bin = match shell {
+        Some("bash") => "bash",
+        Some("sh") => "sh",
+        _ => "sh",
+    };
+    let mut cmd = tokio::process::Command::new(shell_bin);
     cmd.args(["-c", command]);
     cmd
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::handler::ServerContext;
 
@@ -61,7 +61,8 @@ where
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     info!("SSH connection detected — ssh feature not enabled, disconnecting");
-    let version_line = b"SSH-2.0-mrsh_stub\r\n";
+    let version_line = format!("SSH-2.0-mrsh_{}\r\n", env!("CARGO_PKG_VERSION"));
+    let version_line = version_line.as_bytes();
     stream.write_all(version_line).await.ok();
 
     // Read client version (up to 255 bytes)
@@ -88,8 +89,10 @@ where
 #[cfg(feature = "ssh")]
 mod impl_ssh {
     use super::*;
+    use std::collections::HashMap;
     use russh::server::{Auth, Handler, Msg, Session};
     use russh::{Channel, ChannelId, Pty};
+    // tracing macros come from super::* (debug, info, warn)
 
     /// Per-connection SSH session handler.
     pub(super) struct SshHandler {
@@ -198,7 +201,7 @@ mod impl_ssh {
                     tokio::spawn(async move {
                         let mut stream = channel.into_stream();
                         let exit_code = crate::scp::handle_scp(&mut stream, &command, &addr).await;
-                        let _ = stream.shutdown().await;
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
                         info!("SCP finished: ch={} exit={}", addr, exit_code);
                     });
                 }
@@ -390,9 +393,7 @@ mod impl_ssh {
                     let stream = channel.into_stream();
                     let sftp_handler = SftpHandler::new();
                     tokio::spawn(async move {
-                        if let Err(e) = russh_sftp::server::run(stream, sftp_handler).await {
-                            warn!("SFTP session error: {}", e);
-                        }
+                        russh_sftp::server::run(stream, sftp_handler).await;
                     });
                 } else {
                     session.channel_failure(channel_id)?;
@@ -581,7 +582,7 @@ mod impl_ssh {
             &mut self,
             id: u32,
             filename: String,
-            _pflags: russh_sftp::protocol::PFlags,
+            _pflags: russh_sftp::protocol::OpenFlags,
             _attrs: russh_sftp::protocol::FileAttributes,
         ) -> Result<russh_sftp::protocol::Handle, Self::Error> {
             debug!("SFTP open: {}", filename);
@@ -616,7 +617,7 @@ mod impl_ssh {
             id: u32,
             handle: String,
             offset: u64,
-            data: bytes::Bytes,
+            data: Vec<u8>,
         ) -> Result<russh_sftp::protocol::Status, Self::Error> {
             use std::io::{Seek, SeekFrom, Write};
             debug!("SFTP write: {} offset={} len={}", handle, offset, data.len());
@@ -726,6 +727,9 @@ mod impl_ssh {
         };
 
         russh::server::Config {
+            server_id: russh::SshId::Standard(
+                std::borrow::Cow::Owned(format!("SSH-2.0-mrsh_{}", env!("CARGO_PKG_VERSION")))
+            ),
             keys: vec![host_key],
             auth_rejection_time: std::time::Duration::from_secs(1),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
@@ -829,6 +833,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         });
 
         let (mut client, server) = tokio::io::duplex(4096);
@@ -877,6 +882,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         });
 
         let (client, server) = tokio::io::duplex(4096);

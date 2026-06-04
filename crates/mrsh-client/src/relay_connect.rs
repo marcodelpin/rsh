@@ -59,6 +59,7 @@ pub async fn connect_via_relay(opts: &RelayConnectOptions) -> Result<TlsClient> 
         platform: String::new(),
         service_port: 0,
         encrypted_net_info: Vec::new(),
+        ports: Vec::new(),
     };
 
     let result = rdv_client

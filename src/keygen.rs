@@ -221,39 +221,69 @@ pub fn run_keys(args: &[String]) -> Result<()> {
 }
 
 /// List all authorized keys with fingerprint, type, and comment.
+/// Searches ALL possible authorized_keys locations.
 fn keys_list() -> Result<()> {
     use mrsh_core::auth;
+    use std::collections::HashSet;
 
-    let data_dir = crate::server_data_dir();
-    let ak_path = data_dir.join("authorized_keys");
-
-    if !ak_path.exists() {
-        eprintln!("No authorized_keys file at {}", ak_path.display());
-        eprintln!("Generate a key with: mrsh keygen");
-        return Ok(());
-    }
-
-    let keys = auth::load_authorized_keys(&ak_path, false)?;
-
-    if keys.is_empty() {
-        eprintln!("authorized_keys is empty.");
-        return Ok(());
-    }
+    let ak_paths = crate::all_authorized_keys_paths();
+    let mut total_keys = 0;
+    let mut seen_key_data: HashSet<Vec<u8>> = HashSet::new();
+    let mut found_any_file = false;
 
     println!("{:<12} {:<50} COMMENT", "TYPE", "FINGERPRINT");
     println!("{}", "-".repeat(80));
 
-    for key in &keys {
-        let fp = auth::key_fingerprint(&key.key_data);
-        let comment = key.comment.as_deref().unwrap_or("");
-        let perms = format_permissions(&key.permissions);
-        println!("{:<12} {:<50} {}", key.key_type, fp, comment);
-        if !perms.is_empty() {
-            println!("             options: {}", perms);
+    for ak_path in &ak_paths {
+        if !ak_path.exists() {
+            continue;
+        }
+        found_any_file = true;
+
+        let keys = match auth::load_authorized_keys(ak_path, false) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("  (error reading {}: {})", ak_path.display(), e);
+                continue;
+            }
+        };
+
+        let mut path_count = 0;
+        for key in &keys {
+            if !seen_key_data.insert(key.key_data.clone()) {
+                continue; // deduplicate across files
+            }
+            let fp = auth::key_fingerprint(&key.key_data);
+            let comment = key.comment.as_deref().unwrap_or("");
+            let perms = format_permissions(&key.permissions);
+            println!("{:<12} {:<50} {}", key.key_type, fp, comment);
+            if !perms.is_empty() {
+                println!("             options: {}", perms);
+            }
+            path_count += 1;
+        }
+
+        if path_count > 0 {
+            println!("  ({} from {})", path_count, ak_path.display());
+            total_keys += path_count;
         }
     }
 
-    println!("\n{} key(s) in {}", keys.len(), ak_path.display());
+    if !found_any_file {
+        eprintln!("No authorized_keys file found in any location:");
+        for p in &ak_paths {
+            eprintln!("  - {}", p.display());
+        }
+        eprintln!("Generate a key with: mrsh keygen");
+        return Ok(());
+    }
+
+    if total_keys == 0 {
+        eprintln!("All authorized_keys files are empty.");
+    } else {
+        println!("\n{} unique key(s) total", total_keys);
+    }
+
     Ok(())
 }
 

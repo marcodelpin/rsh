@@ -128,6 +128,14 @@ struct Cli {
     #[arg(long = "mux-stop")]
     mux_stop: bool,
 
+    /// Use cmd.exe instead of PowerShell for exec (avoids $var expansion)
+    #[arg(long = "cmd")]
+    use_cmd: bool,
+
+    /// Use sh/bash instead of PowerShell for exec
+    #[arg(long = "sh")]
+    use_sh: bool,
+
     /// Use QUIC transport instead of TLS/TCP (experimental, requires --features quic)
     #[cfg(feature = "quic")]
     #[arg(long = "quic")]
@@ -404,30 +412,16 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        // Auto-detect service mode:
-        // If no -h and no local subcommand → try SCM dispatch first.
-        // If SCM dispatch fails → fall through to tray mode.
+        // Default server mode: tray.
+        // No -h, no local subcommand, no --service → launch as tray (port 9822).
+        // SCM dispatch only happens with explicit --service flag (set by service registration).
+        // This avoids the SCM probe delay and ensures schtask/double-click = tray.
         let is_local_cmd = cli.args.first().is_none_or(|a| {
             LOCAL_COMMANDS.contains(&a.as_str()) || a == "help" || a == "recording"
         });
         if cli.host.is_none() && !is_local_cmd {
-            let port = cli.port.unwrap_or(DEFAULT_PORT);
-            let result = mrsh_server::service::run_as_service(move |cancel| {
-                let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-                rt.block_on(async {
-                    if let Err(e) = server_mode::run_server_mode_with_cancel(port, cancel).await {
-                        tracing::error!("server error: {}", e);
-                    }
-                });
-            });
-            match result {
-                Ok(()) => return Ok(()),          // Service ran and stopped cleanly
-                Err(_) => {
-                    // Not launched by SCM → fall through to tray mode
-                    let rt = tokio::runtime::Runtime::new()?;
-                    return rt.block_on(server_mode::run_server_mode(TRAY_PORT, true));
-                }
-            }
+            let rt = tokio::runtime::Runtime::new()?;
+            return rt.block_on(server_mode::run_server_mode(TRAY_PORT, true));
         }
     }
 
@@ -1162,73 +1156,84 @@ async fn async_main(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
-    let mut client = if let Some(ref dev_id) = device_id {
+    // Determine if host was specified as a bare DeviceID (numeric-only).
+    // If so, relay is the ONLY path. If host is IP/hostname with DeviceID
+    // from config, try direct first with relay as fallback.
+    let host_is_device_id = mrsh_relay::rendezvous::is_device_id(host);
+
+    // Helper: build relay options from config + device_id
+    #[cfg(not(feature = "no-relay"))]
+    let make_relay_opts = |dev_id: &str, port: u16| mrsh_client::relay_connect::RelayConnectOptions {
+        device_id: dev_id.to_string(),
+        rendezvous_server: config
+            .rendezvous_server
+            .as_deref()
+            .unwrap_or("localhost:21116")
+            .to_string(),
+        rendezvous_key: config.rendezvous_key.clone().unwrap_or_default(),
+        key_path: cli.key.clone(),
+        server_name: resolved_host.clone(),
+        port,
+        target_port: if auto_try_ports { 0 } else { port },
+        force_relay: false,
+        enrollment_token: config.enrollment_token.clone().unwrap_or_default(),
+    };
+
+    let mut client = if host_is_device_id {
+        // Bare DeviceID: relay is the only path
         #[cfg(feature = "no-relay")]
         bail!("relay connections disabled in this build");
-        // Relay path: resolve via hbbs, connect via P2P or hbbr
         #[cfg(not(feature = "no-relay"))]
-        let relay_opts = mrsh_client::relay_connect::RelayConnectOptions {
-            device_id: dev_id.clone(),
-            rendezvous_server: config
-                .rendezvous_server
-                .as_deref()
-                .unwrap_or("localhost:21116")
-                .to_string(),
-            rendezvous_key: config.rendezvous_key.clone().unwrap_or_default(),
-            key_path: cli.key.clone(),
-            server_name: resolved_host.clone(),
-            port: resolved_port,
-            target_port: if auto_try_ports { 0 } else { resolved_port },
-            force_relay: false,
-            enrollment_token: config.enrollment_token.clone().unwrap_or_default(),
-        };
-        mrsh_client::relay_connect::connect_via_relay(&relay_opts).await?
-    } else if auto_try_ports {
-        // Auto-try ports: try 9822 (tray) → 8822 (service) → 22 (SSH)
-        let opts = ConnectOptions {
-            host: resolved_host.clone(),
-            port: resolved_port,
-            key_path: cli.key.clone(),
-            password_user: cli.user.clone(),
-        };
-        match mrsh_client::client::connect_auto_try(&opts).await {
-            Ok((client, actual_port)) => {
-                resolved_port = actual_port;
-                client
-            }
-            Err(tls_err) => {
-                // TLS failed on all ports — try SSH fallback on port 22
-                #[cfg(feature = "ssh")]
-                {
-                    debug!("TLS failed, trying SSH fallback on port 22: {}", tls_err);
-                    if mrsh_client::ssh_client::ssh_client_available() {
-                        match mrsh_client::ssh_client::SshSession::connect(
-                            &opts.host, 22, &opts.key_path,
-                        ).await {
-                            Ok(ssh) => {
-                                eprintln!("Connected via SSH (no mrsh service on target)");
-                                // Handle command directly via SSH session
-                                let exit = server_mode::run_ssh_command(ssh, cmd, &args).await?;
-                                std::process::exit(exit);
-                            }
-                            Err(ssh_err) => {
-                                debug!("SSH fallback also failed: {}", ssh_err);
-                            }
-                        }
-                    }
-                }
-                return Err(tls_err);
-            }
+        {
+            let dev_id = device_id.as_ref().unwrap();
+            mrsh_client::relay_connect::connect_via_relay(&make_relay_opts(dev_id, resolved_port)).await?
         }
     } else {
-        // Direct connection to explicit port
-        let opts = ConnectOptions {
+        // IP/hostname: try direct first
+        let direct_opts = ConnectOptions {
             host: resolved_host.clone(),
             port: resolved_port,
             key_path: cli.key.clone(),
             password_user: cli.user.clone(),
         };
-        mrsh_client::client::connect(&opts).await?
+        let direct_result = if auto_try_ports {
+            mrsh_client::client::connect_auto_try(&direct_opts).await
+                .map(|(c, p)| { resolved_port = p; c })
+        } else {
+            mrsh_client::client::connect(&direct_opts).await
+        };
+
+        match direct_result {
+            Ok(client) => client,
+            Err(direct_err) => {
+                // Direct TLS failed — try relay fallback if DeviceID available
+                #[cfg(not(feature = "no-relay"))]
+                if let Some(ref dev_id) = device_id {
+                    tracing::debug!("direct failed, trying relay via {}", dev_id);
+                    match mrsh_client::relay_connect::connect_via_relay(&make_relay_opts(dev_id, resolved_port)).await {
+                        Ok(client) => {
+                            eprintln!("connected via relay (direct failed)");
+                            client
+                        }
+                        Err(_) => {
+                            // Relay also failed — try SSH fallback on port 22
+                            if mrsh_client::ssh_client::ssh_client_available() {
+                                tracing::debug!("relay failed, trying SSH on port 22");
+                                return run_ssh_fallback(&resolved_host, 22, &cli.key, cmd, &args).await;
+                            }
+                            return Err(direct_err);
+                        }
+                    }
+                } else {
+                    // No relay — try SSH fallback on port 22
+                    if mrsh_client::ssh_client::ssh_client_available() {
+                        tracing::debug!("direct TLS failed, trying SSH on port 22");
+                        return run_ssh_fallback(&resolved_host, 22, &cli.key, cmd, &args).await;
+                    }
+                    return Err(direct_err);
+                }
+            }
+        }
     };
 
     // ── Save server's DeviceID + rendezvous to client config ───
@@ -1329,7 +1334,15 @@ async fn async_main(cli: Cli) -> Result<()> {
         if args.len() < 2 {
             bail!("exec requires a command");
         }
-        let command = args[1..].join(" ");
+        let raw_command = args[1..].join(" ");
+        // Prepend shell prefix if --cmd or --sh flag used
+        let command = if cli.use_cmd {
+            format!("CMD:{}", raw_command)
+        } else if cli.use_sh {
+            format!("SH:{}", raw_command)
+        } else {
+            raw_command
+        };
         let exit_code = mrsh_client::commands::exec_stream(&mut client, &command, &[]).await?;
         // Finish session log
         if let Some(tracker) = tracker {
@@ -1355,7 +1368,14 @@ async fn async_main(cli: Cli) -> Result<()> {
             if args.len() < 2 {
                 bail!("exec requires a command");
             }
-            let command = args[1..].join(" ");
+            let raw_command = args[1..].join(" ");
+            let command = if cli.use_cmd {
+                format!("CMD:{}", raw_command)
+            } else if cli.use_sh {
+                format!("SH:{}", raw_command)
+            } else {
+                raw_command
+            };
             let result = mrsh_client::commands::exec(&mut client, &command, &[]).await?;
             print!("{}", result);
         }
@@ -2017,6 +2037,37 @@ async fn async_main(cli: Cli) -> Result<()> {
 
 
 
+// ── SSH fallback ──────────────────────────────────────────────
+
+/// Connect via SSH and run a command when mrsh TLS is not available.
+async fn run_ssh_fallback(
+    host: &str,
+    port: u16,
+    key_path: &Option<String>,
+    cmd: &str,
+    args: &[String],
+) -> Result<()> {
+    if !mrsh_client::ssh_client::ssh_client_available() {
+        bail!("SSH fallback not available (compile with --features ssh)");
+    }
+    #[cfg(feature = "ssh")]
+    {
+        use mrsh_client::ssh_client::SshSession;
+        eprintln!("connecting via SSH (port {})...", port);
+        let session = SshSession::connect(host, port, key_path).await?;
+        let exit_code = server_mode::run_ssh_command(session, cmd, args).await?;
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "ssh"))]
+    {
+        let _ = (host, port, key_path, cmd, args);
+        bail!("SSH fallback not available");
+    }
+}
+
 // ── Watch mode ──────────────────────────────────────────────
 
 /// Watch a local directory for changes and auto-push to remote.
@@ -2297,6 +2348,59 @@ pub(crate) fn is_same_lan(remote: std::net::SocketAddr, local_addrs: &[std::net:
 
 
 
+
+/// Return ALL possible authorized_keys paths (primary first, then fallbacks).
+/// The server should load keys from ALL of these, merging and deduplicating.
+pub(crate) fn all_authorized_keys_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+
+    // Primary: the data_dir we'd normally use
+    let primary = server_data_dir();
+    paths.push(primary.join("authorized_keys"));
+
+    #[cfg(target_os = "windows")]
+    {
+        // System-wide location (service)
+        let system_dir = std::path::PathBuf::from(r"C:\ProgramData\mrsh");
+        let system_ak = system_dir.join("authorized_keys");
+        if !paths.contains(&system_ak) {
+            paths.push(system_ak);
+        }
+
+        // User home location (tray)
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let user_ak = std::path::PathBuf::from(home).join(".mrsh").join("authorized_keys");
+            if !paths.contains(&user_ak) {
+                paths.push(user_ak);
+            }
+        }
+
+        // Legacy location
+        let legacy_ak = std::path::PathBuf::from(r"C:\ProgramData\remote-shell").join("authorized_keys");
+        if !paths.contains(&legacy_ak) {
+            paths.push(legacy_ak);
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // System-wide
+        let etc_ak = std::path::PathBuf::from("/etc/rsh/authorized_keys");
+        if !paths.contains(&etc_ak) {
+            paths.push(etc_ak);
+        }
+
+        // User home
+        if let Some(home) = std::env::var_os("HOME") {
+            let user_ak = std::path::PathBuf::from(home).join(".mrsh").join("authorized_keys");
+            if !paths.contains(&user_ak) {
+                paths.push(user_ak);
+            }
+        }
+    }
+
+    paths
+}
 
 pub(crate) fn server_data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]

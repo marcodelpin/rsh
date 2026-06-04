@@ -659,6 +659,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         });
 
         (acceptor, ctx, tls_config_clone)

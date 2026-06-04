@@ -54,6 +54,8 @@ pub struct ServerContext {
     pub device_id: Option<String>,
     /// Rendezvous server address (host:port) this server is registered on.
     pub rendezvous_server: Option<String>,
+    /// All authorized_keys file paths (for hot-reload on auth miss).
+    pub authorized_keys_paths: Vec<std::path::PathBuf>,
 }
 
 /// Authenticated client info.
@@ -628,15 +630,47 @@ where
         anyhow::bail!("public key revoked: {}", key_fingerprint);
     }
 
-    // Find matching authorized key
+    // Find matching authorized key (check in-memory first, then hot-reload from disk)
     let matched_key = ctx.authorized_keys.iter().find(|k| k.key_data == raw_key);
 
-    if matched_key.is_none() {
-        warn!("auth: unknown key {}", key_fingerprint);
-        send_auth_fail(stream, "public key not authorized", &ctx.server_version, use_binary).await?;
-        anyhow::bail!("public key not authorized");
-    }
-    let matched_key = matched_key.unwrap();
+    let hot_reloaded;
+    let matched_key = if let Some(k) = matched_key {
+        k
+    } else {
+        // Key not in memory — hot-reload from ALL authorized_keys paths on disk.
+        // This catches keys added after server started (e.g., via `keys add`).
+        info!(
+            "auth: key {} not in memory ({} loaded keys), hot-reloading from disk",
+            key_fingerprint,
+            ctx.authorized_keys.len()
+        );
+        let mut fresh_keys: Vec<auth::AuthorizedKey> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for ak_path in &ctx.authorized_keys_paths {
+            if ak_path.exists() {
+                if let Ok(keys) = auth::load_authorized_keys(ak_path, false) {
+                    for key in keys {
+                        if seen.insert(key.key_data.clone()) {
+                            fresh_keys.push(key);
+                        }
+                    }
+                }
+            }
+        }
+
+        hot_reloaded = fresh_keys;
+        match hot_reloaded.iter().find(|k| k.key_data == raw_key) {
+            Some(k) => {
+                info!("auth: key {} found after hot-reload ({} keys on disk)", key_fingerprint, hot_reloaded.len());
+                k
+            }
+            None => {
+                warn!("auth: unknown key {} (not in memory nor on disk)", key_fingerprint);
+                send_auth_fail(stream, "public key not authorized", &ctx.server_version, use_binary).await?;
+                anyhow::bail!("public key not authorized");
+            }
+        }
+    };
 
     // 3. Send challenge
     let challenge = auth::generate_challenge();
@@ -902,6 +936,7 @@ mod tests {
             server_key_path: None,
             device_id: Some("123456789".to_string()),
             rendezvous_server: Some("rdv.test:21116".to_string()),
+            authorized_keys_paths: vec![],
         }
     }
 

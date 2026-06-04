@@ -81,6 +81,8 @@ pub struct Client {
     pub service_port: u16,
     /// Encrypted network info blob (envelope encryption). Opaque to hbbs.
     pub encrypted_net_info: Vec<u8>,
+    /// All listening ports with type and capabilities.
+    pub ports: Vec<proto::PortInfo>,
 }
 
 /// Check whether a string looks like a device ID rather than a hostname/IP.
@@ -227,6 +229,8 @@ struct PeerEntry {
     service_port: u16,
     /// Encrypted network info blob (opaque, forwarded to clients).
     encrypted_net_info: Vec<u8>,
+    /// All listening ports with type and capabilities.
+    ports: Vec<proto::PortInfo>,
     /// Persistent TCP notification stream (for NAT-ed peers that can't receive UDP).
     tcp_notify: Option<Arc<tokio::sync::Mutex<tokio::net::TcpStream>>>,
 }
@@ -357,6 +361,7 @@ impl RendezvousServer {
                             platform: rp.platform.clone(),
                             service_port: rp.service_port as u16,
                             encrypted_net_info: rp.encrypted_net_info.clone(),
+                            ports: rp.ports.clone(),
                             tcp_notify: existing_tcp,
                         },
                     );
@@ -461,6 +466,7 @@ impl RendezvousServer {
                             socket_addr: encoded_addr,
                             relay_server: self.relay_server.clone(),
                             encrypted_net_info: entry.encrypted_net_info.clone(),
+                            ports: entry.ports.clone(),
                             ..Default::default()
                         },
                     )),
@@ -507,6 +513,7 @@ impl RendezvousServer {
                     socket_addr: encode_socket_addr(&entry.addr),
                     last_seen_secs,
                     service_port: entry.service_port as i32,
+                    ports: entry.ports.clone(),
                 }
             })
             .collect();
@@ -595,6 +602,7 @@ impl RendezvousServer {
                     socket_addr: encode_socket_addr(&entry.addr),
                     last_seen_secs,
                     service_port: entry.service_port as i32,
+                    ports: entry.ports.clone(),
                 }
             })
             .collect();
@@ -900,7 +908,8 @@ impl Client {
                     hostname: self.hostname.clone(),
                     platform: self.platform.clone(),
                     service_port: self.service_port as i32,
-                    ..Default::default()
+                    encrypted_net_info: self.encrypted_net_info.clone(),
+                    ports: self.ports.clone(),
                 },
             )),
         };
@@ -1183,6 +1192,7 @@ impl Client {
                     platform: self.platform.clone(),
                     service_port: self.service_port as i32,
                     encrypted_net_info: self.encrypted_net_info.clone(),
+                    ports: self.ports.clone(),
                 },
             )),
         };
@@ -1387,6 +1397,7 @@ async fn handle_tcp_relay_request(
                     platform: rp.platform.clone(),
                     service_port: rp.service_port as u16,
                     encrypted_net_info: rp.encrypted_net_info.clone(),
+                    ports: rp.ports.clone(),
                     tcp_notify: Some(tcp_stream),
                 },
             );

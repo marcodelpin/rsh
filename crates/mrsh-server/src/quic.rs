@@ -1119,6 +1119,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         })
     }
 
@@ -1581,6 +1582,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         });
 
         let (server_ep, client_ep, server_addr) = make_quic_endpoint_pair().unwrap();
@@ -1899,6 +1901,7 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            authorized_keys_paths: vec![],
         });
 
         let (server_ep, client_ep, server_addr) = make_quic_endpoint_pair().unwrap();
