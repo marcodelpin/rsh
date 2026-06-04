@@ -40,6 +40,16 @@ message RegisterPeer {
   // All ports this server listens on, with type and capabilities.
   // Supersedes service_port (field 6) when non-empty.
   repeated PortInfo ports = 8;
+  // rsh-5264.1 heartbeat-feedback fields (ignored by RustDesk clients).
+  // Servers report their compiled version + last self-update outcome at
+  // every registration so `mrsh fleet update`/`status` can read fleet
+  // state from rdv (single round-trip) instead of TCP-probing each host.
+  string current_version = 9;       // mrsh server version, e.g. "1.10.29"
+  string last_update_status = 10;   // "success" | "failed:<reason>" | "never"
+  int64 last_update_at_unix = 11;   // unix-seconds timestamp, 0 if never
+  // rsh-5264.5 staged-rollout fields (ignored by RustDesk and pre-5264.5 servers).
+  string track = 12;                // "stable" | "canary" | "dev" (default "stable")
+  bool auto_upgrade = 13;           // true = host opts in to rdv-driven self-update
 }
 
 // Describes a single listening port and its capabilities.
@@ -168,6 +178,9 @@ message FetchLocalAddr {
   bytes socket_addr = 1;
   string relay_server = 2;
   bytes socket_addr_v6 = 3;
+  // rsh-64x9 2026-05-21: same-NAT peers benefit from LAN discovery too.
+  // Backward-compatible (new field; old clients/servers default to empty).
+  bytes encrypted_net_info = 4;
 }
 
 message LocalAddr {
@@ -292,6 +305,13 @@ message GroupPeer {
   int32 service_port = 6;  // rsh command listener port (0 = default 8822) — compat
   repeated PortInfo ports = 7;  // all listening ports with capabilities
   bytes encrypted_net_info = 8; // ECIES-encrypted LAN IPs, ports, hostname
+  // rsh-5264.1 heartbeat-feedback fields (forwarded from RegisterPeer).
+  string current_version = 9;       // mrsh server version, e.g. "1.10.29"
+  string last_update_status = 10;   // "success" | "failed:<reason>" | "never"
+  int64 last_update_at_unix = 11;   // unix-seconds timestamp, 0 if never
+  // rsh-5264.5 staged-rollout fields (forwarded from RegisterPeer).
+  string track = 12;                // "stable" | "canary" | "dev"
+  bool auto_upgrade = 13;           // true = host opts in to rdv-driven self-update
 }
 
 // --- Fleet peer list (rsh extension) ---
@@ -302,6 +322,68 @@ message ListPeers {
 
 message ListPeersResponse {
   repeated GroupPeer peers = 1;  // reuse GroupPeer format
+}
+
+// --- VersionAdvert (rsh-5264.3, per-platform/per-track latest version) ---
+//
+// rdv stores the operator-published "latest version available" per
+// (platform, track) tuple. Servers query at heartbeat with their
+// (platform, track, current_version); rdv replies with the advert when a
+// newer version is available, otherwise update_available=false.
+
+message VersionAdvert {
+  string platform = 1;        // "windows-msvc" | "linux-glibc" | "linux-musl" | "macos"
+  string track = 2;           // "stable" | "canary" | "dev"
+  string latest_version = 3;  // semver, e.g. "1.10.30"
+  string download_url = 4;    // optional; where rdv hosts the binary (relay endpoint)
+  bytes signature = 5;        // Ed25519 signature of binary, from release-signing key
+  int64 published_at_unix = 6;
+}
+
+// Operator-side: publish a VersionAdvert (signed by the release-signing key).
+// `operator_signature` covers the canonical string
+// `<platform>|<track>|<version>` so an attacker who reuses a binary signature
+// cannot publish under a different (platform, track, version) tuple.
+message PublishVersionRequest {
+  VersionAdvert advert = 1;
+  bytes binary_blob = 2;          // optional inline binary blob (small releases)
+  bytes operator_signature = 3;   // Ed25519 sig of "<platform>|<track>|<version>"
+}
+
+message PublishVersionResponse {
+  bool accepted = 1;
+  string error_message = 2;
+}
+
+// Server-side: query latest version for my platform+track tuple.
+message QueryVersionRequest {
+  string platform = 1;
+  string track = 2;
+  string current_version = 3;  // server's current version, for "no update needed" reply
+}
+
+message QueryVersionResponse {
+  bool update_available = 1;
+  VersionAdvert advert = 2;     // present iff update_available=true
+}
+
+// rsh-5264.6: server-side blob fetch. After QueryVersion returns an advert,
+// the server fetches the actual binary bytes from rdv via this RPC. MUST be
+// sent over TCP — payload (7-8 MB) exceeds UDP packet limits.
+message FetchBinaryRequest {
+  string platform = 1;          // matches the advert's platform
+  string track = 2;             // matches the advert's track
+  string version = 3;           // pinned version OR latest_version from advert
+}
+
+message FetchBinaryResponse {
+  bool found = 1;
+  bytes binary_blob = 2;        // raw binary bytes (empty when found=false)
+  bytes signature = 3;           // Ed25519 sig of binary_blob (re-served for
+                                 // independent verification — same value as
+                                 // VersionAdvert.signature for the matching
+                                 // (platform, track, version) tuple)
+  string error_message = 4;     // populated when found=false
 }
 
 // --- Top-level envelope ---
@@ -338,5 +420,13 @@ message RendezvousMessage {
     GroupQueryResponse group_query_response = 35;
     ListPeers list_peers = 36;
     ListPeersResponse list_peers_response = 37;
+    // rsh-5264.3 VersionAdvert protocol
+    PublishVersionRequest publish_version_request = 38;
+    PublishVersionResponse publish_version_response = 39;
+    QueryVersionRequest query_version_request = 40;
+    QueryVersionResponse query_version_response = 41;
+    // rsh-5264.6 binary blob fetch (TCP transport only)
+    FetchBinaryRequest fetch_binary_request = 42;
+    FetchBinaryResponse fetch_binary_response = 43;
   }
 }

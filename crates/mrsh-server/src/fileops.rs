@@ -215,7 +215,6 @@ fn days_to_date(mut days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -51,8 +51,7 @@ fn cert_needs_renewal(cert_path: &Path) -> bool {
     let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
         return false; // clock skew → keep existing
     };
-    let max_age_secs =
-        (CERT_VALIDITY_DAYS as u64).saturating_sub(CERT_RENEWAL_BUFFER_DAYS) * 86400;
+    let max_age_secs = (CERT_VALIDITY_DAYS as u64).saturating_sub(CERT_RENEWAL_BUFFER_DAYS) * 86400;
     age.as_secs() > max_age_secs
 }
 
@@ -141,6 +140,15 @@ pub fn client_config() -> Arc<rustls::ClientConfig> {
 /// On first connect, saves the server cert fingerprint to `known_hosts_path`.
 /// On subsequent connects, rejects if the fingerprint has changed (MITM protection).
 pub fn client_config_tofu(known_hosts_path: Option<PathBuf>) -> Arc<rustls::ClientConfig> {
+    client_config_tofu_port(known_hosts_path, None)
+}
+
+/// TOFU client config with port awareness. Non-default ports get separate
+/// known_hosts entries (e.g. "host:8899" for debug-server vs "host" for service).
+pub fn client_config_tofu_port(
+    known_hosts_path: Option<PathBuf>,
+    port: Option<u16>,
+) -> Arc<rustls::ClientConfig> {
     ensure_crypto_provider();
     let path = known_hosts_path.unwrap_or_else(|| {
         dirs::home_dir()
@@ -148,7 +156,7 @@ pub fn client_config_tofu(known_hosts_path: Option<PathBuf>) -> Arc<rustls::Clie
             .join(".rsh")
             .join("known_hosts")
     });
-    let verifier = TofuVerifier::new(path);
+    let verifier = TofuVerifier::new(path, port);
     let config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
@@ -234,14 +242,19 @@ pub fn set_accept_host_key(accept: bool) {
 struct TofuVerifier {
     known_hosts_path: PathBuf,
     cache: Mutex<HashMap<String, String>>,
+    /// Port for key disambiguation. Non-default ports (not 8822/9822) get
+    /// stored as "host:port" in known_hosts to prevent TOFU conflicts
+    /// between services on different ports (e.g. debug-server on 8899).
+    port: Option<u16>,
 }
 
 impl TofuVerifier {
-    fn new(known_hosts_path: PathBuf) -> Self {
+    fn new(known_hosts_path: PathBuf, port: Option<u16>) -> Self {
         let cache = Self::load_known_hosts(&known_hosts_path);
         Self {
             known_hosts_path,
             cache: Mutex::new(cache),
+            port,
         }
     }
 
@@ -300,7 +313,13 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let hostname = Self::server_name_to_string(server_name);
+        let raw_hostname = Self::server_name_to_string(server_name);
+        // Include port in key for non-standard ports (prevents TOFU conflicts
+        // between service on 8822 and debug-server on 8899)
+        let hostname = match self.port {
+            Some(p) if p != 8822 && p != 9822 => format!("{}:{}", raw_hostname, p),
+            _ => raw_hostname,
+        };
         let fingerprint = cert_fingerprint(end_entity.as_ref());
 
         let cache = self.cache.lock().unwrap();
@@ -310,7 +329,10 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
             }
             // Fingerprint mismatch — accept if flag set, reject otherwise
             if ACCEPT_CHANGED_HOST_KEY.load(std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
+                // desk-xqq: downgraded from warn! to debug! — fleet status emits
+                // one summary warn per drifted host after probing (fleet_cmd.rs),
+                // avoiding per-TLS-handshake spam when multiple transports are tried.
+                tracing::debug!(
                     "TOFU: host key changed for {} — accepting new key {}",
                     hostname,
                     fingerprint
@@ -332,8 +354,8 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         }
         drop(cache); // Release lock before saving
 
-        // First connection — trust and save
-        tracing::info!(
+        // First connection — trust and save (debug level: floods stderr in fleet status)
+        tracing::debug!(
             "TOFU: new host {} with fingerprint {}",
             hostname,
             fingerprint
@@ -450,7 +472,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let known_hosts = dir.join("known_hosts");
 
-        let verifier = TofuVerifier::new(known_hosts.clone());
+        let verifier = TofuVerifier::new(known_hosts.clone(), None);
 
         // Generate a cert
         let (cert_pem, _) = generate_self_signed_cert().unwrap();
@@ -490,7 +512,7 @@ mod tests {
         let server_name = ServerName::try_from("test-host-2").unwrap();
 
         // First connect
-        let verifier = TofuVerifier::new(known_hosts.clone());
+        let verifier = TofuVerifier::new(known_hosts.clone(), None);
         verifier
             .verify_server_cert(
                 &certs[0],
@@ -502,7 +524,7 @@ mod tests {
             .unwrap();
 
         // Second connect with same cert — should accept
-        let verifier2 = TofuVerifier::new(known_hosts.clone());
+        let verifier2 = TofuVerifier::new(known_hosts.clone(), None);
         let result = verifier2.verify_server_cert(
             &certs[0],
             &[],
@@ -535,7 +557,7 @@ mod tests {
         let server_name = ServerName::try_from("test-host-3").unwrap();
 
         // First connect with cert1
-        let verifier = TofuVerifier::new(known_hosts.clone());
+        let verifier = TofuVerifier::new(known_hosts.clone(), None);
         verifier
             .verify_server_cert(
                 &certs1[0],
@@ -547,7 +569,7 @@ mod tests {
             .unwrap();
 
         // Second connect with different cert — should reject
-        let verifier2 = TofuVerifier::new(known_hosts.clone());
+        let verifier2 = TofuVerifier::new(known_hosts.clone(), None);
         let result = verifier2.verify_server_cert(
             &certs2[0],
             &[],
@@ -599,15 +621,11 @@ mod tests {
 
         // Backdate the cert file to simulate expiry (400 days ago)
         let cert_path = dir.join("tls_cert.pem");
-        let old_time = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(400 * 86400);
-        filetime::set_file_mtime(
-            &cert_path,
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .unwrap_or_else(|_| {
-            // filetime not available — skip this test
-        });
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 86400);
+        filetime::set_file_mtime(&cert_path, filetime::FileTime::from_system_time(old_time))
+            .unwrap_or_else(|_| {
+                // filetime not available — skip this test
+            });
 
         // If mtime was set, cert should be regenerated
         if let Ok(meta) = std::fs::metadata(&cert_path) {

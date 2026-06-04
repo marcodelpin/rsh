@@ -45,10 +45,16 @@ pub async fn handle_scp<S: AsyncRead + AsyncWrite + Unpin + Send>(
     }
 
     if is_sink {
-        info!("SCP sink (upload) → {} (recursive={}), from {}", target_path, recursive, remote_addr);
+        info!(
+            "SCP sink (upload) → {} (recursive={}), from {}",
+            target_path, recursive, remote_addr
+        );
         scp_sink(stream, &target_path, remote_addr).await
     } else if is_source {
-        info!("SCP source (download) ← {} (recursive={}), from {}", target_path, recursive, remote_addr);
+        info!(
+            "SCP source (download) ← {} (recursive={}), from {}",
+            target_path, recursive, remote_addr
+        );
         scp_source(stream, &target_path, recursive, remote_addr).await
     } else {
         let _ = scp_error(stream, "scp: must specify -t or -f").await;
@@ -98,7 +104,11 @@ async fn scp_sink<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let dir_name = parts[2].trim();
                 current_dir = current_dir.join(dir_name);
                 if let Err(e) = std::fs::create_dir_all(&current_dir) {
-                    let _ = scp_error(stream, &format!("scp: mkdir {}: {}", current_dir.display(), e)).await;
+                    let _ = scp_error(
+                        stream,
+                        &format!("scp: mkdir {}: {}", current_dir.display(), e),
+                    )
+                    .await;
                     return 1;
                 }
                 info!("SCP mkdir {} (from {})", current_dir.display(), remote_addr);
@@ -116,7 +126,11 @@ async fn scp_sink<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let _ = stream.write_all(&[0]).await;
             }
             _ => {
-                let _ = scp_error(stream, &format!("scp: unknown command {:?}", line[0] as char)).await;
+                let _ = scp_error(
+                    stream,
+                    &format!("scp: unknown command {:?}", line[0] as char),
+                )
+                .await;
                 return 1;
             }
         }
@@ -173,7 +187,11 @@ async fn receive_file<S: AsyncRead + AsyncWrite + Unpin + Send>(
             .await
             .map_err(|e| format!("read data: {}", e))?;
         if n == 0 {
-            return Err(format!("unexpected EOF at {}/{} bytes", size - remaining, size));
+            return Err(format!(
+                "unexpected EOF at {}/{} bytes",
+                size - remaining,
+                size
+            ));
         }
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|e| format!("write {}: {}", file_path.display(), e))?;
@@ -276,7 +294,12 @@ async fn send_file<S: AsyncRead + AsyncWrite + Unpin + Send>(
         return 1;
     }
 
-    info!("SCP sent {} ({} bytes) to {}", path.display(), size, remote_addr);
+    info!(
+        "SCP sent {} ({} bytes) to {}",
+        path.display(),
+        size,
+        remote_addr
+    );
     0
 }
 
@@ -286,53 +309,56 @@ fn send_dir<'a, S: AsyncRead + AsyncWrite + Unpin + 'a>(
     dir: &'a Path,
     remote_addr: &'a str,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u32> + Send + 'a>>
-where S: Send {
+where
+    S: Send,
+{
     Box::pin(async move {
-    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
 
-    // Send directory header: D0755 0 <name>\n
-    let header = format!("D0755 0 {}\n", name);
-    if stream.write_all(header.as_bytes()).await.is_err() {
-        return 1;
-    }
-
-    let mut ack = [0u8; 1];
-    if stream.read_exact(&mut ack).await.is_err() || ack[0] != 0 {
-        return 1;
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            let _ = scp_error(stream, &format!("scp: readdir {}: {}", dir.display(), e)).await;
+        // Send directory header: D0755 0 <name>\n
+        let header = format!("D0755 0 {}\n", name);
+        if stream.write_all(header.as_bytes()).await.is_err() {
             return 1;
         }
-    };
 
-    let mut sorted: Vec<_> = entries.flatten().collect();
-    sorted.sort_by_key(|e| e.file_name());
+        let mut ack = [0u8; 1];
+        if stream.read_exact(&mut ack).await.is_err() || ack[0] != 0 {
+            return 1;
+        }
 
-    for entry in sorted {
-        let path = entry.path();
-        if path.is_dir() {
-            if send_dir(stream, &path, remote_addr).await != 0 {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = scp_error(stream, &format!("scp: readdir {}: {}", dir.display(), e)).await;
                 return 1;
             }
-        } else if let Ok(meta) = entry.metadata()
-            && send_file(stream, &path, meta.len(), remote_addr).await != 0 {
+        };
+
+        let mut sorted: Vec<_> = entries.flatten().collect();
+        sorted.sort_by_key(|e| e.file_name());
+
+        for entry in sorted {
+            let path = entry.path();
+            if path.is_dir() {
+                if send_dir(stream, &path, remote_addr).await != 0 {
+                    return 1;
+                }
+            } else if let Ok(meta) = entry.metadata()
+                && send_file(stream, &path, meta.len(), remote_addr).await != 0
+            {
                 return 1;
             }
-    }
+        }
 
-    // End directory: E\n
-    if stream.write_all(b"E\n").await.is_err() {
-        return 1;
-    }
-    if stream.read_exact(&mut ack).await.is_err() || ack[0] != 0 {
-        return 1;
-    }
+        // End directory: E\n
+        if stream.write_all(b"E\n").await.is_err() {
+            return 1;
+        }
+        if stream.read_exact(&mut ack).await.is_err() || ack[0] != 0 {
+            return 1;
+        }
 
-    0
+        0
     })
 }
 
@@ -343,7 +369,10 @@ async fn read_line<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Vec<u8
     loop {
         let n = stream.read(&mut byte).await?;
         if n == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "EOF"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF",
+            ));
         }
         if byte[0] == b'\n' {
             return Ok(line);
@@ -353,7 +382,10 @@ async fn read_line<S: AsyncRead + Unpin + Send>(stream: &mut S) -> Result<Vec<u8
 }
 
 /// Send an SCP error message.
-async fn scp_error<S: AsyncWrite + Unpin + Send>(stream: &mut S, msg: &str) -> Result<(), std::io::Error> {
+async fn scp_error<S: AsyncWrite + Unpin + Send>(
+    stream: &mut S,
+    msg: &str,
+) -> Result<(), std::io::Error> {
     warn!("SCP error: {}", msg);
     stream.write_all(&[1]).await?;
     stream.write_all(msg.as_bytes()).await?;
@@ -364,7 +396,7 @@ async fn scp_error<S: AsyncWrite + Unpin + Send>(stream: &mut S, msg: &str) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+    use tokio::io::DuplexStream;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -505,9 +537,8 @@ mod tests {
     async fn handle_scp_neither_sink_nor_source_returns_error() {
         let (mut client, mut server) = duplex();
         // No -t or -f flag → error
-        let h = tokio::spawn(async move {
-            handle_scp(&mut server, "scp /some/path", "test").await
-        });
+        let h =
+            tokio::spawn(async move { handle_scp(&mut server, "scp /some/path", "test").await });
         assert_eq!(client_read_byte(&mut client).await, 1);
         let code = h.await.unwrap();
         assert_eq!(code, 1);
@@ -639,7 +670,10 @@ mod tests {
         assert_eq!(client_read_byte(&mut client).await, 0);
 
         // Send a T (timestamp) command — should be acked and ignored
-        client.write_all(b"T1700000000 0 1700000000 0\n").await.unwrap();
+        client
+            .write_all(b"T1700000000 0 1700000000 0\n")
+            .await
+            .unwrap();
         assert_eq!(client_read_byte(&mut client).await, 0);
 
         // Now send a regular file
@@ -780,7 +814,10 @@ mod tests {
         assert_eq!(client_read_byte(&mut client).await, 0); // initial OK
 
         // C header with non-numeric size
-        client.write_all(b"C0644 notanumber file.txt\n").await.unwrap();
+        client
+            .write_all(b"C0644 notanumber file.txt\n")
+            .await
+            .unwrap();
 
         // Server should send error byte
         assert_eq!(client_read_byte(&mut client).await, 1);
@@ -885,9 +922,8 @@ mod tests {
         let (mut client, mut server) = duplex();
         let file_path = tmp.join("data.bin").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &file_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &file_path, false, "test").await });
 
         // Send initial ack
         client_write_byte(&mut client, 0).await;
@@ -927,16 +963,19 @@ mod tests {
         let (mut client, mut server) = duplex();
         let file_path = tmp.join("empty.dat").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &file_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &file_path, false, "test").await });
 
         client_write_byte(&mut client, 0).await; // initial ack
 
         let header = client_read_line(&mut client).await;
         let header_str = String::from_utf8_lossy(&header);
         // Size must be 0
-        assert!(header_str.starts_with("C0644 0 empty.dat"), "unexpected header: {}", header_str);
+        assert!(
+            header_str.starts_with("C0644 0 empty.dat"),
+            "unexpected header: {}",
+            header_str
+        );
 
         client_write_byte(&mut client, 0).await; // ack header
 
@@ -965,9 +1004,8 @@ mod tests {
         let (mut client, mut server) = duplex();
         let file_path = tmp.join("big.dat").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &file_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &file_path, false, "test").await });
 
         client_write_byte(&mut client, 0).await;
 
@@ -1020,9 +1058,8 @@ mod tests {
         let (mut client, mut server) = duplex();
         let dir_path = tmp.to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &dir_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &dir_path, false, "test").await });
 
         client_write_byte(&mut client, 0).await;
 
@@ -1045,9 +1082,7 @@ mod tests {
         let (mut client, mut server) = duplex();
         let dir_path = tmp.join("mydir").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &dir_path, true, "test").await
-        });
+        let h = tokio::spawn(async move { scp_source(&mut server, &dir_path, true, "test").await });
 
         client_write_byte(&mut client, 0).await; // initial ack
 
@@ -1102,15 +1137,18 @@ mod tests {
         let (mut client, mut server) = duplex();
         let file_path = tmp.join("binary.bin").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &file_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &file_path, false, "test").await });
 
         client_write_byte(&mut client, 0).await;
 
         let header = client_read_line(&mut client).await;
         let header_str = String::from_utf8_lossy(&header);
-        assert!(header_str.starts_with("C0644 256 binary.bin"), "header: {}", header_str);
+        assert!(
+            header_str.starts_with("C0644 256 binary.bin"),
+            "header: {}",
+            header_str
+        );
 
         client_write_byte(&mut client, 0).await;
 
@@ -1204,16 +1242,19 @@ mod tests {
         let (mut client, mut server) = duplex();
         let file_path = tmp.join("exec.sh").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &file_path, false, "test").await
-        });
+        let h =
+            tokio::spawn(async move { scp_source(&mut server, &file_path, false, "test").await });
 
         client_write_byte(&mut client, 0).await;
 
         let header = client_read_line(&mut client).await;
         let header_str = String::from_utf8_lossy(&header);
         // Mode must always be 0644, regardless of on-disk mode
-        assert!(header_str.starts_with("C0644 "), "expected C0644 mode, got: {}", header_str);
+        assert!(
+            header_str.starts_with("C0644 "),
+            "expected C0644 mode, got: {}",
+            header_str
+        );
 
         // Clean up: ack + read data + trail + final ack
         client_write_byte(&mut client, 0).await;
@@ -1240,22 +1281,29 @@ mod tests {
         let (mut client, mut server) = duplex();
         let dir_path = tmp.join("d").to_str().unwrap().to_string();
 
-        let h = tokio::spawn(async move {
-            scp_source(&mut server, &dir_path, true, "test").await
-        });
+        let h = tokio::spawn(async move { scp_source(&mut server, &dir_path, true, "test").await });
 
         client_write_byte(&mut client, 0).await;
 
         let dir_hdr = client_read_line(&mut client).await;
         let dir_hdr_str = String::from_utf8_lossy(&dir_hdr);
-        assert!(dir_hdr_str.starts_with("D0755 "), "expected D0755, got: {}", dir_hdr_str);
+        assert!(
+            dir_hdr_str.starts_with("D0755 "),
+            "expected D0755, got: {}",
+            dir_hdr_str
+        );
 
         // Drain the rest so the server task can finish cleanly
         client_write_byte(&mut client, 0).await; // ack D
         let file_hdr = client_read_line(&mut client).await;
         client_write_byte(&mut client, 0).await; // ack C
         let file_hdr_str = String::from_utf8_lossy(&file_hdr);
-        let sz: usize = file_hdr_str.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let sz: usize = file_hdr_str
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
         let mut buf = vec![0u8; sz];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(client_read_byte(&mut client).await, 0); // trailing \0
@@ -1300,7 +1348,10 @@ mod tests {
 
         assert_eq!(std::fs::read_to_string(tmp.join("one.txt")).unwrap(), "111");
         assert_eq!(std::fs::read_to_string(tmp.join("two.txt")).unwrap(), "222");
-        assert_eq!(std::fs::read_to_string(tmp.join("three.txt")).unwrap(), "333");
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("three.txt")).unwrap(),
+            "333"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

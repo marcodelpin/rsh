@@ -28,10 +28,7 @@ const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 /// Well-known public STUN servers.
-pub const STUN_SERVERS: &[&str] = &[
-    "stun.l.google.com:19302",
-    "stun1.l.google.com:19302",
-];
+pub const STUN_SERVERS: &[&str] = &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
 
 /// NAT type classification.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,7 +68,12 @@ pub struct NatInfo {
 pub async fn detect_nat_type(timeout: Duration) -> NatInfo {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
-        Err(_) => return NatInfo { nat_type: NatType::Unknown, external_addr: None },
+        Err(_) => {
+            return NatInfo {
+                nat_type: NatType::Unknown,
+                external_addr: None,
+            };
+        }
     };
 
     let mut results = Vec::new();
@@ -80,18 +82,30 @@ pub async fn detect_nat_type(timeout: Duration) -> NatInfo {
             Ok(addr) => results.push(addr),
             Err(e) => tracing::debug!("STUN {} failed: {}", server, e),
         }
-        if results.len() >= 2 { break; }
+        if results.len() >= 2 {
+            break;
+        }
     }
 
     match results.len() {
-        0 => NatInfo { nat_type: NatType::Unknown, external_addr: None },
-        1 => NatInfo { nat_type: NatType::Unknown, external_addr: Some(results[0]) },
+        0 => NatInfo {
+            nat_type: NatType::Unknown,
+            external_addr: None,
+        },
+        1 => NatInfo {
+            nat_type: NatType::Unknown,
+            external_addr: Some(results[0]),
+        },
         _ => {
             let addr1 = results[0];
             let addr2 = results[1];
             let nat_type = if addr1.ip() == addr2.ip() && addr1.port() == addr2.port() {
                 // Check if external matches local
-                if sock.local_addr().map(|l| l.ip() == addr1.ip()).unwrap_or(false) {
+                if sock
+                    .local_addr()
+                    .map(|l| l.ip() == addr1.ip())
+                    .unwrap_or(false)
+                {
                     NatType::Open
                 } else {
                     NatType::Cone
@@ -99,7 +113,10 @@ pub async fn detect_nat_type(timeout: Duration) -> NatInfo {
             } else {
                 NatType::Symmetric
             };
-            NatInfo { nat_type, external_addr: Some(addr1) }
+            NatInfo {
+                nat_type,
+                external_addr: Some(addr1),
+            }
         }
     }
 }
@@ -117,7 +134,9 @@ async fn stun_binding(sock: &UdpSocket, server: &str, timeout: Duration) -> Resu
 
     let txn_id = req[8..20].to_vec();
 
-    sock.send_to(&req, server).await.context("send STUN request")?;
+    sock.send_to(&req, server)
+        .await
+        .context("send STUN request")?;
 
     let mut buf = [0u8; 512];
     let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
@@ -235,9 +254,21 @@ mod tests {
             1 ^ cookie[2],
             100 ^ cookie[3],
         ];
-        let data = [0x00, 0x01, port_bytes[0], port_bytes[1], ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]];
+        let data = [
+            0x00,
+            0x01,
+            port_bytes[0],
+            port_bytes[1],
+            ip_bytes[0],
+            ip_bytes[1],
+            ip_bytes[2],
+            ip_bytes[3],
+        ];
         let addr = parse_xor_mapped_address(&data).unwrap();
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100)));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100))
+        );
         assert_eq!(addr.port(), 8822);
     }
 
@@ -245,7 +276,10 @@ mod tests {
     fn parse_mapped_address_ipv4() {
         let data = [0x00, 0x01, 0x22, 0x76, 10, 0, 0, 1]; // port=8822, ip=10.0.0.1
         let addr = parse_mapped_address(&data).unwrap();
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
+        );
         assert_eq!(addr.port(), 0x2276); // 8822
     }
 

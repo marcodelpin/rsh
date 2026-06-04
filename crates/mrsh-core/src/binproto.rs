@@ -127,8 +127,12 @@ pub fn decode_blob(data: &[u8], offset: usize) -> Result<(&[u8], usize)> {
     if offset + 4 > data.len() {
         bail!("decode_blob: truncated length at offset {}", offset);
     }
-    let len = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
-        as usize;
+    let len = u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]) as usize;
     let start = offset + 4;
     let end = start + len;
     if end > data.len() {
@@ -147,7 +151,12 @@ pub fn decode_u32_le(data: &[u8], offset: usize) -> Result<(u32, usize)> {
     if offset + 4 > data.len() {
         bail!("decode_u32_le: truncated at offset {}", offset);
     }
-    let v = u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+    let v = u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]);
     Ok((v, offset + 4))
 }
 
@@ -157,8 +166,14 @@ pub fn decode_u64_le(data: &[u8], offset: usize) -> Result<(u64, usize)> {
         bail!("decode_u64_le: truncated at offset {}", offset);
     }
     let v = u64::from_le_bytes([
-        data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
-        data[offset + 4], data[offset + 5], data[offset + 6], data[offset + 7],
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+        data[offset + 4],
+        data[offset + 5],
+        data[offset + 6],
+        data[offset + 7],
     ]);
     Ok((v, offset + 8))
 }
@@ -291,7 +306,13 @@ pub fn parse_auth_ok_full(data: &[u8]) -> Result<AuthOkFields> {
     let (version, off) = decode_str(data, 0)?;
     let version = version.to_string();
     if off >= data.len() {
-        return Ok(AuthOkFields { version, caps: vec![], banner: None, device_id: None, rendezvous_server: None });
+        return Ok(AuthOkFields {
+            version,
+            caps: vec![],
+            banner: None,
+            device_id: None,
+            rendezvous_server: None,
+        });
     }
     let caps_count = data[off] as usize;
     let mut off = off + 1;
@@ -306,7 +327,9 @@ pub fn parse_auth_ok_full(data: &[u8]) -> Result<AuthOkFields> {
         off = new_off;
         Some(b.to_string())
     } else {
-        if off < data.len() { off += 1; } // skip 0 flag
+        if off < data.len() {
+            off += 1;
+        } // skip 0 flag
         None
     };
     // Extended fields (v1.7.9+): device_id, rendezvous_server
@@ -315,7 +338,9 @@ pub fn parse_auth_ok_full(data: &[u8]) -> Result<AuthOkFields> {
         off = new_off;
         Some(id.to_string())
     } else {
-        if off < data.len() { off += 1; }
+        if off < data.len() {
+            off += 1;
+        }
         None
     };
     let rendezvous_server = if off < data.len() && data[off] == 1 {
@@ -324,7 +349,13 @@ pub fn parse_auth_ok_full(data: &[u8]) -> Result<AuthOkFields> {
     } else {
         None
     };
-    Ok(AuthOkFields { version, caps, banner, device_id, rendezvous_server })
+    Ok(AuthOkFields {
+        version,
+        caps,
+        banner,
+        device_id,
+        rendezvous_server,
+    })
 }
 
 // ── Exec message builders ───────────────────────────────────────
@@ -457,7 +488,14 @@ pub fn parse_log_query(data: &[u8]) -> Result<(String, String, u8, u32, u64, u32
     let tail_lines = u32::from_be_bytes(data[off + 1..off + 5].try_into()?);
     let byte_offset = u64::from_be_bytes(data[off + 5..off + 13].try_into()?);
     let max_matches = u32::from_be_bytes(data[off + 13..off + 17].try_into()?);
-    Ok((path.to_string(), pattern.to_string(), flags, tail_lines, byte_offset, max_matches))
+    Ok((
+        path.to_string(),
+        pattern.to_string(),
+        flags,
+        tail_lines,
+        byte_offset,
+        max_matches,
+    ))
 }
 
 /// Build LOG_END payload: lines_scanned + matches_found + final_offset.
@@ -607,26 +645,34 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(8192);
 
         // Server sends stdout chunk
-        send_msg(&mut server, msg::EXEC_STDOUT, b"hello ").await.unwrap();
+        send_msg(&mut server, msg::EXEC_STDOUT, b"hello ")
+            .await
+            .unwrap();
         let (tid, data) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::EXEC_STDOUT);
         assert_eq!(data, b"hello ");
 
         // Server sends stderr chunk
-        send_msg(&mut server, msg::EXEC_STDERR, b"warning\n").await.unwrap();
+        send_msg(&mut server, msg::EXEC_STDERR, b"warning\n")
+            .await
+            .unwrap();
         let (tid, data) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::EXEC_STDERR);
         assert_eq!(data, b"warning\n");
 
         // Server sends more stdout
-        send_msg(&mut server, msg::EXEC_STDOUT, b"world\n").await.unwrap();
+        send_msg(&mut server, msg::EXEC_STDOUT, b"world\n")
+            .await
+            .unwrap();
         let (tid, data) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::EXEC_STDOUT);
         assert_eq!(data, b"world\n");
 
         // Server sends exit code
         let exit_code: u32 = 0;
-        send_msg(&mut server, msg::EXEC_EXIT, &exit_code.to_le_bytes()).await.unwrap();
+        send_msg(&mut server, msg::EXEC_EXIT, &exit_code.to_le_bytes())
+            .await
+            .unwrap();
         let (tid, data) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::EXEC_EXIT);
         assert_eq!(data.len(), 4);
@@ -639,9 +685,13 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
 
         // Error output on stderr, then non-zero exit
-        send_msg(&mut server, msg::EXEC_STDERR, b"not found\n").await.unwrap();
+        send_msg(&mut server, msg::EXEC_STDERR, b"not found\n")
+            .await
+            .unwrap();
         let exit_code: u32 = 1;
-        send_msg(&mut server, msg::EXEC_EXIT, &exit_code.to_le_bytes()).await.unwrap();
+        send_msg(&mut server, msg::EXEC_EXIT, &exit_code.to_le_bytes())
+            .await
+            .unwrap();
 
         let (tid, _) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::EXEC_STDERR);
@@ -706,7 +756,9 @@ mod tests {
         // Client sends AUTH_REQUEST
         let pubkey = vec![0xAA; 32];
         let req = build_auth_request(&pubkey, "1.4.2", &["binary-proto", "zstd"]);
-        send_msg(&mut client, msg::AUTH_REQUEST, &req).await.unwrap();
+        send_msg(&mut client, msg::AUTH_REQUEST, &req)
+            .await
+            .unwrap();
 
         // Server receives and parses
         let (tid, payload) = recv_msg(&mut server).await.unwrap();
@@ -718,7 +770,9 @@ mod tests {
 
         // Server sends challenge (32 random bytes)
         let challenge = vec![0xBB; 32];
-        send_msg(&mut server, msg::AUTH_CHALLENGE, &challenge).await.unwrap();
+        send_msg(&mut server, msg::AUTH_CHALLENGE, &challenge)
+            .await
+            .unwrap();
 
         // Client receives challenge
         let (tid, payload) = recv_msg(&mut client).await.unwrap();
@@ -727,7 +781,9 @@ mod tests {
 
         // Client sends signature (64 bytes)
         let sig = vec![0xCC; 64];
-        send_msg(&mut client, msg::AUTH_RESPONSE, &sig).await.unwrap();
+        send_msg(&mut client, msg::AUTH_RESPONSE, &sig)
+            .await
+            .unwrap();
 
         // Server receives, verifies, sends OK
         let (tid, payload) = recv_msg(&mut server).await.unwrap();
@@ -740,7 +796,7 @@ mod tests {
         // Client receives OK
         let (tid, payload) = recv_msg(&mut client).await.unwrap();
         assert_eq!(tid, msg::AUTH_OK);
-        let (ver, caps, banner) = parse_auth_ok(&payload).unwrap();
+        let (ver, _caps, banner) = parse_auth_ok(&payload).unwrap();
         assert_eq!(ver, "1.4.2");
         assert!(banner.is_none());
     }

@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 mrsh-core.workspace = true
 mrsh-transfer.workspace = true
+# rsh-5264.6: rdv client (publish/query/fetch) for self-update-from-rdv
+mrsh-relay.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -72,3 +74,4 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+tracing-subscriber.workspace = true

@@ -143,8 +143,8 @@ pub fn parse_open_payload(payload: &[u8]) -> (String, String) {
 mod server {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tokio::net::{TcpStream, UdpSocket};
     use tokio::sync::{Mutex, RwLock, mpsc};
@@ -249,9 +249,10 @@ mod server {
                 MsgType::ChannelData => {
                     let channels = self.channels.read().await;
                     if let Some(ch) = channels.get(&msg.channel_id)
-                        && !ch.closed.load(Ordering::Acquire) {
-                            let _ = ch.data_tx.send(msg.payload).await;
-                        }
+                        && !ch.closed.load(Ordering::Acquire)
+                    {
+                        let _ = ch.data_tx.send(msg.payload).await;
+                    }
                 }
 
                 MsgType::ChannelEOF => {
@@ -609,7 +610,6 @@ mod server {
         ch.confirm().await;
 
         // Stream exec output as ChannelData chunks (like SSH exec channel).
-        use tokio::process::Command;
         use tokio::io::AsyncReadExt;
 
         let mut cmd = crate::exec::build_command(&command);
@@ -644,13 +644,17 @@ mod server {
                             }
                         }
                     }
-                    if stdout_done && stderr_done { break; }
+                    if stdout_done && stderr_done {
+                        break;
+                    }
                 }
 
                 let _ = child.wait().await;
             }
             Err(e) => {
-                let _ = ch.write_data(format!("ERROR: spawn failed: {}\n", e).as_bytes()).await;
+                let _ = ch
+                    .write_data(format!("ERROR: spawn failed: {}\n", e).as_bytes())
+                    .await;
             }
         }
 

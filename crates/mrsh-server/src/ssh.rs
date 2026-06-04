@@ -17,6 +17,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(not(feature = "ssh"))]
+use tracing::info;
+#[cfg(feature = "ssh")]
 use tracing::{debug, info, warn};
 
 use crate::handler::ServerContext;
@@ -89,9 +92,9 @@ where
 #[cfg(feature = "ssh")]
 mod impl_ssh {
     use super::*;
-    use std::collections::HashMap;
     use russh::server::{Auth, Handler, Msg, Session};
     use russh::{Channel, ChannelId, Pty};
+    use std::collections::HashMap;
     // tracing macros come from super::* (debug, info, warn)
 
     /// Per-connection SSH session handler.
@@ -126,9 +129,7 @@ mod impl_ssh {
 
             // Extract raw public key bytes from the russh key
             let raw_bytes = match public_key.key_data() {
-                russh::keys::ssh_key::public::KeyData::Ed25519(ed) => {
-                    ed.0.to_vec()
-                }
+                russh::keys::ssh_key::public::KeyData::Ed25519(ed) => ed.0.to_vec(),
                 _ => {
                     warn!("SSH auth rejected: unsupported key type");
                     return Ok(Auth::Reject {
@@ -141,7 +142,10 @@ mod impl_ssh {
             // Compare raw key bytes against authorized_keys
             for ak in &self.ctx.authorized_keys {
                 if ak.key_type == "ssh-ed25519" && ak.key_data == raw_bytes {
-                    info!("SSH auth accepted for user={} comment={:?}", user, ak.comment);
+                    info!(
+                        "SSH auth accepted for user={} comment={:?}",
+                        user, ak.comment
+                    );
                     return Ok(Auth::Accept);
                 }
             }
@@ -176,7 +180,10 @@ mod impl_ssh {
             _modes: &[(Pty, u32)],
             session: &mut Session,
         ) -> Result<(), Self::Error> {
-            debug!("SSH pty_request: ch={} {}x{}", channel, col_width, row_height);
+            debug!(
+                "SSH pty_request: ch={} {}x{}",
+                channel, col_width, row_height
+            );
             self.pty_sizes.insert(channel, (col_width, row_height));
             session.channel_success(channel)?;
             Ok(())
@@ -190,7 +197,11 @@ mod impl_ssh {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             let command = String::from_utf8_lossy(data).to_string();
-            info!("SSH exec: ch={} cmd={}", channel_id, &command[..80.min(command.len())]);
+            info!(
+                "SSH exec: ch={} cmd={}",
+                channel_id,
+                &command[..80.min(command.len())]
+            );
 
             session.channel_success(channel_id)?;
 
@@ -248,7 +259,8 @@ mod impl_ssh {
                 tokio::spawn(async move {
                     let size = format!("{}x{}", cols, rows);
                     let env_vars = Vec::new();
-                    if let Err(e) = crate::shell::handle_shell(&mut stream, &size, &env_vars).await {
+                    if let Err(e) = crate::shell::handle_shell(&mut stream, &size, &env_vars).await
+                    {
                         warn!("SSH shell error: {}", e);
                     }
                 });
@@ -267,7 +279,10 @@ mod impl_ssh {
             _pix_height: u32,
             _session: &mut Session,
         ) -> Result<(), Self::Error> {
-            debug!("SSH window_change: ch={} {}x{}", channel, col_width, row_height);
+            debug!(
+                "SSH window_change: ch={} {}x{}",
+                channel, col_width, row_height
+            );
             self.pty_sizes.insert(channel, (col_width, row_height));
             // Note: resize of active ConPTY shell is handled internally by shell.rs
             Ok(())
@@ -297,7 +312,10 @@ mod impl_ssh {
             let target = format!("{}:{}", host_to_connect, port_to_connect);
             info!(
                 "SSH direct-tcpip: {} -> {} (from {}:{})",
-                channel.id(), target, originator_address, originator_port
+                channel.id(),
+                target,
+                originator_address,
+                originator_port
             );
 
             // Check allowed tunnels
@@ -318,7 +336,9 @@ mod impl_ssh {
             tokio::spawn(async move {
                 match tokio::net::TcpStream::connect(&target).await {
                     Ok(mut target_stream) => {
-                        if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await {
+                        if let Err(e) =
+                            tokio::io::copy_bidirectional(&mut stream, &mut target_stream).await
+                        {
                             debug!("SSH tunnel {} closed: {}", target, e);
                         }
                     }
@@ -433,17 +453,31 @@ mod impl_ssh {
                 loop {
                     match listener.accept().await {
                         Ok((stream, peer)) => {
-                            debug!("SSH -R connection from {} to {}:{}", peer, fwd_addr, fwd_port);
+                            debug!(
+                                "SSH -R connection from {} to {}:{}",
+                                peer, fwd_addr, fwd_port
+                            );
                             let h = handle.clone();
                             let addr = fwd_addr.clone();
                             tokio::spawn(async move {
-                                match h.channel_open_forwarded_tcpip(
-                                    addr, fwd_port, peer.ip().to_string(), peer.port() as u32,
-                                ).await {
+                                match h
+                                    .channel_open_forwarded_tcpip(
+                                        addr,
+                                        fwd_port,
+                                        peer.ip().to_string(),
+                                        peer.port() as u32,
+                                    )
+                                    .await
+                                {
                                     Ok(channel) => {
                                         let mut ch_stream = channel.into_stream();
                                         let mut tcp_stream = stream;
-                                        tokio::io::copy_bidirectional(&mut ch_stream, &mut tcp_stream).await.ok();
+                                        tokio::io::copy_bidirectional(
+                                            &mut ch_stream,
+                                            &mut tcp_stream,
+                                        )
+                                        .await
+                                        .ok();
                                     }
                                     Err(e) => {
                                         warn!("SSH -R channel open failed: {}", e);
@@ -478,7 +512,9 @@ mod impl_ssh {
     struct SftpHandler;
 
     impl SftpHandler {
-        fn new() -> Self { Self }
+        fn new() -> Self {
+            Self
+        }
     }
 
     impl russh_sftp::server::Handler for SftpHandler {
@@ -553,8 +589,8 @@ mod impl_ssh {
             path: String,
         ) -> Result<russh_sftp::protocol::Name, Self::Error> {
             debug!("SFTP realpath: {}", path);
-            let resolved = std::fs::canonicalize(&path)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&path));
+            let resolved =
+                std::fs::canonicalize(&path).unwrap_or_else(|_| std::path::PathBuf::from(&path));
             let name = resolved.to_string_lossy().to_string();
             Ok(russh_sftp::protocol::Name {
                 id,
@@ -586,7 +622,10 @@ mod impl_ssh {
             _attrs: russh_sftp::protocol::FileAttributes,
         ) -> Result<russh_sftp::protocol::Handle, Self::Error> {
             debug!("SFTP open: {}", filename);
-            Ok(russh_sftp::protocol::Handle { id, handle: filename })
+            Ok(russh_sftp::protocol::Handle {
+                id,
+                handle: filename,
+            })
         }
 
         async fn read(
@@ -603,13 +642,17 @@ mod impl_ssh {
             file.seek(SeekFrom::Start(offset))
                 .map_err(|_| russh_sftp::protocol::StatusCode::Failure)?;
             let mut buf = vec![0u8; len as usize];
-            let n = file.read(&mut buf)
+            let n = file
+                .read(&mut buf)
                 .map_err(|_| russh_sftp::protocol::StatusCode::Failure)?;
             if n == 0 {
                 return Err(russh_sftp::protocol::StatusCode::Eof);
             }
             buf.truncate(n);
-            Ok(russh_sftp::protocol::Data { id, data: buf.into() })
+            Ok(russh_sftp::protocol::Data {
+                id,
+                data: buf.into(),
+            })
         }
 
         async fn write(
@@ -620,7 +663,12 @@ mod impl_ssh {
             data: Vec<u8>,
         ) -> Result<russh_sftp::protocol::Status, Self::Error> {
             use std::io::{Seek, SeekFrom, Write};
-            debug!("SFTP write: {} offset={} len={}", handle, offset, data.len());
+            debug!(
+                "SFTP write: {} offset={} len={}",
+                handle,
+                offset,
+                data.len()
+            );
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -677,8 +725,7 @@ mod impl_ssh {
             path: String,
         ) -> Result<russh_sftp::protocol::Status, Self::Error> {
             debug!("SFTP rmdir: {}", path);
-            std::fs::remove_dir(&path)
-                .map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
+            std::fs::remove_dir(&path).map_err(|_| russh_sftp::protocol::StatusCode::NoSuchFile)?;
             Ok(russh_sftp::protocol::Status {
                 id,
                 status_code: russh_sftp::protocol::StatusCode::Ok,
@@ -717,7 +764,10 @@ mod impl_ssh {
                     key
                 }
                 Err(e) => {
-                    warn!("SSH: failed to load server_key from {:?}: {}, using ephemeral", path, e);
+                    warn!(
+                        "SSH: failed to load server_key from {:?}: {}, using ephemeral",
+                        path, e
+                    );
                     generate_ephemeral_key()
                 }
             }
@@ -727,9 +777,10 @@ mod impl_ssh {
         };
 
         russh::server::Config {
-            server_id: russh::SshId::Standard(
-                std::borrow::Cow::Owned(format!("SSH-2.0-mrsh_{}", env!("CARGO_PKG_VERSION")))
-            ),
+            server_id: russh::SshId::Standard(std::borrow::Cow::Owned(format!(
+                "SSH-2.0-mrsh_{}",
+                env!("CARGO_PKG_VERSION")
+            ))),
             keys: vec![host_key],
             auth_rejection_time: std::time::Duration::from_secs(1),
             auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
@@ -833,15 +884,15 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            device_id: None,
+            rendezvous_server: None,
             authorized_keys_paths: vec![],
         });
 
         let (mut client, server) = tokio::io::duplex(4096);
 
         let ctx_clone = ctx.clone();
-        let handle = tokio::spawn(async move {
-            handle_ssh_connection(server, ctx_clone).await
-        });
+        let handle = tokio::spawn(async move { handle_ssh_connection(server, ctx_clone).await });
 
         // Client should receive server version string
         let mut version_buf = vec![0u8; 256];
@@ -882,6 +933,8 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            device_id: None,
+            rendezvous_server: None,
             authorized_keys_paths: vec![],
         });
 

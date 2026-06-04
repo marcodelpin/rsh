@@ -62,12 +62,18 @@ pub async fn decode_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8
         }
         3 => {
             let mut rest = [0u8; 2];
-            reader.read_exact(&mut rest).await.context("read header bytes 2-3")?;
+            reader
+                .read_exact(&mut rest)
+                .await
+                .context("read header bytes 2-3")?;
             (b0 as u32) | ((rest[0] as u32) << 8) | ((rest[1] as u32) << 16)
         }
         4 => {
             let mut rest = [0u8; 3];
-            reader.read_exact(&mut rest).await.context("read header bytes 2-4")?;
+            reader
+                .read_exact(&mut rest)
+                .await
+                .context("read header bytes 2-4")?;
             u32::from_le_bytes([b0, rest[0], rest[1], rest[2]])
         }
         _ => unreachable!(),
@@ -78,7 +84,11 @@ pub async fn decode_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8
         return Ok(Vec::new());
     }
     if payload_len > MAX_PAYLOAD {
-        anyhow::bail!("payload too large: {} bytes (max {})", payload_len, MAX_PAYLOAD);
+        anyhow::bail!(
+            "payload too large: {} bytes (max {})",
+            payload_len,
+            MAX_PAYLOAD
+        );
     }
 
     let mut buf = vec![0u8; payload_len];
@@ -155,7 +165,9 @@ mod tests {
     }
 
     fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread().build().unwrap()
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
     }
 
     #[test]

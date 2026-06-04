@@ -2,6 +2,29 @@
 
 use std::path::PathBuf;
 
+/// LAN-first resolution policy for a host (rsh-x9l5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LanFirst {
+    /// Try mDNS `<host>.local` first; fall back to rdv on failure.
+    #[default]
+    Auto,
+    /// LAN path only — return an error if not reachable via mDNS/direct.
+    Yes,
+    /// Skip LAN probe entirely; use rdv directly (old behaviour).
+    No,
+}
+
+impl LanFirst {
+    /// Parse from config value string. Unknown values default to `Auto`.
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "1" => LanFirst::Yes,
+            "no" | "false" | "0" => LanFirst::No,
+            _ => LanFirst::Auto, // "auto" or anything unrecognised
+        }
+    }
+}
+
 /// A single host entry from the config file.
 #[derive(Debug, Clone, Default)]
 pub struct HostConfig {
@@ -23,6 +46,24 @@ pub struct HostConfig {
     pub session_log: Option<bool>,
     /// QUIC port for this host (if QUIC transport is enabled on the server).
     pub quic_port: Option<u16>,
+    /// Target OS override for fleet update binary selection.
+    /// Accepted values (case-insensitive): "windows", "linux", "linux-musl",
+    /// "linux-aarch64" (also accepts "linux-arm64", "aarch64", "arm64").
+    /// When None, auto-detected from server capabilities at probe time.
+    /// Useful for hosts that are offline during `fleet update` or that run
+    /// a different libc/arch than the probed cap suggests.
+    pub platform: Option<String>,
+    /// Per-host release track override (e.g., "stable", "canary", "beta").
+    /// Used by VersionAdvert protocol for staged rollouts (rsh-5264.3).
+    pub track: Option<String>,
+    /// Per-host opt-in for auto-upgrade flow (rsh-5264 epic).
+    pub auto_upgrade: Option<bool>,
+    /// LAN-first resolution policy (rsh-x9l5).
+    ///
+    /// `Auto` (default): try mDNS `<host>.local` before falling back to rdv.
+    /// `Yes`: LAN path only — error if unreachable.
+    /// `No`: skip LAN probe, go straight to rdv (preserves old behaviour).
+    pub lan_first: LanFirst,
 }
 
 impl HostConfig {
@@ -42,6 +83,10 @@ impl HostConfig {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            track: None,
+            auto_upgrade: None,
+            lan_first: LanFirst::Auto,
         }
     }
 
@@ -72,6 +117,10 @@ pub struct Config {
     pub session_log_dir: Option<String>,
     /// Days to retain session logs (default: 90).
     pub session_log_retain: u32,
+    /// Optional shared-filesystem spool dir. When set, the server also polls
+    /// this directory for FS-transport sessions (see `mrsh_core::fs_transport`).
+    /// Clients connect with `-h fs:///<path>`. None = TCP only.
+    pub fs_spool: Option<String>,
 }
 
 impl Default for Config {
@@ -86,6 +135,7 @@ impl Default for Config {
             session_log: true,
             session_log_dir: None,
             session_log_retain: 90,
+            fs_spool: None,
         }
     }
 }
@@ -94,6 +144,27 @@ impl Config {
     /// Returns the default config file path (~/.mrsh/config).
     pub fn default_path() -> Option<PathBuf> {
         dirs::home_dir().map(|h| h.join(".mrsh").join("config"))
+    }
+
+    /// Returns the per-host release track, if a `Host <name>` block defines one.
+    /// rsh-5264.3 staged rollouts.
+    pub fn track_for(&self, hostname: &str) -> Option<String> {
+        for h in &self.hosts {
+            if h.pattern == hostname {
+                return h.track.clone();
+            }
+        }
+        None
+    }
+
+    /// Returns the per-host auto-upgrade flag, if defined. rsh-5264.5.
+    pub fn auto_upgrade_for(&self, hostname: &str) -> Option<bool> {
+        for h in &self.hosts {
+            if h.pattern == hostname {
+                return h.auto_upgrade;
+            }
+        }
+        None
     }
 
     /// Load config with fallback chain:
@@ -139,15 +210,28 @@ impl Config {
 
     /// Load enrollment config from the service data directory.
     /// Windows: C:\ProgramData\mrsh\config.enrollment
-    /// Linux: /etc/rsh/config.enrollment
+    /// Linux: /etc/mrsh/config.enrollment (legacy fallback /etc/rsh, rsh-ag8t)
     fn load_enrollment() -> Option<Self> {
         #[cfg(target_os = "windows")]
-        let data_dir = std::path::PathBuf::from(r"C:\ProgramData\mrsh");
-        #[cfg(not(target_os = "windows"))]
-        let data_dir = std::path::PathBuf::from("/etc/rsh");
+        let candidates = vec![std::path::PathBuf::from(r"C:\ProgramData\mrsh")];
+        #[cfg(target_os = "android")]
+        // Termux: HOME is /data/data/com.termux/files/home; no /etc writable to user.
+        let candidates = vec![
+            dirs::home_dir()
+                .map(|h| h.join(".config").join("mrsh"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/data/local/tmp/mrsh")),
+        ];
+        #[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
+        // Canonical /etc/mrsh first, legacy /etc/rsh fallback (rsh-ag8t).
+        let candidates = vec![
+            std::path::PathBuf::from("/etc/mrsh"),
+            std::path::PathBuf::from("/etc/rsh"),
+        ];
 
-        let path = data_dir.join("config.enrollment");
-        std::fs::read_to_string(&path).ok().map(|c| Self::parse(&c))
+        candidates
+            .iter()
+            .find_map(|d| std::fs::read_to_string(d.join("config.enrollment")).ok())
+            .map(|c| Self::parse(&c))
     }
 
     /// Parse config from string content.
@@ -211,7 +295,7 @@ impl Config {
                         host.user = Some(value.to_string());
                     }
                 }
-                "mac" => {
+                "mac" | "macaddress" => {
                     if let Some(ref mut host) = current_host {
                         host.mac = Some(value.to_string());
                     }
@@ -262,6 +346,17 @@ impl Config {
                         host.quic_port = Some(p);
                     }
                 }
+                "platform" => {
+                    // rsh-lic: per-host OS hint for fleet-update binary pick.
+                    if let Some(ref mut host) = current_host {
+                        host.platform = Some(value.to_lowercase());
+                    }
+                }
+                "lanfirst" => {
+                    if let Some(ref mut host) = current_host {
+                        host.lan_first = LanFirst::from_str(value);
+                    }
+                }
                 "enrollmenttoken" => {
                     if current_host.is_none() {
                         cfg.enrollment_token = Some(value.to_string());
@@ -289,9 +384,23 @@ impl Config {
                 }
                 "sessionlogretain" => {
                     if current_host.is_none()
-                        && let Ok(days) = value.parse::<u32>() {
-                            cfg.session_log_retain = days;
-                        }
+                        && let Ok(days) = value.parse::<u32>()
+                    {
+                        cfg.session_log_retain = days;
+                    }
+                }
+                "fsspool" => {
+                    // FS-transport spool dir (server side). Global-only.
+                    if current_host.is_none() {
+                        let expanded = if value.starts_with("~/") {
+                            dirs::home_dir()
+                                .map(|h| h.join(&value[2..]).to_string_lossy().to_string())
+                                .unwrap_or_else(|| value.to_string())
+                        } else {
+                            value.to_string()
+                        };
+                        cfg.fs_spool = Some(expanded);
+                    }
                 }
                 _ => {} // Ignore unknown keys
             }
@@ -309,6 +418,23 @@ impl Config {
         self.hosts.iter().find(|h| match_pattern(&h.pattern, name))
     }
 
+    /// rsh-le15: resolve the effective client key path for connecting to `name`.
+    ///
+    /// Precedence (matches SSH semantics):
+    ///   1. explicit `-i` flag (`cli_key`)
+    ///   2. the matching Host block's `IdentityFile`
+    ///   3. `None` — caller falls back to default `~/.ssh/id_ed25519` discovery
+    ///
+    /// The TLS/relay/transfer paths previously used only the `-i` flag and
+    /// silently ignored a config-only `IdentityFile` (only the SSH transport
+    /// honored it), so config-only auth failed the TLS handshake until the key
+    /// was copied to the default path.
+    pub fn resolve_identity_file(&self, name: &str, cli_key: &Option<String>) -> Option<String> {
+        cli_key
+            .clone()
+            .or_else(|| self.find_host(name).and_then(|h| h.identity_file.clone()))
+    }
+
     /// Returns merged list of global rendezvous servers (single + list).
     pub fn get_rendezvous_servers(&self) -> Vec<String> {
         let mut servers = Vec::new();
@@ -323,9 +449,10 @@ impl Config {
     /// Per-host setting overrides global.
     pub fn is_session_log_enabled(&self, host: &str) -> bool {
         if let Some(hc) = self.find_host(host)
-            && let Some(enabled) = hc.session_log {
-                return enabled;
-            }
+            && let Some(enabled) = hc.session_log
+        {
+            return enabled;
+        }
         self.session_log
     }
 
@@ -373,13 +500,17 @@ impl Config {
         if self.session_log_retain != 90 {
             sb.push_str(&format!("SessionLogRetain {}\n", self.session_log_retain));
         }
+        if let Some(ref p) = self.fs_spool {
+            sb.push_str(&format!("FsSpool {}\n", p));
+        }
 
         let has_global = self.device_id.is_some()
             || self.rendezvous_server.is_some()
             || !self.rendezvous_servers.is_empty()
             || self.rendezvous_key.is_some()
             || self.enrollment_token.is_some()
-            || !self.session_log;
+            || !self.session_log
+            || self.fs_spool.is_some();
 
         if has_global && !self.hosts.is_empty() {
             sb.push('\n');
@@ -427,7 +558,16 @@ impl Config {
                 sb.push_str(&format!("    RendezvousKey {}\n", v));
             }
             if let Some(enabled) = h.session_log {
-                sb.push_str(&format!("    SessionLog {}\n", if enabled { "true" } else { "false" }));
+                sb.push_str(&format!(
+                    "    SessionLog {}\n",
+                    if enabled { "true" } else { "false" }
+                ));
+            }
+            // Only serialise when explicitly set (auto is the default, no need to write it)
+            match h.lan_first {
+                LanFirst::Yes => sb.push_str("    LanFirst yes\n"),
+                LanFirst::No => sb.push_str("    LanFirst no\n"),
+                LanFirst::Auto => {} // default — omit
             }
         }
 
@@ -451,7 +591,10 @@ impl Config {
         // Find existing host by pattern or hostname
         let existing = self.hosts.iter_mut().find(|h| {
             h.pattern.eq_ignore_ascii_case(hostname)
-                || h.hostname.as_deref().map(|n| n.eq_ignore_ascii_case(hostname)).unwrap_or(false)
+                || h.hostname
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case(hostname))
+                    .unwrap_or(false)
         });
 
         if let Some(host) = existing {
@@ -570,6 +713,38 @@ Host laptop-1
     }
 
     #[test]
+    fn resolve_identity_file_precedence() {
+        // rsh-le15 regression: TLS/relay path must honor a config-only IdentityFile.
+        // Precedence: -i flag > Host block IdentityFile > None (default discovery).
+        let cfg = Config::parse(
+            "Host with-key\n    Hostname with-key.local\n    Port 8822\n    \
+             IdentityFile /home/user/.ssh/id_ed25519_gitlab\n",
+        );
+
+        // 1. explicit -i flag wins over the config IdentityFile
+        let flag = Some("/explicit/flag/key".to_string());
+        assert_eq!(
+            cfg.resolve_identity_file("with-key", &flag).as_deref(),
+            Some("/explicit/flag/key"),
+            "-i flag must take precedence over config IdentityFile"
+        );
+
+        // 2. no -i flag → config IdentityFile is honored (the bug: TLS path ignored it)
+        assert_eq!(
+            cfg.resolve_identity_file("with-key", &None).as_deref(),
+            Some("/home/user/.ssh/id_ed25519_gitlab"),
+            "config IdentityFile must be honored when -i is absent"
+        );
+
+        // 3. host without IdentityFile + no -i → None (caller falls back to discovery)
+        let plain = Config::parse("Host plain\n    Hostname plain.local\n    Port 8822\n");
+        assert_eq!(plain.resolve_identity_file("plain", &None), None);
+
+        // 4. unknown host + no -i → None
+        assert_eq!(cfg.resolve_identity_file("nonexistent", &None), None);
+    }
+
+    #[test]
     fn parse_hosts() {
         let cfg = Config::parse(TEST_CONFIG);
         assert_eq!(cfg.hosts.len(), 4);
@@ -645,13 +820,20 @@ Host laptop-1
     fn session_log_dir_default() {
         let cfg = Config::parse("");
         let dir = cfg.session_log_dir();
-        assert!(dir.ends_with(".mrsh/logs") || dir.ends_with(".mrsh\\logs") || dir.ends_with(".rsh/logs"));
+        assert!(
+            dir.ends_with(".mrsh/logs")
+                || dir.ends_with(".mrsh\\logs")
+                || dir.ends_with(".rsh/logs")
+        );
     }
 
     #[test]
     fn session_log_dir_custom() {
         let cfg = Config::parse("SessionLogDir /custom/logs\n");
-        assert_eq!(cfg.session_log_dir(), std::path::PathBuf::from("/custom/logs"));
+        assert_eq!(
+            cfg.session_log_dir(),
+            std::path::PathBuf::from("/custom/logs")
+        );
     }
 
     #[test]
@@ -669,7 +851,9 @@ Host laptop-1
 
     #[test]
     fn session_log_per_host_override() {
-        let cfg = Config::parse("SessionLog true\n\nHost nolog\n    Hostname nolog.local\n    SessionLog false\n");
+        let cfg = Config::parse(
+            "SessionLog true\n\nHost nolog\n    Hostname nolog.local\n    SessionLog false\n",
+        );
         assert!(cfg.is_session_log_enabled("other"));
         assert!(!cfg.is_session_log_enabled("nolog"));
     }
@@ -680,7 +864,10 @@ Host laptop-1
             "Host gpu\n    Hostname gpu-server.local\n    Description Development GPU workstation\n    TailscaleIP 100.64.0.1\n",
         );
         let h = cfg.find_host("gpu").unwrap();
-        assert_eq!(h.description.as_deref(), Some("Development GPU workstation"));
+        assert_eq!(
+            h.description.as_deref(),
+            Some("Development GPU workstation")
+        );
         assert_eq!(h.tailscale_ip.as_deref(), Some("100.64.0.1"));
     }
 
@@ -701,6 +888,10 @@ Host laptop-1
         let path = Config::default_path();
         assert!(path.is_some());
         let p = path.unwrap();
-        assert!(p.ends_with(".mrsh/config") || p.ends_with(".mrsh\\config") || p.ends_with(".rsh/config"));
+        assert!(
+            p.ends_with(".mrsh/config")
+                || p.ends_with(".mrsh\\config")
+                || p.ends_with(".rsh/config")
+        );
     }
 }

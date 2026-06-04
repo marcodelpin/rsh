@@ -115,13 +115,16 @@ pub fn run_totp_setup(fingerprint: Option<&str>) -> Result<()> {
         rand::thread_rng().fill_bytes(&mut buf);
         let code = buf.iter().map(|b| format!("{:02x}", b)).collect::<String>();
         let digest = Sha256::digest(code.as_bytes());
-        let hash = digest.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+        let hash = digest
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
         recovery_codes.push(code);
         recovery_hashes.push(hash);
     }
 
     let uri = format!(
-        "otpauth://totp/rsh:{}?secret={}&issuer=rsh&algorithm=SHA1&digits=6&period=30",
+        "otpauth://totp/mrsh:{}?secret={}&issuer=mrsh&algorithm=SHA1&digits=6&period=30",
         fp, secret
     );
 
@@ -202,17 +205,21 @@ pub fn run_keys(args: &[String]) -> Result<()> {
         "show" => keys_show(),
         "add" => {
             if args.len() < 2 {
-                bail!("Usage: mrsh keys add <pubkey-string-or-file>\n\
+                bail!(
+                    "Usage: mrsh keys add <pubkey-string-or-file>\n\
                        Example: mrsh keys add ~/.ssh/id_ed25519.pub\n\
-                       Example: mrsh keys add 'ssh-ed25519 AAAA... comment'");
+                       Example: mrsh keys add 'ssh-ed25519 AAAA... comment'"
+                );
             }
             keys_add(&args[1..].join(" "))
         }
         "remove" | "rm" => {
             if args.len() < 2 {
-                bail!("Usage: mrsh keys remove <fingerprint-or-comment>\n\
+                bail!(
+                    "Usage: mrsh keys remove <fingerprint-or-comment>\n\
                        Example: mrsh keys remove SHA256:abc...\n\
-                       Example: mrsh keys remove mykey");
+                       Example: mrsh keys remove mykey"
+                );
             }
             keys_remove(&args[1])
         }
@@ -364,8 +371,10 @@ fn keys_add(key_input: &str) -> Result<()> {
 
     // Validate: must start with a recognized key type
     if !key_line.starts_with("ssh-") && !key_line.starts_with("ecdsa-") {
-        bail!("Invalid key format. Expected: ssh-ed25519 AAAA... [comment]\n\
-               Or provide a path to a .pub file.");
+        bail!(
+            "Invalid key format. Expected: ssh-ed25519 AAAA... [comment]\n\
+               Or provide a path to a .pub file."
+        );
     }
 
     // Check for duplicates across ALL authorized_keys paths
@@ -395,10 +404,15 @@ fn keys_add(key_input: &str) -> Result<()> {
     // Parse to show fingerprint
     use mrsh_core::auth;
     if let Ok(keys) = auth::load_authorized_keys(&ak_path, false)
-        && let Some(last) = keys.last() {
-            let fp = auth::key_fingerprint(&last.key_data);
-            eprintln!("Added key: {} ({})", fp, last.comment.as_deref().unwrap_or("no comment"));
-        }
+        && let Some(last) = keys.last()
+    {
+        let fp = auth::key_fingerprint(&last.key_data);
+        eprintln!(
+            "Added key: {} ({})",
+            fp,
+            last.comment.as_deref().unwrap_or("no comment")
+        );
+    }
     eprintln!("Written to: {}", ak_path.display());
 
     Ok(())
@@ -474,16 +488,36 @@ fn keys_remove(query: &str) -> Result<()> {
 /// Format key permissions for display.
 fn format_permissions(perms: &mrsh_core::auth::KeyPermissions) -> String {
     let mut opts: Vec<String> = Vec::new();
-    if !perms.allow_exec { opts.push("no-exec".into()); }
-    if !perms.allow_push { opts.push("no-push".into()); }
-    if !perms.allow_pull { opts.push("no-pull".into()); }
-    if !perms.allow_shell { opts.push("no-shell".into()); }
-    if !perms.allow_tunnel { opts.push("no-tunnel".into()); }
-    if !perms.allow_gui { opts.push("no-gui".into()); }
-    if !perms.allow_clipboard { opts.push("no-clipboard".into()); }
-    if !perms.allow_reboot { opts.push("no-reboot".into()); }
-    if !perms.allow_screenshot { opts.push("no-screenshot".into()); }
-    if !perms.allow_self_update { opts.push("no-self-update".into()); }
+    if !perms.allow_exec {
+        opts.push("no-exec".into());
+    }
+    if !perms.allow_push {
+        opts.push("no-push".into());
+    }
+    if !perms.allow_pull {
+        opts.push("no-pull".into());
+    }
+    if !perms.allow_shell {
+        opts.push("no-shell".into());
+    }
+    if !perms.allow_tunnel {
+        opts.push("no-tunnel".into());
+    }
+    if !perms.allow_gui {
+        opts.push("no-gui".into());
+    }
+    if !perms.allow_clipboard {
+        opts.push("no-clipboard".into());
+    }
+    if !perms.allow_reboot {
+        opts.push("no-reboot".into());
+    }
+    if !perms.allow_screenshot {
+        opts.push("no-screenshot".into());
+    }
+    if !perms.allow_self_update {
+        opts.push("no-self-update".into());
+    }
     if let Some(ref cmd) = perms.forced_command {
         opts.push(format!("command=\"{}\"", cmd));
     }
@@ -501,7 +535,10 @@ mod tests {
     fn format_permissions_default_all_allowed() {
         let perms = KeyPermissions::default();
         let out = format_permissions(&perms);
-        assert!(out.is_empty(), "default permissions should produce empty string, got: {out}");
+        assert!(
+            out.is_empty(),
+            "default permissions should produce empty string, got: {out}"
+        );
     }
 
     #[test]
@@ -546,8 +583,16 @@ mod tests {
         let out = format_permissions(&perms);
         // Should have all no-* entries
         for tag in &[
-            "no-exec", "no-push", "no-pull", "no-shell", "no-tunnel",
-            "no-gui", "no-clipboard", "no-reboot", "no-screenshot", "no-self-update",
+            "no-exec",
+            "no-push",
+            "no-pull",
+            "no-shell",
+            "no-tunnel",
+            "no-gui",
+            "no-clipboard",
+            "no-reboot",
+            "no-screenshot",
+            "no-self-update",
         ] {
             assert!(out.contains(tag), "missing {tag} in: {out}");
         }
@@ -572,7 +617,10 @@ mod tests {
         };
         let out = format_permissions(&perms);
         assert!(out.contains("no-shell"), "missing no-shell: {out}");
-        assert!(out.contains(r#"command="/bin/date""#), "missing forced command: {out}");
+        assert!(
+            out.contains(r#"command="/bin/date""#),
+            "missing forced command: {out}"
+        );
     }
 
     // ── run_keygen ──────────────────────────────────────────────────
@@ -615,7 +663,10 @@ mod tests {
         std::fs::write(&key_path, "existing content").unwrap();
 
         let result = run_keygen(Some(&key_path));
-        assert!(result.is_err(), "keygen should refuse to overwrite existing file");
+        assert!(
+            result.is_err(),
+            "keygen should refuse to overwrite existing file"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("already exists"),
@@ -624,7 +675,10 @@ mod tests {
 
         // Original content preserved
         let content = std::fs::read_to_string(&key_path).unwrap();
-        assert_eq!(content, "existing content", "original file should not be modified");
+        assert_eq!(
+            content, "existing content",
+            "original file should not be modified"
+        );
     }
 
     #[test]
@@ -673,7 +727,10 @@ mod tests {
 
         let keys = auth::load_authorized_keys(&ak_path, false).unwrap();
         let fp = auth::key_fingerprint(&keys[0].key_data);
-        assert!(fp.starts_with("SHA256:"), "fingerprint should start with SHA256: got {fp}");
+        assert!(
+            fp.starts_with("SHA256:"),
+            "fingerprint should start with SHA256: got {fp}"
+        );
     }
 
     // ── keys_add logic (tested via file manipulation) ───────────────
@@ -684,7 +741,10 @@ mod tests {
         let key_path = dir.path().join("k");
         run_keygen(Some(&key_path)).unwrap();
         let pub_path = dir.path().join("k.pub");
-        let mut content = std::fs::read_to_string(&pub_path).unwrap().trim().to_string();
+        let mut content = std::fs::read_to_string(&pub_path)
+            .unwrap()
+            .trim()
+            .to_string();
         // Replace comment (last field after second space)
         if let Some(pos) = content.rfind(' ') {
             content.truncate(pos);
@@ -702,7 +762,10 @@ mod tests {
         let key_line = gen_pubkey_line("test-add");
 
         // Simulate keys_add logic: validate, check duplicates, append
-        assert!(key_line.starts_with("ssh-"), "test key should start with ssh-");
+        assert!(
+            key_line.starts_with("ssh-"),
+            "test key should start with ssh-"
+        );
         std::fs::create_dir_all(dir.path()).unwrap();
 
         use std::io::Write;
@@ -768,11 +831,17 @@ mod tests {
                 }
             }
         }
-        assert!(!is_duplicate, "different keys should not be flagged as duplicate");
+        assert!(
+            !is_duplicate,
+            "different keys should not be flagged as duplicate"
+        );
 
         // Append key2
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&ak_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ak_path)
+            .unwrap();
         writeln!(file, "{}", key2).unwrap();
         drop(file);
 
@@ -883,7 +952,10 @@ mod tests {
 
         let remaining = auth::load_authorized_keys(&ak_path, false).unwrap();
         assert_eq!(remaining.len(), 2);
-        let comments: Vec<_> = remaining.iter().map(|k| k.comment.as_deref().unwrap_or("")).collect();
+        let comments: Vec<_> = remaining
+            .iter()
+            .map(|k| k.comment.as_deref().unwrap_or(""))
+            .collect();
         assert!(comments.contains(&"alpha"));
         assert!(comments.contains(&"gamma"));
         assert!(!comments.contains(&"beta"));
@@ -923,8 +995,14 @@ mod tests {
         std::fs::write(&ak_path, &rebuilt).unwrap();
 
         // Comments and blank lines preserved
-        assert!(rebuilt.contains("# Header comment"), "header comment preserved");
-        assert!(rebuilt.contains("# Middle comment"), "middle comment preserved");
+        assert!(
+            rebuilt.contains("# Header comment"),
+            "header comment preserved"
+        );
+        assert!(
+            rebuilt.contains("# Middle comment"),
+            "middle comment preserved"
+        );
 
         let remaining = auth::load_authorized_keys(&ak_path, false).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -949,13 +1027,25 @@ mod tests {
 
         // First key: default permissions → format_permissions empty
         let perms0 = format_permissions(&keys[0].permissions);
-        assert!(perms0.is_empty(), "unrestricted key should have empty options: {perms0}");
+        assert!(
+            perms0.is_empty(),
+            "unrestricted key should have empty options: {perms0}"
+        );
 
         // Second key: restrict + permit-exec → all denied except exec
         let perms1 = format_permissions(&keys[1].permissions);
-        assert!(!perms1.contains("no-exec"), "exec should be allowed (permit-exec): {perms1}");
-        assert!(perms1.contains("no-push"), "push should be denied (restrict): {perms1}");
-        assert!(perms1.contains("no-shell"), "shell should be denied (restrict): {perms1}");
+        assert!(
+            !perms1.contains("no-exec"),
+            "exec should be allowed (permit-exec): {perms1}"
+        );
+        assert!(
+            perms1.contains("no-push"),
+            "push should be denied (restrict): {perms1}"
+        );
+        assert!(
+            perms1.contains("no-shell"),
+            "shell should be denied (restrict): {perms1}"
+        );
     }
 
     // ── key validation (keys_add input validation logic) ────────────
@@ -970,16 +1060,17 @@ mod tests {
         ];
         for input in &invalid_inputs {
             let starts_ok = input.starts_with("ssh-") || input.starts_with("ecdsa-");
-            assert!(
-                !starts_ok,
-                "input '{input}' should fail validation"
-            );
+            assert!(!starts_ok, "input '{input}' should fail validation");
         }
     }
 
     #[test]
     fn key_validation_accepts_valid_prefixes() {
-        let valid_prefixes = ["ssh-ed25519 AAAA...", "ssh-rsa AAAA...", "ecdsa-sha2 AAAA..."];
+        let valid_prefixes = [
+            "ssh-ed25519 AAAA...",
+            "ssh-rsa AAAA...",
+            "ecdsa-sha2 AAAA...",
+        ];
         for input in &valid_prefixes {
             let starts_ok = input.starts_with("ssh-") || input.starts_with("ecdsa-");
             assert!(starts_ok, "input '{input}' should pass validation");

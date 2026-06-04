@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Network: mrsh binds TCP listener + dials rendezvous server -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Boot survival -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Foreground service for long-running mrsh process supervision -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- Wake-lock so mrsh keeps polling rendezvous even under doze -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Notification visible for foreground service (Android 13+ runtime perm) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Storage access (rsh-viro 2026-05-14): mrsh self-sufficient on /sdcard -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- APK self-install (rsh-ol1u 2026-05-14): obsolete mdp-updater push path,
+         enable mrsh-android to install APKs (incl. its own future updates)
+         via PackageInstaller — user still taps the system Install dialog. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- Screen capture via MediaProjection (rsh-swxg 2026-05-14): user grants
+         consent ONCE per session via system dialog, then screencaps via
+         persistent ScreencapService — no root/shell-uid needed. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:allowBackup="false"
+        android:hasFragileUserData="false"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:requestLegacyExternalStorage="true"
+        android:extractNativeLibs="true">
+
+        <!-- Minimal launcher Activity: required to exit the Android
+             "stopped" state so BootReceiver receives BOOT_COMPLETED on
+             subsequent reboots. Starts MrshService on first launch. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- APK install dispatcher (rsh-ol1u). Triggered via:
+             am start action it.mdp.mrsh.INSTALL_APK with extra apk=path.
+             Reads apk path from extra, invokes PackageInstaller.Session,
+             system shows standard Install dialog, user taps Install. -->
+        <activity
+            android:name=".InstallActivity"
+            android:exported="true"
+            android:taskAffinity=""
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="it.mdp.mrsh.INSTALL_APK" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- BOOT_COMPLETED broadcast receiver — starts MrshService.
+             extractNativeLibs="true" guarantees libmrsh.so is materialised on
+             disk (vs running from APK zip) so ProcessBuilder can exec it. -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="false">
+            <intent-filter android:priority="999">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- PackageInstaller session result receiver (rsh-ol1u). -->
+        <receiver
+            android:name=".InstallResultReceiver"
+            android:exported="false" />
+
+        <!-- Screen capture dispatcher (rsh-swxg). Triggered via:
+             am start action it.mdp.mrsh.SCREENCAP with extra out=path.
+             First call requests MediaProjection consent (system dialog);
+             subsequent calls reuse the running ScreencapService token. -->
+        <activity
+            android:name=".ScreencapActivity"
+            android:exported="true"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="it.mdp.mrsh.SCREENCAP" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Foreground service holding MediaProjection token (rsh-swxg). -->
+        <service
+            android:name=".ScreencapService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- HTTP client endpoint (rsh-crxd absorb-F). Replaces curl/wget
+             dependency. Trigger via broadcast action it.mdp.mrsh.HTTP with
+             extras: method, url, headers, body or body_file, out. See
+             HttpReceiver.java for full extras documentation. -->
+        <receiver
+            android:name=".HttpReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="it.mdp.mrsh.HTTP" />
+            </intent-filter>
+        </receiver>
+
+        <!-- AccessibilityService (rsh-9mzt absorb-E). Activated once via
+             Settings to Accessibility to mrsh-android, then mrsh exec can
+             dispatch tap/swipe/set-text/find-by-text/silent-screencap. -->
+        <service
+            android:name=".MrshAccessibilityService"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/accessibility_service_summary"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- Long-running foreground service supervising the mrsh native process. -->
+        <service
+            android:name=".MrshService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Shizuku v3 client declaration (rsh-a88j absorb-D). The Shizuku
+             Manager grants/revokes our app via this provider; SDK calls
+             Shizuku.pingBinder() / requestPermission() route through it. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+    </application>
+
+</manifest>

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Minimal terminal-prompt glyph for the persistent foreground notification. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M2,4 L22,4 L22,20 L2,20 Z M2,4 M4,6 L20,6 L20,18 L4,18 Z M6,10 L9,13 L6,16 M11,16 L18,16" />
+</vector>

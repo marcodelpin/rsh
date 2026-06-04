@@ -9,9 +9,57 @@ use mrsh_core::binproto::{self, msg};
 use mrsh_core::protocol::Response;
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::safety;
+
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
+
+/// On Windows: probes once at first exec whether direct `powershell.exe` spawning works.
+/// Some systems (AppLocker / software restriction policies) block direct pwsh spawning
+/// by SYSTEM services but allow `cmd.exe → powershell.exe` via indirection. When the probe
+/// fails we wrap PS commands via `cmd /c powershell -NoProfile -Command <cmd>`.
+#[cfg(target_os = "windows")]
+static POWERSHELL_DIRECT_WORKS: OnceLock<bool> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn probe_powershell_direct() -> bool {
+    // Synchronous probe — called once at lazy init time. Short timeout.
+    use std::os::windows::process::CommandExt;
+    let result = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "exit 0"])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .output();
+    match result {
+        Ok(o) if o.status.success() => {
+            info!("exec: direct powershell spawn probe PASSED — using direct pwsh");
+            true
+        }
+        Ok(o) => {
+            warn!(
+                "exec: direct powershell probe returned exit={:?} — routing via cmd /c fallback",
+                o.status.code()
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                "exec: direct powershell spawn failed ({}) — routing via cmd /c fallback",
+                e
+            );
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_direct_works() -> bool {
+    *POWERSHELL_DIRECT_WORKS.get_or_init(probe_powershell_direct)
+}
 
 /// Execute a command and return the response.
 /// On Windows: `powershell -NoProfile -Command <cmd>` (default)
@@ -26,7 +74,11 @@ pub async fn handle_exec(command: &str, env_vars: &[String]) -> Response {
 ///   `CMD:dir /b`  → cmd.exe
 ///   `SH:ls -la`   → sh/bash
 ///   `echo hello`  → default (PowerShell on Windows, sh on Linux)
-pub async fn handle_exec_with_shell(command: &str, env_vars: &[String], shell: Option<&str>) -> Response {
+pub async fn handle_exec_with_shell(
+    command: &str,
+    env_vars: &[String],
+    shell: Option<&str>,
+) -> Response {
     // Auto-detect shell from command prefix
     let (effective_shell, effective_command) = if let Some(rest) = command.strip_prefix("CMD:") {
         (Some("cmd"), rest)
@@ -84,13 +136,12 @@ pub async fn handle_exec_with_shell(command: &str, env_vars: &[String], shell: O
     }
 }
 
-/// Run a command, returning (output, success).
-async fn run_command(command: &str, env_vars: &[String]) -> anyhow::Result<(String, bool)> {
-    run_command_with_shell(command, env_vars, None).await
-}
-
 /// Run with explicit shell.
-async fn run_command_with_shell(command: &str, env_vars: &[String], shell: Option<&str>) -> anyhow::Result<(String, bool)> {
+async fn run_command_with_shell(
+    command: &str,
+    env_vars: &[String],
+    shell: Option<&str>,
+) -> anyhow::Result<(String, bool)> {
     let mut cmd = build_command_with_shell(command, shell);
 
     // Add environment variables (with sanitization)
@@ -142,10 +193,21 @@ pub fn build_command_with_shell(command: &str, shell: Option<&str>) -> tokio::pr
             c
         }
         _ => {
-            // Default: PowerShell
-            let mut c = tokio::process::Command::new("powershell");
-            c.args(["-NoProfile", "-Command", command]);
-            c
+            // Default: PowerShell — probe once whether direct spawn works on this host.
+            // If AppLocker / policy blocks pwsh.exe as a SYSTEM-service child, fall back
+            // to `cmd /c powershell -NoProfile -Command <cmd>` which routes via cmd.exe.
+            if powershell_direct_works() {
+                let mut c = tokio::process::Command::new("powershell");
+                c.args(["-NoProfile", "-Command", command]);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("cmd");
+                // /d disables AutoRun; /c runs the following command and terminates.
+                // powershell is resolved from PATH inside the cmd child, which on
+                // AppLocker-constrained systems is the path that the policy allows.
+                c.args(["/d", "/c", "powershell", "-NoProfile", "-Command", command]);
+                c
+            }
         }
     };
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -309,6 +371,39 @@ pub async fn handle_exec_stream<W: AsyncWriteExt + Unpin>(
 mod tests {
     use super::*;
 
+    fn read_env_command(name: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("Write-Output $env:{name}")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("printenv {name}")
+        }
+    }
+
+    fn require_env_command(name: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("if ($env:{name}) {{ Write-Output $env:{name} }} else {{ exit 1 }}")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("printenv {name}")
+        }
+    }
+
+    fn join_env_command(left: &str, right: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            format!("Write-Output ($env:{left} + '_' + $env:{right})")
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            format!("echo ${{{left}}}_${{{right}}}")
+        }
+    }
+
     #[tokio::test]
     async fn exec_echo() {
         let resp = handle_exec("echo hello", &[]).await;
@@ -331,7 +426,11 @@ mod tests {
 
     #[tokio::test]
     async fn exec_with_env_vars() {
-        let resp = handle_exec("echo $TEST_VAR", &["TEST_VAR=hello123".to_string()]).await;
+        let resp = handle_exec(
+            &read_env_command("TEST_VAR"),
+            &["TEST_VAR=hello123".to_string()],
+        )
+        .await;
         assert!(resp.success);
         assert!(resp.output.unwrap().contains("hello123"));
     }
@@ -366,13 +465,17 @@ mod tests {
 
         // Run the streaming handler in a task
         let handle = tokio::spawn(async move {
-            handle_exec_stream("echo streaming_test", &[], &mut tokio::io::BufWriter::new(writer)).await
+            handle_exec_stream(
+                "echo streaming_test",
+                &[],
+                &mut tokio::io::BufWriter::new(writer),
+            )
+            .await
         });
 
         // Read chunks from the pipe
         let mut got_stdout = false;
-        let mut exit_code = None;
-        loop {
+        let exit_code = loop {
             let (type_id, data) = binproto::recv_msg(&mut reader).await.unwrap();
             match type_id {
                 msg::EXEC_STDOUT => {
@@ -382,14 +485,16 @@ mod tests {
                     }
                 }
                 msg::EXEC_EXIT => {
-                    exit_code = Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
-                    break;
+                    break Some(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
                 }
                 msg::EXEC_STDERR => {} // ignore stderr
                 _ => panic!("unexpected msg type 0x{:02x}", type_id),
             }
-        }
-        assert!(got_stdout, "should have received stdout with 'streaming_test'");
+        };
+        assert!(
+            got_stdout,
+            "should have received stdout with 'streaming_test'"
+        );
         assert_eq!(exit_code, Some(0));
         handle.await.unwrap().unwrap();
     }
@@ -413,13 +518,32 @@ mod tests {
     // ── build_command tests ─────────────────────────────────────
 
     #[test]
-    fn build_command_uses_sh_on_linux() {
+    fn build_command_uses_expected_shell() {
         let cmd = build_command("echo test");
-        // On non-windows, build_command creates `sh -c <command>`
         let std_cmd = cmd.as_std();
-        assert_eq!(std_cmd.get_program(), "sh");
         let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
-        assert_eq!(args, vec!["-c", "echo test"]);
+        #[cfg(target_os = "windows")]
+        {
+            // Default PS path may be direct (`powershell -NoProfile -Command echo test`)
+            // or fallback via cmd (`cmd /d /c powershell -NoProfile -Command echo test`).
+            // The probe decides at first call; both are valid — assert the final PS
+            // invocation args match, regardless of wrapper.
+            let program = std_cmd.get_program().to_str().unwrap_or("");
+            if program == "powershell" {
+                assert_eq!(args, vec!["-NoProfile", "-Command", "echo test"]);
+            } else {
+                assert_eq!(program, "cmd");
+                assert_eq!(
+                    args,
+                    vec!["/d", "/c", "powershell", "-NoProfile", "-Command", "echo test"]
+                );
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(std_cmd.get_program(), "sh");
+            assert_eq!(args, vec!["-c", "echo test"]);
+        }
     }
 
     #[test]
@@ -428,8 +552,30 @@ mod tests {
         let cmd = build_command(complex);
         let std_cmd = cmd.as_std();
         let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], complex);
+        #[cfg(target_os = "windows")]
+        {
+            // Accept either direct powershell invocation or cmd-wrapped fallback
+            // (depending on whether the one-shot probe decided pwsh is spawnable).
+            let program = std_cmd.get_program().to_str().unwrap_or("");
+            if program == "powershell" {
+                assert_eq!(args[0], "-NoProfile");
+                assert_eq!(args[1], "-Command");
+                assert_eq!(args[2], complex);
+            } else {
+                assert_eq!(program, "cmd");
+                assert_eq!(args[0], "/d");
+                assert_eq!(args[1], "/c");
+                assert_eq!(args[2], "powershell");
+                assert_eq!(args[3], "-NoProfile");
+                assert_eq!(args[4], "-Command");
+                assert_eq!(args[5], complex);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(args[0], "-c");
+            assert_eq!(args[1], complex);
+        }
     }
 
     #[test]
@@ -438,9 +584,22 @@ mod tests {
         // Verify it still produces a valid Command structure.
         let cmd = build_command("");
         let std_cmd = cmd.as_std();
-        assert_eq!(std_cmd.get_program(), "sh");
         let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
-        assert_eq!(args, vec!["-c", ""]);
+        #[cfg(target_os = "windows")]
+        {
+            let program = std_cmd.get_program().to_str().unwrap_or("");
+            if program == "powershell" {
+                assert_eq!(args, vec!["-NoProfile", "-Command", ""]);
+            } else {
+                assert_eq!(program, "cmd");
+                assert_eq!(args, vec!["/d", "/c", "powershell", "-NoProfile", "-Command", ""]);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(std_cmd.get_program(), "sh");
+            assert_eq!(args, vec!["-c", ""]);
+        }
     }
 
     // ── is_dangerous_env_var exhaustive coverage ────────────────
@@ -472,11 +631,7 @@ mod tests {
             "LOGNAME",
         ];
         for var in &dangerous {
-            assert!(
-                is_dangerous_env_var(var),
-                "{} should be blocked",
-                var
-            );
+            assert!(is_dangerous_env_var(var), "{} should be blocked", var);
         }
     }
 
@@ -533,11 +688,7 @@ mod tests {
             "VERBOSE",
         ];
         for var in &safe {
-            assert!(
-                !is_dangerous_env_var(var),
-                "{} should be allowed",
-                var
-            );
+            assert!(!is_dangerous_env_var(var), "{} should be allowed", var);
         }
     }
 
@@ -636,14 +787,8 @@ mod tests {
     #[tokio::test]
     async fn exec_dangerous_env_var_silently_dropped() {
         // PATH is dangerous; command should still succeed but not see the override
-        // Use printenv which lists env vars. PATH override should be dropped,
-        // so the default PATH is used (not /evil/path).
-        let resp = handle_exec(
-            "printenv PATH",
-            &["PATH=/evil/path".to_string()],
-        )
-        .await;
-        // Command succeeds (printenv PATH still works with inherited PATH)
+        // so the inherited PATH is used instead of the injected value.
+        let resp = handle_exec(&read_env_command("PATH"), &["PATH=/evil/path".to_string()]).await;
         assert!(resp.success);
         let output = resp.output.unwrap();
         assert!(
@@ -656,7 +801,7 @@ mod tests {
     #[tokio::test]
     async fn exec_safe_env_var_passed_through() {
         let resp = handle_exec(
-            "printenv MY_CUSTOM_VAR",
+            &read_env_command("MY_CUSTOM_VAR"),
             &["MY_CUSTOM_VAR=secret42".to_string()],
         )
         .await;
@@ -680,16 +825,12 @@ mod tests {
         // Mix of safe, dangerous, and malformed env vars
         let env_vars = vec![
             "SAFE_ONE=alpha".to_string(),
-            "PATH=/bad".to_string(),         // dangerous, dropped
-            "MALFORMED".to_string(),          // no '=', ignored
+            "PATH=/bad".to_string(), // dangerous, dropped
+            "MALFORMED".to_string(), // no '=', ignored
             "SAFE_TWO=beta".to_string(),
             "LD_PRELOAD=/evil.so".to_string(), // dangerous, dropped
         ];
-        let resp = handle_exec(
-            "echo ${SAFE_ONE}_${SAFE_TWO}",
-            &env_vars,
-        )
-        .await;
+        let resp = handle_exec(&join_env_command("SAFE_ONE", "SAFE_TWO"), &env_vars).await;
         assert!(resp.success);
         let output = resp.output.unwrap();
         assert!(output.contains("alpha"), "SAFE_ONE should be set");
@@ -700,7 +841,7 @@ mod tests {
     async fn exec_env_var_with_equals_in_value() {
         // Value itself contains '=' — split_once should handle this
         let resp = handle_exec(
-            "printenv CONN_STR",
+            &read_env_command("CONN_STR"),
             &["CONN_STR=host=localhost;port=5432".to_string()],
         )
         .await;
@@ -740,12 +881,7 @@ mod tests {
 
         let (mut reader, writer) = tokio::io::duplex(65536);
         let handle = tokio::spawn(async move {
-            handle_exec_stream(
-                "false",
-                &[],
-                &mut tokio::io::BufWriter::new(writer),
-            )
-            .await
+            handle_exec_stream("false", &[], &mut tokio::io::BufWriter::new(writer)).await
         });
 
         // Read all messages until EXEC_EXIT
@@ -769,13 +905,9 @@ mod tests {
 
         let (mut reader, writer) = tokio::io::duplex(65536);
         let env = vec!["STREAM_TEST_VAR=streamed123".to_string()];
+        let cmd = read_env_command("STREAM_TEST_VAR");
         let handle = tokio::spawn(async move {
-            handle_exec_stream(
-                "printenv STREAM_TEST_VAR",
-                &env,
-                &mut tokio::io::BufWriter::new(writer),
-            )
-            .await
+            handle_exec_stream(&cmd, &env, &mut tokio::io::BufWriter::new(writer)).await
         });
 
         let mut got_value = false;
@@ -803,13 +935,9 @@ mod tests {
 
         let (mut reader, writer) = tokio::io::duplex(65536);
         let env = vec!["LD_PRELOAD=/evil.so".to_string()];
+        let cmd = require_env_command("LD_PRELOAD");
         let handle = tokio::spawn(async move {
-            handle_exec_stream(
-                "printenv LD_PRELOAD",
-                &env,
-                &mut tokio::io::BufWriter::new(writer),
-            )
-            .await
+            handle_exec_stream(&cmd, &env, &mut tokio::io::BufWriter::new(writer)).await
         });
 
         let mut saw_evil = false;
@@ -846,8 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn exec_combines_stdout_and_stderr() {
-        let resp =
-            handle_exec("echo OUT_PART && echo ERR_PART >&2", &[]).await;
+        let resp = handle_exec("echo OUT_PART && echo ERR_PART >&2", &[]).await;
         let output = resp.output.unwrap();
         assert!(output.contains("OUT_PART"), "should contain stdout");
         assert!(output.contains("ERR_PART"), "should contain stderr");

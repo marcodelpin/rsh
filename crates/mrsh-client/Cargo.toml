@@ -22,6 +22,7 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rpassword = "7"
 dirs = "6"
+socket2 = { version = "0.5", features = ["all"] }
 sha2.workspace = true
 hex = "0.4"
 rand.workspace = true
@@ -29,14 +30,15 @@ tar = "0.4"
 flate2 = "1"
 tempfile = "3"
 quinn = { workspace = true, optional = true }
-russh = { version = "0.58", default-features = false, features = ["flate2", "ring"], optional = true }
+russh = { version = "0.58", default-features = false, features = ["flate2", "ring", "rsa"], optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
 quic = ["quinn"]
-ssh-client = ["russh"]
+ssh-client = ["russh", "ed25519-dalek"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

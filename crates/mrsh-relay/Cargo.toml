@@ -16,6 +16,7 @@ hex = "0.4"
 tokio-util = "0.7"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 aes-gcm = "0.10"
+socket2 = { version = "0.5", features = ["all"] }
 
 [build-dependencies]
 prost-build.workspace = true

@@ -29,7 +29,11 @@ pub fn derive_group_keypair(enrollment_token: &str) -> (StaticSecret, PublicKey)
 }
 
 /// Collect network interfaces on this machine.
-pub fn collect_network_info(hostname: &str, service_port: u16, tray_port: u16) -> proto::NetworkInfo {
+pub fn collect_network_info(
+    hostname: &str,
+    service_port: u16,
+    tray_port: u16,
+) -> proto::NetworkInfo {
     let interfaces = collect_interfaces();
     proto::NetworkInfo {
         interfaces,
@@ -160,10 +164,7 @@ fn ecies_encrypt_key(
 }
 
 /// ECIES decrypt: unwrap a 32-byte key using our X25519 static secret.
-fn ecies_decrypt_key(
-    entry: &proto::GroupKeyEntry,
-    our_secret: &StaticSecret,
-) -> Result<[u8; 32]> {
+fn ecies_decrypt_key(entry: &proto::GroupKeyEntry, our_secret: &StaticSecret) -> Result<[u8; 32]> {
     // Reconstruct ephemeral public key
     let ephemeral_pub_bytes: [u8; 32] = entry
         .ephemeral_pubkey
@@ -218,13 +219,24 @@ fn collect_interfaces() -> Vec<proto::NetInterface> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // Parse /proc/net or ip command on Linux
-        if let Ok(output) = std::process::Command::new("ip")
-            .args(["-j", "-4", "addr", "show"])
-            .output()
-        {
-            if let Ok(text) = String::from_utf8(output.stdout) {
-                parse_linux_interfaces(&text, &mut result);
+        // rsh-npyw 2026-05-20: try bare `ip` then absolute paths because systemd
+        // service default PATH often omits /usr/sbin and /sbin where `ip` lives.
+        // Without this fallback, the server collects 0 interfaces and clients
+        // can't LAN-probe (always falls through to relay).
+        let candidates: &[&str] = &["ip", "/usr/sbin/ip", "/sbin/ip", "/bin/ip"];
+        for cmd in candidates {
+            if let Ok(output) = std::process::Command::new(cmd)
+                .args(["-j", "-4", "addr", "show"])
+                .output()
+            {
+                if output.status.success() && !output.stdout.is_empty() {
+                    if let Ok(text) = String::from_utf8(output.stdout) {
+                        parse_linux_interfaces(&text, &mut result);
+                    }
+                    if !result.is_empty() {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -252,7 +264,10 @@ fn parse_windows_interfaces(json: &str, result: &mut Vec<proto::NetInterface>) {
         let extract_num = |key: &str| -> Option<u32> {
             let needle = format!("\"{}\":", key);
             let start = line.find(&needle)? + needle.len();
-            let num_str: String = line[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num_str: String = line[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             num_str.parse().ok()
         };
 
@@ -289,24 +304,26 @@ fn parse_linux_interfaces(json: &str, result: &mut Vec<proto::NetInterface>) {
         let extract_num = |block: &str, key: &str| -> Option<u32> {
             let needle = format!("\"{}\":", key);
             let start = block.find(&needle)? + needle.len();
-            let num_str: String = block[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+            let num_str: String = block[start..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             num_str.parse().ok()
         };
 
-        if let Some(name) = extract_str(iface_block, "") {
-            // Skip — ifname was the split point, need to re-extract
-        }
-
-        // Extract ifname from the value after split
-        let ifname = {
-            let s = iface_block.trim_start_matches(|c: char| c != '"');
-            if s.starts_with(":\"") {
-                let start = 2;
-                let end = s[start..].find('"').unwrap_or(0) + start;
-                &s[start..end]
-            } else {
-                continue;
+        // rsh-npyw bugfix 2026-05-20: Extract ifname from the value AFTER the
+        // split delimiter "ifname". Chunk text starts with `:"<name>"` (colon
+        // is preserved by split). Previous impl did trim_start_matches(non-quote)
+        // which REMOVED the colon, making the subsequent starts_with(":\"")
+        // check always fail → 0 interfaces parsed.
+        let ifname = if iface_block.starts_with(":\"") {
+            let start = 2;
+            match iface_block[start..].find('"') {
+                Some(rel_end) => &iface_block[start..start + rel_end],
+                None => continue,
             }
+        } else {
+            continue;
         };
 
         if ifname == "lo" {
@@ -331,7 +348,11 @@ fn prefix_to_netmask(prefix: u32) -> String {
     if prefix > 32 {
         return "255.255.255.255".to_string();
     }
-    let mask: u32 = if prefix == 0 { 0 } else { !0u32 << (32 - prefix) };
+    let mask: u32 = if prefix == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix)
+    };
     format!(
         "{}.{}.{}.{}",
         (mask >> 24) & 0xFF,
@@ -352,9 +373,12 @@ pub fn same_subnet(ip1: &str, mask1: &str, ip2: &str, mask2: &str) -> bool {
         }
     };
 
-    if let (Some(a), Some(b), Some(m1), Some(m2)) =
-        (parse_ip(ip1), parse_ip(ip2), parse_ip(mask1), parse_ip(mask2))
-    {
+    if let (Some(a), Some(b), Some(m1), Some(m2)) = (
+        parse_ip(ip1),
+        parse_ip(ip2),
+        parse_ip(mask1),
+        parse_ip(mask2),
+    ) {
         // Use the more restrictive mask
         let mask = m1 & m2;
         (a & mask) == (b & mask)
@@ -390,8 +414,7 @@ mod tests {
             hex::encode(h.finalize())
         };
 
-        let blob =
-            encrypt_network_info(&info, &[(group_hash, group_pub)]).expect("encrypt");
+        let blob = encrypt_network_info(&info, &[(group_hash, group_pub)]).expect("encrypt");
         assert!(!blob.is_empty());
 
         let decrypted = decrypt_network_info(&blob, token)
@@ -439,11 +462,7 @@ mod tests {
             ..Default::default()
         };
 
-        let blob = encrypt_network_info(
-            &info,
-            &[(hash1, pub1), (hash2, pub2)],
-        )
-        .unwrap();
+        let blob = encrypt_network_info(&info, &[(hash1, pub1), (hash2, pub2)]).unwrap();
 
         // Both tokens can decrypt
         let d1 = decrypt_network_info(&blob, token1).unwrap().unwrap();
@@ -482,16 +501,22 @@ mod tests {
     #[test]
     fn same_subnet_basic() {
         assert!(same_subnet(
-            "192.0.2.50", "255.255.255.0",
-            "192.0.2.100", "255.255.255.0"
+            "192.0.2.50",
+            "255.255.255.0",
+            "192.0.2.100",
+            "255.255.255.0"
         ));
         assert!(!same_subnet(
-            "192.0.2.50", "255.255.255.0",
-            "192.168.72.50", "255.255.255.0"
+            "192.0.2.50",
+            "255.255.255.0",
+            "192.168.72.50",
+            "255.255.255.0"
         ));
         assert!(same_subnet(
-            "10.0.0.1", "255.0.0.0",
-            "10.255.255.254", "255.0.0.0"
+            "10.0.0.1",
+            "255.0.0.0",
+            "10.255.255.254",
+            "255.0.0.0"
         ));
     }
 

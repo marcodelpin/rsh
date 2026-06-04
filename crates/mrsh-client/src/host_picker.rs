@@ -7,18 +7,18 @@
 use std::io;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use mrsh_core::config::{Config, HostConfig};
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
-use mrsh_core::config::{Config, HostConfig};
 
 // ── Result ──────────────────────────────────────────────────────
 
@@ -83,11 +83,7 @@ impl App {
                         .unwrap_or("")
                         .to_lowercase()
                         .contains(&q)
-                    || h.mac
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q)
+                    || h.mac.as_deref().unwrap_or("").to_lowercase().contains(&q)
             })
             .collect();
 
@@ -137,7 +133,7 @@ impl App {
 pub fn run_host_picker() -> io::Result<PickerResult> {
     let cfg = Config::load();
     if cfg.hosts.is_empty() {
-        eprintln!("No hosts configured. Use `rsh config-edit` to add hosts.");
+        eprintln!("No hosts configured. Use `mrsh config-edit` to add hosts.");
         return Ok(PickerResult::Cancelled);
     }
 
@@ -149,7 +145,9 @@ pub fn run_host_picker() -> io::Result<PickerResult> {
         .collect();
 
     if hosts.is_empty() {
-        eprintln!("No concrete hosts configured (only wildcards found). Use `rsh config-edit` to add hosts.");
+        eprintln!(
+            "No concrete hosts configured (only wildcards found). Use `mrsh config-edit` to add hosts."
+        );
         return Ok(PickerResult::Cancelled);
     }
 
@@ -217,7 +215,7 @@ fn run_loop(
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3), // filter bar
-        Constraint::Min(5),   // host list
+        Constraint::Min(5),    // host list
         Constraint::Length(1), // footer
     ])
     .split(f.area());
@@ -261,10 +259,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
             ];
 
             // Address info
-            let addr = h
-                .hostname
-                .as_deref()
-                .unwrap_or("-");
+            let addr = h.hostname.as_deref().unwrap_or("-");
             spans.push(Span::styled(
                 format!("{:<22}", format!("{}:{}", addr, h.port)),
                 Style::default().fg(Color::White),
@@ -340,6 +335,10 @@ mod tests {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         }
     }
 

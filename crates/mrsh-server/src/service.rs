@@ -2,6 +2,8 @@
 //! Uses windows-service crate on Windows; stub on other platforms.
 
 #[cfg(target_os = "windows")]
+use crate::win_proc::HideWindow;
+#[cfg(target_os = "windows")]
 use tracing::info;
 
 /// Service name used for registration.
@@ -48,6 +50,7 @@ pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
                     &format!("binPath= \"{}\" --service", exe_path),
                     &format!("DisplayName= \"{}\"", SERVICE_DISPLAY_NAME),
                 ])
+                .hide_window()
                 .output();
         }
         Err(e) => return Err(e.into()),
@@ -65,21 +68,49 @@ pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
             "actions=",
             "restart/5000",
         ])
+        .hide_window()
         .output();
 
     info!("service installed: {}", SERVICE_NAME);
 
-    // Open firewall for mrsh ports (LAN access — Tailscale only covers its own IP)
+    // Grant Users modify access to ProgramData\mrsh\ so self-update works
+    // on non-admin machines (e.g. CLIENT-OREB). Without this, the service runs
+    // as SYSTEM but exec handlers impersonate the connected user, who can't
+    // rename/overwrite the binary.
+    let data_dir = std::path::Path::new(exe_path)
+        .parent()
+        .unwrap_or(std::path::Path::new(r"C:\ProgramData\mrsh"));
+    let _ = std::process::Command::new("icacls")
+        .args([
+            &data_dir.to_string_lossy().to_string(),
+            "/grant",
+            "Users:(OI)(CI)M",
+            "/T",
+        ])
+        .hide_window()
+        .output();
+    info!("ACL: granted Users:Modify on {}", data_dir.display());
+
+    // Open firewall for mrsh ports (LAN access — Tailscale only covers its own IP).
+    // profile=any covers private+domain+public — needed because at lock screen
+    // Windows NLA can fall back to "Public" (no domain identification, user logged
+    // out), and a private+domain-only rule would block inbound. rsh-5wzh 2026-05-15.
     for port in &[8822u16, 9822] {
         let rule_name = format!("mrsh-inbound-{}", port);
         let _ = std::process::Command::new("netsh")
             .args([
-                "advfirewall", "firewall", "add", "rule",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
                 &format!("name={}", rule_name),
-                "dir=in", "action=allow", "protocol=TCP",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
                 &format!("localport={}", port),
-                "profile=private,domain",
+                "profile=any",
             ])
+            .hide_window()
             .output();
         info!("firewall rule added: {} (TCP {})", rule_name, port);
     }
@@ -88,10 +119,12 @@ pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
     // Without this, the old tray keeps running and shows stale version.
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/IM", "mrsh.exe"])
+        .hide_window()
         .output();
     // Also kill legacy binary name
     let _ = std::process::Command::new("taskkill")
         .args(["/F", "/IM", "rsh.exe"])
+        .hide_window()
         .output();
 
     // Register tray companion at user logon — ensures visible tray icon
@@ -114,6 +147,7 @@ pub fn ensure_tray_task(exe_path: &str) {
     // Check if task exists
     let check = std::process::Command::new("schtasks")
         .args(["/query", "/tn", TRAY_TASK_NAME])
+        .hide_window()
         .output();
     let task_exists = check.map(|o| o.status.success()).unwrap_or(false);
 
@@ -125,9 +159,33 @@ pub fn ensure_tray_task(exe_path: &str) {
         return; // register_tray_logon_task already calls /run
     }
 
+    // Task exists — check if RunLevel needs updating (LeastPrivilege → HighestAvailable).
+    // Older versions registered with LeastPrivilege, which means the tray runs non-elevated
+    // even when the user is admin. Re-register if RunLevel is missing or wrong.
+    let xml_check = std::process::Command::new("schtasks")
+        .args(["/query", "/tn", TRAY_TASK_NAME, "/xml"])
+        .hide_window()
+        .output();
+    let needs_upgrade = xml_check
+        .map(|o| {
+            let xml = String::from_utf8_lossy(&o.stdout);
+            // Re-register if HighestAvailable is NOT present (old task or no RunLevel)
+            !xml.contains("HighestAvailable")
+        })
+        .unwrap_or(false);
+
+    if needs_upgrade {
+        info!("tray task has wrong RunLevel, re-registering with HighestAvailable");
+        if let Err(e) = register_tray_logon_task(exe_path) {
+            tracing::warn!("failed to re-register tray task: {}", e);
+        }
+        return;
+    }
+
     // Task exists — check if tray process is already running before launching another
     let tasklist = std::process::Command::new("tasklist")
         .args(["/fi", "imagename eq mrsh.exe", "/fo", "csv", "/nh"])
+        .hide_window()
         .output();
     let tray_running = tasklist
         .map(|o| {
@@ -141,12 +199,73 @@ pub fn ensure_tray_task(exe_path: &str) {
         info!("tray task exists but tray not running, launching");
         let _ = std::process::Command::new("schtasks")
             .args(["/run", "/tn", TRAY_TASK_NAME])
+            .hide_window()
             .output();
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn ensure_tray_task(_exe_path: &str) {}
+
+/// Ensure firewall rules for mrsh ports cover all profiles (private+domain+public).
+/// Self-heals existing fleet installs that had `profile=private,domain` — at
+/// Windows lock screen NLA can downgrade to Public profile, and the old rule
+/// would no longer apply, leaving mrsh unreachable while user is locked out.
+/// Idempotent: `netsh advfirewall firewall set rule` updates an existing rule
+/// in place. rsh-5wzh 2026-05-15.
+#[cfg(target_os = "windows")]
+pub fn ensure_firewall_rules() {
+    for port in &[8822u16, 9822] {
+        let rule_name = format!("mrsh-inbound-{}", port);
+        // `set rule new profile=any` updates if rule exists; falls back to
+        // add+delete if `set` fails (very old netsh).
+        let set_result = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "set",
+                "rule",
+                &format!("name={}", rule_name),
+                "new",
+                "profile=any",
+                "action=allow",
+                "dir=in",
+                "protocol=TCP",
+                &format!("localport={}", port),
+            ])
+            .hide_window()
+            .output();
+        let set_ok = set_result
+            .as_ref()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if set_ok {
+            info!("firewall rule ensured: {} (TCP {}, profile=any)", rule_name, port);
+            continue;
+        }
+        // Rule may not exist (old install without firewall step, or just upgraded
+        // from a very old build). Add it.
+        let _ = std::process::Command::new("netsh")
+            .args([
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={}", rule_name),
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                &format!("localport={}", port),
+                "profile=any",
+            ])
+            .hide_window()
+            .output();
+        info!("firewall rule added (no prior rule): {} (TCP {})", rule_name, port);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn ensure_firewall_rules() {}
 
 /// Register a scheduled task that launches the mrsh tray at user logon.
 ///
@@ -165,7 +284,7 @@ fn register_tray_logon_task(exe_path: &str) -> anyhow::Result<()> {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Principals><Principal id="Author"><GroupId>S-1-5-32-545</GroupId><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Principals><Principal id="Author"><GroupId>S-1-5-32-545</GroupId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
@@ -197,6 +316,7 @@ fn register_tray_logon_task(exe_path: &str) -> anyhow::Result<()> {
             xml_path.to_str().unwrap_or(""),
             "/f",
         ])
+        .hide_window()
         .output()?;
 
     let _ = std::fs::remove_file(&xml_path);
@@ -211,17 +331,61 @@ fn register_tray_logon_task(exe_path: &str) -> anyhow::Result<()> {
     // Run the tray task immediately — user is likely already logged in.
     let _ = Command::new("schtasks")
         .args(["/run", "/tn", TRAY_TASK_NAME])
+        .hide_window()
         .output();
 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "android")]
+pub fn install_service(_exe_path: &str) -> anyhow::Result<()> {
+    // Android (Termux) has no systemd. Autostart is provided by the Termux:Boot
+    // app: place a script at ~/.termux/boot/01-start-mrsh that exec's the binary.
+    // mrsh itself does not write that file (Termux:Boot must be user-installed).
+    eprintln!(
+        "install-service: no-op on Android — use Termux:Boot script ~/.termux/boot/01-start-mrsh"
+    );
+    eprintln!(
+        "example: echo '#!/data/data/com.termux/files/usr/bin/sh\\nexec ~/.local/bin/mrsh --daemon' > ~/.termux/boot/01-start-mrsh && chmod +x ~/.termux/boot/01-start-mrsh"
+    );
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
 pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
-    // Generate a systemd unit file template for the user
+    // Canonical install dir: /opt/mrsh/. The binary lives here owned by the
+    // service user (NOT root), so self-update works without sudo (rsh-z7um).
+    // /usr/local/bin/mrsh is left as a symlink for CLI compatibility.
+    use std::os::unix::fs::PermissionsExt;
+
+    let target_dir = "/opt/mrsh";
+    let target_bin = format!("{}/mrsh", target_dir);
+    let legacy_bin = "/usr/local/bin/mrsh";
+
+    // Create /opt/mrsh/ and copy current binary there
+    std::fs::create_dir_all(target_dir)
+        .map_err(|e| anyhow::anyhow!("create {}: {} (try with sudo)", target_dir, e))?;
+    std::fs::copy(exe_path, &target_bin)
+        .map_err(|e| anyhow::anyhow!("copy {} -> {}: {}", exe_path, target_bin, e))?;
+    std::fs::set_permissions(&target_bin, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| anyhow::anyhow!("chmod {}: {}", target_bin, e))?;
+
+    // Symlink /usr/local/bin/mrsh -> /opt/mrsh/mrsh for CLI compat.
+    // If the legacy path is a regular file (existing install), remove it first.
+    if std::path::Path::new(legacy_bin).exists() || std::fs::symlink_metadata(legacy_bin).is_ok() {
+        let _ = std::fs::remove_file(legacy_bin);
+    }
+    std::os::unix::fs::symlink(&target_bin, legacy_bin)
+        .map_err(|e| anyhow::anyhow!("symlink {} -> {}: {}", legacy_bin, target_bin, e))?;
+
+    // Ownership note: caller (running as root via sudo) should chown the dir
+    // to the intended service user. Default install assumes the unit's User=
+    // matches the invoking user when not run via sudo. The migration script
+    // (.tmp/migrate-mrsh-linux.sh) handles existing-install ownership transfer.
+
     let unit = format!(
         r#"[Unit]
-Description=Remote Shell (rsh) daemon
+Description=Remote Shell (mrsh) daemon
 After=network.target
 
 [Service]
@@ -229,18 +393,30 @@ Type=simple
 ExecStart={exe} --daemon
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/etc/rsh
+WorkingDirectory=/etc/mrsh
 
 [Install]
 WantedBy=multi-user.target
 "#,
-        exe = exe_path,
+        exe = target_bin,
     );
-    let unit_path = "/etc/systemd/system/rsh.service";
+    // Remove any legacy rsh.service unit from older installs (renamed to mrsh.service).
+    let legacy_unit = "/etc/systemd/system/rsh.service";
+    if std::path::Path::new(legacy_unit).exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["disable", "--now", "rsh"])
+            .output();
+        let _ = std::fs::remove_file(legacy_unit);
+        eprintln!("removed legacy unit {} (renamed to mrsh.service)", legacy_unit);
+    }
+
+    let unit_path = "/etc/systemd/system/mrsh.service";
     std::fs::write(unit_path, &unit)
         .map_err(|e| anyhow::anyhow!("write {}: {} (try with sudo)", unit_path, e))?;
-    eprintln!("wrote {}", unit_path);
-    eprintln!("run: sudo systemctl daemon-reload && sudo systemctl enable --now rsh");
+    eprintln!("wrote {} (binary at {})", unit_path, target_bin);
+    eprintln!("symlinked {} -> {}", legacy_bin, target_bin);
+    eprintln!("run: sudo systemctl daemon-reload && sudo systemctl enable --now mrsh");
+    eprintln!("note: chown {} to the service user before starting", target_bin);
     Ok(())
 }
 
@@ -258,6 +434,7 @@ pub fn uninstall_service() -> anyhow::Result<()> {
     // Remove tray logon task
     let _ = std::process::Command::new("schtasks")
         .args(["/delete", "/tn", TRAY_TASK_NAME, "/f"])
+        .hide_window()
         .output();
 
     // Remove firewall rules
@@ -265,9 +442,13 @@ pub fn uninstall_service() -> anyhow::Result<()> {
         let rule_name = format!("mrsh-inbound-{}", port);
         let _ = std::process::Command::new("netsh")
             .args([
-                "advfirewall", "firewall", "delete", "rule",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
                 &format!("name={}", rule_name),
             ])
+            .hide_window()
             .output();
     }
 
@@ -275,24 +456,43 @@ pub fn uninstall_service() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "android")]
 pub fn uninstall_service() -> anyhow::Result<()> {
-    let unit_path = "/etc/systemd/system/rsh.service";
-    if std::path::Path::new(unit_path).exists() {
+    eprintln!(
+        "uninstall-service: no-op on Android — remove ~/.termux/boot/01-start-mrsh manually"
+    );
+    Ok(())
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
+pub fn uninstall_service() -> anyhow::Result<()> {
+    // Stop + disable both the current (mrsh) and any legacy (rsh) unit.
+    for svc in ["mrsh", "rsh"] {
         let _ = std::process::Command::new("systemctl")
-            .args(["stop", "mrsh"])
+            .args(["stop", svc])
             .output();
         let _ = std::process::Command::new("systemctl")
-            .args(["disable", "mrsh"])
+            .args(["disable", svc])
             .output();
-        std::fs::remove_file(unit_path)
-            .map_err(|e| anyhow::anyhow!("remove {}: {} (try with sudo)", unit_path, e))?;
-        let _ = std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .output();
+    }
+    let mut removed = false;
+    for unit_path in [
+        "/etc/systemd/system/mrsh.service",
+        "/etc/systemd/system/rsh.service",
+    ] {
+        if std::path::Path::new(unit_path).exists() {
+            std::fs::remove_file(unit_path)
+                .map_err(|e| anyhow::anyhow!("remove {}: {} (try with sudo)", unit_path, e))?;
+            removed = true;
+        }
+    }
+    let _ = std::process::Command::new("systemctl")
+        .args(["daemon-reload"])
+        .output();
+    if removed {
         eprintln!("service uninstalled");
     } else {
-        eprintln!("no systemd unit file found at {}", unit_path);
+        eprintln!("no systemd unit file found (mrsh.service / rsh.service)");
     }
     Ok(())
 }
@@ -353,18 +553,16 @@ pub fn run_as_service(
         let cancel_for_stop = cancel.clone();
 
         // Register the control handler (Stop, Shutdown, etc.)
-        let status_handle = service_control_handler::register(
-            SERVICE_NAME,
-            move |control| match control {
+        let status_handle =
+            service_control_handler::register(SERVICE_NAME, move |control| match control {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
                     cancel_for_stop.cancel();
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 _ => ServiceControlHandlerResult::NotImplemented,
-            },
-        )
-        .expect("register service control handler");
+            })
+            .expect("register service control handler");
 
         // Report Running
         let _ = status_handle.set_service_status(ServiceStatus {
@@ -470,12 +668,16 @@ mod tests {
         // If someone changes either side, this test documents the contract.
         let install_flag = "--service";
         let detect_flag = "--service"; // must match is_service_mode() check
-        assert_eq!(install_flag, detect_flag,
-            "install_service launch_arguments and is_service_mode must use the same flag format");
+        assert_eq!(
+            install_flag, detect_flag,
+            "install_service launch_arguments and is_service_mode must use the same flag format"
+        );
 
         // Verify single-dash would be wrong (clap uses double-dash)
-        assert_ne!(install_flag, "-service",
-            "single-dash -service is wrong, clap uses --service");
+        assert_ne!(
+            install_flag, "-service",
+            "single-dash -service is wrong, clap uses --service"
+        );
     }
 
     /// Verify is_service_mode returns false in test context (no --service arg)
@@ -501,7 +703,7 @@ mod tests {
     fn uninstall_service_linux_no_unit() {
         #[cfg(not(target_os = "windows"))]
         {
-            let unit_path = "/etc/systemd/system/rsh.service";
+            let unit_path = "/etc/systemd/system/mrsh.service";
             if std::path::Path::new(unit_path).exists() {
                 // mrsh is installed on this machine — uninstall needs root, skip
                 return;

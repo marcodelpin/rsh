@@ -273,7 +273,10 @@ fn issue_2026_03_05_001_mux_unsized_dyn_trait_compiles() {
     // The binproto module's send_msg/recv_msg also use generic bounds correctly:
     // `W: AsyncWriteExt + Unpin` and `R: AsyncReadExt + Unpin`.
     // Verify they compile with concrete types (compile-time check).
-    assert!(true, "mux.rs ?Sized fix is verified by successful compilation");
+    assert!(
+        true,
+        "mux.rs ?Sized fix is verified by successful compilation"
+    );
 }
 
 // ---------------------------------------------------------------------------

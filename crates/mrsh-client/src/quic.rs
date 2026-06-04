@@ -31,7 +31,10 @@ async fn recv_json<T: serde::de::DeserializeOwned>(
     reader: &mut BufReader<quinn::RecvStream>,
 ) -> Result<T> {
     let mut line = String::new();
-    reader.read_line(&mut line).await.context("read JSON line")?;
+    reader
+        .read_line(&mut line)
+        .await
+        .context("read JSON line")?;
     serde_json::from_str(&line).context("parse JSON")
 }
 
@@ -47,7 +50,11 @@ pub struct QuicClient {
 impl QuicClient {
     /// Connect to a server at `addr` with the given SNI name, authenticate
     /// using the ed25519 key at `key_path` (or the discovered default key).
-    pub async fn connect(addr: SocketAddr, server_name: &str, key_path: Option<&str>) -> Result<Self> {
+    pub async fn connect(
+        addr: SocketAddr,
+        server_name: &str,
+        key_path: Option<&str>,
+    ) -> Result<Self> {
         let endpoint = build_client_endpoint()?;
         let conn = endpoint
             .connect(addr, server_name)
@@ -59,7 +66,11 @@ impl QuicClient {
 
         let (server_version, server_caps) = authenticate(&conn, key_path).await?;
 
-        Ok(Self { conn, server_version, server_caps })
+        Ok(Self {
+            conn,
+            server_version,
+            server_caps,
+        })
     }
 
     /// Execute a command and return the output string.
@@ -67,8 +78,12 @@ impl QuicClient {
     /// Server protocol: `OK\n` + output on success, `ERROR: msg` on failure.
     pub async fn exec(&self, command: &str) -> Result<String> {
         let (mut send, recv) = self.conn.open_bi().await.context("open exec stream")?;
-        send.write_all(b"exec\n").await.context("write exec header")?;
-        send.write_all(command.as_bytes()).await.context("write command")?;
+        send.write_all(b"exec\n")
+            .await
+            .context("write exec header")?;
+        send.write_all(command.as_bytes())
+            .await
+            .context("write command")?;
         send.write_all(b"\n").await?;
         send.finish().context("finish exec send")?;
 
@@ -103,7 +118,10 @@ impl QuicClient {
         // Wait for OK from server
         let mut reader = BufReader::new(recv);
         let mut ok_line = String::new();
-        reader.read_line(&mut ok_line).await.context("read tunnel OK")?;
+        reader
+            .read_line(&mut ok_line)
+            .await
+            .context("read tunnel OK")?;
         let ok_line = ok_line.trim();
         if ok_line != "OK" {
             bail!("tunnel rejected: {}", ok_line);
@@ -120,18 +138,25 @@ impl QuicClient {
 
         // Header: push\0path\n
         let header = format!("push\0{}\n", remote_path);
-        send.write_all(header.as_bytes()).await.context("write push header")?;
+        send.write_all(header.as_bytes())
+            .await
+            .context("write push header")?;
 
         // 8-byte BE size + raw data
         let size = data.len() as u64;
-        send.write_all(&size.to_be_bytes()).await.context("write push size")?;
+        send.write_all(&size.to_be_bytes())
+            .await
+            .context("write push size")?;
         send.write_all(data).await.context("write push data")?;
         send.finish().context("finish push send")?;
 
         // Read response
         let mut response = String::new();
         let mut reader = BufReader::new(recv);
-        reader.read_to_string(&mut response).await.context("read push response")?;
+        reader
+            .read_to_string(&mut response)
+            .await
+            .context("read push response")?;
 
         if response.starts_with("OK\n") {
             let written: u64 = response[3..].trim().parse().unwrap_or(size);
@@ -152,13 +177,18 @@ impl QuicClient {
 
         // Header: pull\0path\n
         let header = format!("pull\0{}\n", remote_path);
-        send.write_all(header.as_bytes()).await.context("write pull header")?;
+        send.write_all(header.as_bytes())
+            .await
+            .context("write pull header")?;
         send.finish().context("finish pull send")?;
 
         // Read first line: OK or ERROR
         let mut reader = BufReader::new(recv);
         let mut status_line = String::new();
-        reader.read_line(&mut status_line).await.context("read pull status")?;
+        reader
+            .read_line(&mut status_line)
+            .await
+            .context("read pull status")?;
 
         let status = status_line.trim();
         if status != "OK" {
@@ -167,12 +197,18 @@ impl QuicClient {
 
         // Read 8-byte BE size
         let mut size_buf = [0u8; 8];
-        reader.read_exact(&mut size_buf).await.context("read pull size")?;
+        reader
+            .read_exact(&mut size_buf)
+            .await
+            .context("read pull size")?;
         let size = u64::from_be_bytes(size_buf);
 
         // Read raw data
         let mut data = vec![0u8; size as usize];
-        reader.read_exact(&mut data).await.context("read pull data")?;
+        reader
+            .read_exact(&mut data)
+            .await
+            .context("read pull data")?;
 
         Ok(data)
     }
@@ -188,12 +224,17 @@ impl QuicClient {
         } else {
             format!("ls\0{}\n", remote_path)
         };
-        send.write_all(header.as_bytes()).await.context("write ls header")?;
+        send.write_all(header.as_bytes())
+            .await
+            .context("write ls header")?;
         send.finish().context("finish ls send")?;
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
-        reader.read_line(&mut line).await.context("read ls response")?;
+        reader
+            .read_line(&mut line)
+            .await
+            .context("read ls response")?;
 
         if line.starts_with("ERROR:") {
             bail!("remote ls: {}", line.trim());
@@ -209,32 +250,44 @@ impl QuicClient {
     /// Returns the raw send/recv streams after the server confirms `OK\n`.
     /// The caller is responsible for the wire-framed relay loop.
     ///
-    /// Protocol: `shell[\0{COLSxROWS}]\n` → `OK\n` then bidirectional frames.
+    /// Protocol: `shell[\0{COLSxROWS}[\0env=KEY=VAL]*]\n` → `OK\n` then
+    /// bidirectional frames.
+    ///
+    /// Each entry in `env_vars` is a single `KEY=VAL` string and becomes one
+    /// `env=KEY=VAL` token in the header. Entries containing `\0` or `\n`
+    /// are skipped (those bytes are reserved as protocol delimiters).
+    /// Old servers splitting on the first `\0` would treat the extended
+    /// target as the size string — `parse_size` falls back to `(80, 24)`
+    /// on malformed input, so env-less fallback is acceptable.
     pub async fn open_shell(
         &self,
         size_str: &str,
+        env_vars: &[String],
     ) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-        let (mut send, recv) = self
-            .conn
-            .open_bi()
-            .await
-            .context("open shell stream")?;
+        let (mut send, recv) = self.conn.open_bi().await.context("open shell stream")?;
 
-        let header = if size_str.is_empty() {
-            "shell\n".to_string()
-        } else {
-            format!("shell\0{}\n", size_str)
-        };
+        let mut header = String::from("shell");
+        if !size_str.is_empty() || !env_vars.is_empty() {
+            header.push('\0');
+            header.push_str(size_str);
+        }
+        for e in env_vars {
+            // Reject control bytes that would break the header framing.
+            if e.contains('\0') || e.contains('\n') {
+                continue;
+            }
+            header.push('\0');
+            header.push_str("env=");
+            header.push_str(e);
+        }
+        header.push('\n');
         send.write_all(header.as_bytes())
             .await
             .context("write shell header")?;
 
         let mut reader = BufReader::new(recv);
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .context("read shell OK")?;
+        reader.read_line(&mut line).await.context("read shell OK")?;
 
         if line.starts_with("ERROR:") {
             bail!("remote shell: {}", line.trim());
@@ -265,8 +318,7 @@ fn build_client_endpoint() -> Result<quinn::Endpoint> {
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30))
-            .context("idle timeout")?,
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).context("idle timeout")?,
     ));
     client_config.transport_config(Arc::new(transport));
 
@@ -285,7 +337,7 @@ async fn authenticate(
     let b64 = base64::engine::general_purpose::STANDARD;
     let key_pair = match key_path {
         Some(p) => auth::load_ssh_key(std::path::Path::new(p)).context("load SSH key")?,
-        None => auth::discover_key().context("no SSH key found")?,
+        None => auth::discover_key_or_explain()?, // rsh-m852: detects id_rsa-present case
     };
 
     let (mut send, recv) = conn.open_bi().await.context("open auth stream")?;
@@ -309,7 +361,9 @@ async fn authenticate(
     // Receive challenge
     let challenge: protocol::AuthChallenge =
         recv_json(&mut reader).await.context("recv challenge")?;
-    let challenge_bytes = b64.decode(&challenge.challenge).context("decode challenge")?;
+    let challenge_bytes = b64
+        .decode(&challenge.challenge)
+        .context("decode challenge")?;
 
     // Sign
     let sig = key_pair.sign_challenge(&challenge_bytes);

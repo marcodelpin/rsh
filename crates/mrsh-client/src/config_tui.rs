@@ -5,18 +5,18 @@
 use std::io;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use mrsh_core::config::{Config, HostConfig};
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
-use mrsh_core::config::{Config, HostConfig};
 
 // ── Screen states ──────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ struct App {
     inputs: Vec<String>,
     focus: usize,
     cursor_pos: usize, // cursor position within focused input
-    edit_idx: isize,    // -1 = new, >= 0 = editing existing host
+    edit_idx: isize,   // -1 = new, >= 0 = editing existing host
     // Confirm overlay
     confirm_action: ConfirmAction,
     confirm_msg: String,
@@ -238,9 +238,10 @@ impl App {
             self.cfg.rendezvous_key = opt_str(&self.inputs[3]);
             self.cfg.session_log = parse_bool_default(&self.inputs[4], true);
             if let Ok(days) = self.inputs[5].trim().parse::<u32>()
-                && days > 0 {
-                    self.cfg.session_log_retain = days;
-                }
+                && days > 0
+            {
+                self.cfg.session_log_retain = days;
+            }
             self.dirty = true;
             return;
         }
@@ -266,6 +267,10 @@ impl App {
             rendezvous_key: opt_str(&self.inputs[11]),
             session_log: parse_opt_bool(&self.inputs[12]),
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         };
 
         let idx = self.edit_idx;
@@ -497,9 +502,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::List => draw_list(frame, app),
         Screen::Edit => draw_form(frame, app, HOST_LABELS, HOST_PLACEHOLDERS, "Edit Host"),
-        Screen::Global => {
-            draw_form(frame, app, GLOBAL_LABELS, GLOBAL_PLACEHOLDERS, "Global Settings")
-        }
+        Screen::Global => draw_form(
+            frame,
+            app,
+            GLOBAL_LABELS,
+            GLOBAL_PLACEHOLDERS,
+            "Global Settings",
+        ),
         Screen::Confirm => {
             // Draw list in background, then overlay the confirm dialog
             draw_list(frame, app);
@@ -537,19 +546,24 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    let title = format!(
-        " mrsh hosts ({}) ",
-        app.cfg.hosts.len()
-    );
+    let title = format!(" mrsh hosts ({}) ", app.cfg.hosts.len());
 
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title)
-                .title_style(Style::default().fg(TITLE_COLOR).add_modifier(Modifier::BOLD)),
+                .title_style(
+                    Style::default()
+                        .fg(TITLE_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
         )
-        .highlight_style(Style::default().bg(SELECTED_BG).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(SELECTED_BG)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, chunks[0], &mut app.list_state);
@@ -754,13 +768,13 @@ fn handle_list(app: &mut App, code: KeyCode, mods: KeyModifiers) -> io::Result<b
 
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             if !app.cfg.hosts.is_empty()
-                && let Some(idx) = app.selected_index() {
-                    app.delete_idx = idx;
-                    app.confirm_action = ConfirmAction::Delete;
-                    app.confirm_msg =
-                        format!("Delete {:?}? (y/n)", app.cfg.hosts[idx].pattern);
-                    app.screen = Screen::Confirm;
-                }
+                && let Some(idx) = app.selected_index()
+            {
+                app.delete_idx = idx;
+                app.confirm_action = ConfirmAction::Delete;
+                app.confirm_msg = format!("Delete {:?}? (y/n)", app.cfg.hosts[idx].pattern);
+                app.screen = Screen::Confirm;
+            }
             Ok(false)
         }
 
@@ -984,6 +998,10 @@ mod tests {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         };
         assert_eq!(host_description(&h), "example.com");
     }
@@ -1005,6 +1023,10 @@ mod tests {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         };
         assert_eq!(host_description(&h), "example.com:22");
     }
@@ -1026,6 +1048,10 @@ mod tests {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         };
         assert_eq!(host_description(&h), "(no hostname)");
     }
@@ -1047,6 +1073,10 @@ mod tests {
             rendezvous_key: None,
             session_log: None,
             quic_port: None,
+            platform: None,
+            auto_upgrade: None,
+            track: None,
+            lan_first: mrsh_core::config::LanFirst::Auto,
         };
         let desc = host_description(&h);
         assert!(desc.contains("dev-server"));
@@ -1122,10 +1152,7 @@ Host test-*
 
         assert_eq!(app.cfg.hosts.len(), 1);
         assert_eq!(app.cfg.hosts[0].pattern, "new-host");
-        assert_eq!(
-            app.cfg.hosts[0].hostname.as_deref(),
-            Some("192.168.1.50")
-        );
+        assert_eq!(app.cfg.hosts[0].hostname.as_deref(), Some("192.168.1.50"));
         assert_eq!(app.cfg.hosts[0].port, 9822);
         assert!(app.dirty);
     }
@@ -1176,10 +1203,7 @@ Host test-*
         app.inputs[1] = "new.server:21116".to_string();
         app.apply_form();
 
-        assert_eq!(
-            app.cfg.device_id.as_deref(),
-            Some("my-device-id")
-        );
+        assert_eq!(app.cfg.device_id.as_deref(), Some("my-device-id"));
         assert_eq!(
             app.cfg.rendezvous_server.as_deref(),
             Some("new.server:21116")

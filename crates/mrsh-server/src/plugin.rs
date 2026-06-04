@@ -257,7 +257,6 @@ pub fn handle_plugin_command(action: &str, manager: &PluginManager) -> Response 
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

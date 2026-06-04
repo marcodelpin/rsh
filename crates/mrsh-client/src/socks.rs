@@ -61,14 +61,8 @@ where
         .await
         .with_context(|| format!("SOCKS5: bind {}", bind_addr))?;
 
-    info!(
-        "SOCKS5 proxy listening on 127.0.0.1:{}",
-        listen_port
-    );
-    eprintln!(
-        "SOCKS5 proxy listening on 127.0.0.1:{}",
-        listen_port
-    );
+    info!("SOCKS5 proxy listening on 127.0.0.1:{}", listen_port);
+    eprintln!("SOCKS5 proxy listening on 127.0.0.1:{}", listen_port);
 
     loop {
         let (client_stream, peer) = match listener.accept().await {
@@ -141,18 +135,26 @@ where
     }
     if buf[1] != SOCKS5_CMD_CONNECT {
         // Only CONNECT supported
-        send_socks5_reply(&mut client, SOCKS5_REP_CMD_NOT_SUPPORTED).await.ok();
+        send_socks5_reply(&mut client, SOCKS5_REP_CMD_NOT_SUPPORTED)
+            .await
+            .ok();
         anyhow::bail!("unsupported SOCKS5 command: {:#04x}", buf[1]);
     }
 
     let atyp = buf[3];
     let target_host = match atyp {
         SOCKS5_ATYP_IPV4 => {
-            client.read_exact(&mut buf[..4]).await.context("read IPv4")?;
+            client
+                .read_exact(&mut buf[..4])
+                .await
+                .context("read IPv4")?;
             Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]).to_string()
         }
         SOCKS5_ATYP_DOMAIN => {
-            client.read_exact(&mut buf[..1]).await.context("read domain len")?;
+            client
+                .read_exact(&mut buf[..1])
+                .await
+                .context("read domain len")?;
             let domain_len = buf[0] as usize;
             client
                 .read_exact(&mut buf[..domain_len])
@@ -161,22 +163,33 @@ where
             String::from_utf8_lossy(&buf[..domain_len]).to_string()
         }
         SOCKS5_ATYP_IPV6 => {
-            client.read_exact(&mut buf[..16]).await.context("read IPv6")?;
+            client
+                .read_exact(&mut buf[..16])
+                .await
+                .context("read IPv6")?;
             // Format as IPv6 address
             let mut parts = Vec::with_capacity(8);
             for i in 0..8 {
-                parts.push(format!("{:x}", u16::from_be_bytes([buf[i * 2], buf[i * 2 + 1]])));
+                parts.push(format!(
+                    "{:x}",
+                    u16::from_be_bytes([buf[i * 2], buf[i * 2 + 1]])
+                ));
             }
             parts.join(":")
         }
         _ => {
-            send_socks5_reply(&mut client, SOCKS5_REP_ADDR_NOT_SUPPORTED).await.ok();
+            send_socks5_reply(&mut client, SOCKS5_REP_ADDR_NOT_SUPPORTED)
+                .await
+                .ok();
             anyhow::bail!("unsupported SOCKS5 address type: {:#04x}", atyp);
         }
     };
 
     // Read destination port (2 bytes, big-endian)
-    client.read_exact(&mut buf[..2]).await.context("read port")?;
+    client
+        .read_exact(&mut buf[..2])
+        .await
+        .context("read port")?;
     let target_port = u16::from_be_bytes([buf[0], buf[1]]);
     let target = format!("{}:{}", target_host, target_port);
 
@@ -196,9 +209,15 @@ where
         paths: None,
         batch_patches: None,
         env_vars: None,
+        track: None,
+        version: None,
+        allow_downgrade: None,
+        insecure_no_verify: None,
     };
     if let Err(e) = wire::send_json(&mut rsh_stream, &connect_req).await {
-        send_socks5_reply(&mut client, SOCKS5_REP_GENERAL_FAILURE).await.ok();
+        send_socks5_reply(&mut client, SOCKS5_REP_GENERAL_FAILURE)
+            .await
+            .ok();
         anyhow::bail!("send connect to mrsh server: {}", e);
     }
 
@@ -206,15 +225,19 @@ where
     let ack: protocol::Response = match wire::recv_json(&mut rsh_stream).await {
         Ok(ack) => ack,
         Err(e) => {
-            send_socks5_reply(&mut client, SOCKS5_REP_GENERAL_FAILURE).await.ok();
+            send_socks5_reply(&mut client, SOCKS5_REP_GENERAL_FAILURE)
+                .await
+                .ok();
             anyhow::bail!("recv connect ack: {}", e);
         }
     };
 
     if !ack.success {
-        send_socks5_reply(&mut client, SOCKS5_REP_NOT_ALLOWED).await.ok();
+        send_socks5_reply(&mut client, SOCKS5_REP_NOT_ALLOWED)
+            .await
+            .ok();
         anyhow::bail!(
-            "rsh server rejected connect to {}: {}",
+            "mrsh server rejected connect to {}: {}",
             target,
             ack.error.unwrap_or_default()
         );
@@ -236,12 +259,20 @@ where
 ///
 /// Reply format: VER REP RSV ATYP BND.ADDR BND.PORT
 /// We always reply with 0.0.0.0:0 as bound address.
-async fn send_socks5_reply<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    reply_code: u8,
-) -> Result<()> {
+async fn send_socks5_reply<W: AsyncWrite + Unpin>(writer: &mut W, reply_code: u8) -> Result<()> {
     // VER=5 REP=code RSV=0 ATYP=1(IPv4) ADDR=0.0.0.0 PORT=0
-    let reply = [SOCKS5_VERSION, reply_code, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0];
+    let reply = [
+        SOCKS5_VERSION,
+        reply_code,
+        0x00,
+        SOCKS5_ATYP_IPV4,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
     writer
         .write_all(&reply)
         .await
@@ -273,7 +304,7 @@ where
                     Ok(n) => {
                         wire::send_message(rsh_stream, &buf[..n])
                             .await
-                            .context("send to rsh")?;
+                            .context("send to mrsh")?;
                     }
                     Err(e) => {
                         debug!("SOCKS5: client read error: {}", e);
@@ -353,7 +384,9 @@ mod tests {
         });
 
         let socks_handler = tokio::spawn(async move {
-            handle_socks5_client(&mut server_end, &mut mrsh_client).await.unwrap();
+            handle_socks5_client(&mut server_end, &mut mrsh_client)
+                .await
+                .unwrap();
         });
 
         // SOCKS5 greeting: version=5, 1 method (no auth)
@@ -411,7 +444,9 @@ mod tests {
         });
 
         let socks_handler = tokio::spawn(async move {
-            handle_socks5_client(&mut server_end, &mut mrsh_client).await.unwrap();
+            handle_socks5_client(&mut server_end, &mut mrsh_client)
+                .await
+                .unwrap();
         });
 
         // Greeting
@@ -463,7 +498,9 @@ mod tests {
         });
 
         let socks_handler = tokio::spawn(async move {
-            handle_socks5_client(&mut server_end, &mut mrsh_client).await.unwrap();
+            handle_socks5_client(&mut server_end, &mut mrsh_client)
+                .await
+                .unwrap();
         });
 
         // Greeting
@@ -475,7 +512,7 @@ mod tests {
         // atyp=0x04, 16 bytes IPv6 addr, 2 bytes port
         let mut req = vec![0x05, 0x01, 0x00, 0x04];
         // ::1 = 15 zero bytes + 0x01
-        req.extend_from_slice(&[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]);
+        req.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         req.extend_from_slice(&443u16.to_be_bytes());
         client_end.write_all(&req).await.unwrap();
 
@@ -517,7 +554,9 @@ mod tests {
         });
 
         let socks_handler = tokio::spawn(async move {
-            handle_socks5_client(&mut server_end, &mut mrsh_client).await.unwrap();
+            handle_socks5_client(&mut server_end, &mut mrsh_client)
+                .await
+                .unwrap();
         });
 
         // Greeting

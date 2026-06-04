@@ -78,10 +78,11 @@ where
 {
     // Rate limit check — reject banned IPs before wasting TLS/auth resources
     if let Some(addr) = peer
-        && ctx.rate_limiter.is_banned(&addr.ip()) {
-            warn!("rate limiter: rejecting banned IP {}", addr.ip());
-            return Ok(());
-        }
+        && ctx.rate_limiter.is_banned(&addr.ip())
+    {
+        warn!("rate limiter: rejecting banned IP {}", addr.ip());
+        return Ok(());
+    }
 
     // Phase 1: Auth (with LoginGraceTime-style timeout)
     let auth_timeout = std::time::Duration::from_secs(30);
@@ -106,12 +107,15 @@ where
                 if let Some(addr) = peer {
                     let banned = ctx.rate_limiter.record_failure(addr.ip());
                     if banned {
-                        warn!("IP {} is now banned after repeated auth failures", addr.ip());
+                        warn!(
+                            "IP {} is now banned after repeated auth failures",
+                            addr.ip()
+                        );
                     }
                 }
                 return Ok(());
             }
-        }
+        },
     };
     info!(
         "authenticated: {}",
@@ -132,7 +136,10 @@ where
     // Phase 2: MUX or standard request loop
     #[cfg(windows)]
     if client.mux_enabled {
-        info!("entering MUX mode for {}", client.key_comment.as_deref().unwrap_or("unknown"));
+        info!(
+            "entering MUX mode for {}",
+            client.key_comment.as_deref().unwrap_or("unknown")
+        );
         let (mux_conn, reader) = crate::mux::ServerMuxConn::new(stream);
         return mux_conn.serve(reader).await;
     }
@@ -147,7 +154,10 @@ where
                 return Ok(());
             }
             Err(_) => {
-                info!("idle timeout ({}s), closing connection", idle_timeout.as_secs());
+                info!(
+                    "idle timeout ({}s), closing connection",
+                    idle_timeout.as_secs()
+                );
                 return Ok(());
             }
         };
@@ -161,8 +171,8 @@ where
 
             match type_id {
                 bmsg::EXEC => {
-                    let (command, env_vars) = binproto::parse_exec(payload)
-                        .context("parse binary EXEC")?;
+                    let (command, env_vars) =
+                        binproto::parse_exec(payload).context("parse binary EXEC")?;
                     let command = if let Some(ref forced) = client.permissions.forced_command {
                         forced.clone()
                     } else {
@@ -170,13 +180,24 @@ where
                     };
                     let resp = crate::exec::handle_exec(&command, &env_vars).await;
                     let exit_code = if resp.success { 0u32 } else { 1u32 };
-                    let output = resp.output.unwrap_or_default();
+                    // rsh-v17v 2026-05-21: pack server-side resp.error into the
+                    // result payload when present, so client surfaces real
+                    // diagnostic instead of just an exit code. Prefix with
+                    // `[server-error]` line to keep the boundary visible.
+                    let output = match (resp.output.as_deref(), resp.error.as_deref()) {
+                        (Some(o), Some(e)) if !resp.success && !o.is_empty() => {
+                            format!("{}\n[server-error] {}", o, e)
+                        }
+                        (Some(o), _) => o.to_string(),
+                        (None, Some(e)) => format!("[server-error] {}", e),
+                        (None, None) => String::new(),
+                    };
                     let result = binproto::build_exec_result(exit_code, output.as_bytes());
                     binproto::send_msg(&mut stream, bmsg::EXEC_RESULT, &result).await?;
                 }
                 bmsg::EXEC_STREAM => {
-                    let (command, env_vars) = binproto::parse_exec(payload)
-                        .context("parse binary EXEC_STREAM")?;
+                    let (command, env_vars) =
+                        binproto::parse_exec(payload).context("parse binary EXEC_STREAM")?;
                     let command = if let Some(ref forced) = client.permissions.forced_command {
                         forced.clone()
                     } else {
@@ -191,26 +212,34 @@ where
                     binproto::send_empty(&mut stream, bmsg::PONG).await?;
                 }
                 bmsg::PUSH_START => {
-                    let (file_size, remote_path) = binproto::parse_push_start(payload)
-                        .context("parse binary PUSH_START")?;
-                    debug!("binary push: {} ({} bytes)", remote_path, file_size);
+                    let (file_size, remote_path) =
+                        binproto::parse_push_start(payload).context("parse binary PUSH_START")?;
+                    info!("binary push: {} ({} bytes)", remote_path, file_size);
 
                     // Receive PUSH_DATA chunks and write to file
                     let path = std::path::Path::new(&remote_path);
                     if let Some(parent) = path.parent()
-                        && !parent.exists() {
-                            std::fs::create_dir_all(parent).ok();
-                        }
-                    let mut file_data = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
+                        && !parent.exists()
+                    {
+                        info!("binary push: creating new directory {}", parent.display());
+                        std::fs::create_dir_all(parent).ok();
+                    }
+                    let mut file_data =
+                        Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
                     loop {
-                        let chunk_msg = wire::recv_message(&mut stream).await
+                        let chunk_msg = wire::recv_message(&mut stream)
+                            .await
                             .context("recv push chunk")?;
-                        if chunk_msg.is_empty() { break; }
+                        if chunk_msg.is_empty() {
+                            break;
+                        }
                         match chunk_msg[0] {
                             bmsg::PUSH_DATA => {
                                 file_data.extend_from_slice(&chunk_msg[1..]);
                             }
-                            bmsg::PUSH_END => { break; }
+                            bmsg::PUSH_END => {
+                                break;
+                            }
                             other => {
                                 let err = format!("unexpected msg 0x{:02x} during push", other);
                                 let payload = binproto::build_error(&err);
@@ -221,6 +250,11 @@ where
                     }
                     match std::fs::write(&remote_path, &file_data) {
                         Ok(()) => {
+                            info!(
+                                "binary push: wrote {} bytes to {}",
+                                file_data.len(),
+                                remote_path
+                            );
                             binproto::send_empty(&mut stream, bmsg::PUSH_OK).await?;
                         }
                         Err(e) => {
@@ -230,8 +264,8 @@ where
                     }
                 }
                 bmsg::PULL_REQ => {
-                    let remote_path = binproto::parse_pull_req(payload)
-                        .context("parse binary PULL_REQ")?;
+                    let remote_path =
+                        binproto::parse_pull_req(payload).context("parse binary PULL_REQ")?;
                     match std::fs::read(&remote_path) {
                         Ok(data) => {
                             // Stream in 10MB chunks
@@ -250,9 +284,21 @@ where
                     // Reuse existing info handler — returns JSON (exception for structured data)
                     let req = protocol::Request {
                         req_type: "info".to_string(),
-                        command: None, path: None, content: None, binary: None,
-                        gzip: None, sync_type: None, delta: None, signatures: None,
-                        paths: None, batch_patches: None, env_vars: None,
+                        command: None,
+                        path: None,
+                        content: None,
+                        binary: None,
+                        gzip: None,
+                        sync_type: None,
+                        delta: None,
+                        signatures: None,
+                        paths: None,
+                        batch_patches: None,
+                        env_vars: None,
+                        track: None,
+                        version: None,
+                        allow_downgrade: None,
+                        insecure_no_verify: None,
                     };
                     let resp = dispatch::dispatch(&req, &ctx.session_store).await;
                     if let dispatch::DispatchResult::Response(r) = resp {
@@ -263,16 +309,29 @@ where
                 bmsg::SCREENSHOT_REQ => {
                     let req = protocol::Request {
                         req_type: "screenshot".to_string(),
-                        command: None, path: None, content: None, binary: None,
-                        gzip: None, sync_type: None, delta: None, signatures: None,
-                        paths: None, batch_patches: None, env_vars: None,
+                        command: None,
+                        path: None,
+                        content: None,
+                        binary: None,
+                        gzip: None,
+                        sync_type: None,
+                        delta: None,
+                        signatures: None,
+                        paths: None,
+                        batch_patches: None,
+                        env_vars: None,
+                        track: None,
+                        version: None,
+                        allow_downgrade: None,
+                        insecure_no_verify: None,
                     };
                     let resp = dispatch::dispatch(&req, &ctx.session_store).await;
                     if let dispatch::DispatchResult::Response(r) = resp
                         && let Some(ref b64data) = r.output
-                            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64data) {
-                                binproto::send_msg(&mut stream, bmsg::SCREENSHOT_DATA, &raw).await?;
-                            }
+                        && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64data)
+                    {
+                        binproto::send_msg(&mut stream, bmsg::SCREENSHOT_DATA, &raw).await?;
+                    }
                 }
                 bmsg::SELF_UPDATE => {
                     let path = binproto::parse_pull_req(payload).unwrap_or_default(); // same format
@@ -287,8 +346,8 @@ where
                 }
                 bmsg::REQUEST => {
                     // Fallback: binary-framed JSON request (for commands not yet migrated)
-                    let req: protocol::Request = serde_json::from_slice(payload)
-                        .context("parse JSON in binary REQUEST")?;
+                    let req: protocol::Request =
+                        serde_json::from_slice(payload).context("parse JSON in binary REQUEST")?;
                     let resp = dispatch::dispatch(&req, &ctx.session_store).await;
                     if let dispatch::DispatchResult::Response(r) = resp {
                         let json = serde_json::to_vec(&r).unwrap_or_default();
@@ -329,9 +388,10 @@ where
 
         // Apply forced command if set
         if let Some(ref forced) = client.permissions.forced_command
-            && (req.req_type == "exec" || req.req_type == "exec-as-user") {
-                req.command = Some(forced.clone());
-            }
+            && (req.req_type == "exec" || req.req_type == "exec-as-user")
+        {
+            req.command = Some(forced.clone());
+        }
 
         match dispatch::dispatch(&req, &ctx.session_store).await {
             dispatch::DispatchResult::Response(response) => {
@@ -518,8 +578,8 @@ fn check_permission(req: &protocol::Request, perms: &auth::KeyPermissions) -> Op
                 return Some("screenshot not permitted for this key".to_string());
             }
         }
-        // Self-update
-        "self-update" => {
+        // Self-update (direct push or rsh-5264.6 from-rdv pull) — same gate
+        "self-update" | "self-update-from-rdv" => {
             #[cfg(feature = "no-self-update")]
             return Some("self-update disabled in this build".to_string());
             #[cfg(not(feature = "no-self-update"))]
@@ -527,11 +587,20 @@ fn check_permission(req: &protocol::Request, perms: &auth::KeyPermissions) -> Op
                 return Some("self-update not permitted for this key".to_string());
             }
         }
+        // Tray management — requires exec permission (service control)
+        "tray-start" => {
+            if !perms.allow_exec {
+                return Some("tray-start not permitted for this key".to_string());
+            }
+        }
         // Utility/info commands: always allowed
         "ping" | "session" | "info" => {}
         // Unknown request types: deny by default
         other => {
-            return Some(format!("unknown request type '{}' denied by default", other));
+            return Some(format!(
+                "unknown request type '{}' denied by default",
+                other
+            ));
         }
     }
     None
@@ -566,7 +635,9 @@ where
     let b64 = base64::engine::general_purpose::STANDARD;
 
     // 1. Receive first message — auto-detect binary vs JSON by first byte
-    let raw_msg = wire::recv_message(stream).await.context("recv auth message")?;
+    let raw_msg = wire::recv_message(stream)
+        .await
+        .context("recv auth message")?;
     if raw_msg.is_empty() {
         anyhow::bail!("empty auth message");
     }
@@ -588,8 +659,8 @@ where
         (raw, Some(version), caps, false)
     } else {
         // JSON auth: parse AuthRequest
-        let auth_req: protocol::AuthRequest = serde_json::from_slice(&raw_msg)
-            .context("parse JSON AuthRequest")?;
+        let auth_req: protocol::AuthRequest =
+            serde_json::from_slice(&raw_msg).context("parse JSON AuthRequest")?;
 
         debug!(
             "auth request (json): type={} version={:?}",
@@ -626,7 +697,13 @@ where
     // Check revocation BEFORE authorized_keys lookup
     if auth::is_key_revoked(&raw_key, &ctx.revoked_keys) {
         warn!("auth: REVOKED key {} attempted connection", key_fingerprint);
-        send_auth_fail(stream, "public key has been revoked", &ctx.server_version, use_binary).await?;
+        send_auth_fail(
+            stream,
+            "public key has been revoked",
+            &ctx.server_version,
+            use_binary,
+        )
+        .await?;
         anyhow::bail!("public key revoked: {}", key_fingerprint);
     }
 
@@ -661,12 +738,25 @@ where
         hot_reloaded = fresh_keys;
         match hot_reloaded.iter().find(|k| k.key_data == raw_key) {
             Some(k) => {
-                info!("auth: key {} found after hot-reload ({} keys on disk)", key_fingerprint, hot_reloaded.len());
+                info!(
+                    "auth: key {} found after hot-reload ({} keys on disk)",
+                    key_fingerprint,
+                    hot_reloaded.len()
+                );
                 k
             }
             None => {
-                warn!("auth: unknown key {} (not in memory nor on disk)", key_fingerprint);
-                send_auth_fail(stream, "public key not authorized", &ctx.server_version, use_binary).await?;
+                warn!(
+                    "auth: unknown key {} (not in memory nor on disk)",
+                    key_fingerprint
+                );
+                send_auth_fail(
+                    stream,
+                    "public key not authorized",
+                    &ctx.server_version,
+                    use_binary,
+                )
+                .await?;
                 anyhow::bail!("public key not authorized");
             }
         }
@@ -676,11 +766,8 @@ where
     let challenge = auth::generate_challenge();
     if use_binary {
         // Binary: raw 32 bytes
-        mrsh_core::binproto::send_msg(
-            stream,
-            mrsh_core::binproto::msg::AUTH_CHALLENGE,
-            &challenge,
-        ).await?;
+        mrsh_core::binproto::send_msg(stream, mrsh_core::binproto::msg::AUTH_CHALLENGE, &challenge)
+            .await?;
     } else {
         let challenge_msg = protocol::AuthChallenge {
             challenge: b64.encode(&challenge),
@@ -713,7 +800,13 @@ where
 
     if !valid {
         warn!("auth: bad signature from key {}", key_fingerprint);
-        send_auth_fail(stream, "signature verification failed", &ctx.server_version, use_binary).await?;
+        send_auth_fail(
+            stream,
+            "signature verification failed",
+            &ctx.server_version,
+            use_binary,
+        )
+        .await?;
         anyhow::bail!("signature verification failed");
     }
     info!(
@@ -748,42 +841,35 @@ where
         wire::send_json(stream, &challenge).await?;
 
         // Receive TOTP response
-        let totp_resp: protocol::TotpResponse = wire::recv_json(stream)
-            .await
-            .context("recv TotpResponse")?;
+        let totp_resp: protocol::TotpResponse =
+            wire::recv_json(stream).await.context("recv TotpResponse")?;
 
         // Verify TOTP code
-        let totp_valid = auth::verify_totp(&totp_secret.secret_base32, &totp_resp.totp_code)
-            .unwrap_or(false);
+        let totp_valid =
+            auth::verify_totp(&totp_secret.secret_base32, &totp_resp.totp_code).unwrap_or(false);
 
         if !totp_valid {
             // Try recovery codes
             let mut recovery_used = false;
             if let Some(ref recovery_path) = ctx.totp_recovery_path
                 && recovery_path.exists()
-                    && let Ok(mut recovery_map) = auth::load_totp_recovery(recovery_path)
-                        && auth::check_recovery_code(
-                            &totp_resp.totp_code,
-                            &key_fingerprint,
-                            &mut recovery_map,
-                        ) {
-                            // Save updated recovery codes (used code removed)
-                            if let Err(e) = auth::save_totp_recovery(recovery_path, &recovery_map)
-                            {
-                                warn!("failed to save recovery codes: {}", e);
-                            }
-                            info!(
-                                "auth: TOTP recovery code used for key {}",
-                                key_fingerprint
-                            );
-                            recovery_used = true;
-                        }
+                && let Ok(mut recovery_map) = auth::load_totp_recovery(recovery_path)
+                && auth::check_recovery_code(
+                    &totp_resp.totp_code,
+                    &key_fingerprint,
+                    &mut recovery_map,
+                )
+            {
+                // Save updated recovery codes (used code removed)
+                if let Err(e) = auth::save_totp_recovery(recovery_path, &recovery_map) {
+                    warn!("failed to save recovery codes: {}", e);
+                }
+                info!("auth: TOTP recovery code used for key {}", key_fingerprint);
+                recovery_used = true;
+            }
 
             if !recovery_used {
-                warn!(
-                    "auth: TOTP verification failed for key {}",
-                    key_fingerprint
-                );
+                warn!("auth: TOTP verification failed for key {}", key_fingerprint);
                 let result = protocol::AuthResult {
                     success: false,
                     error: Some("TOTP verification failed".to_string()),
@@ -813,7 +899,26 @@ where
     }
 
     // Always include informational caps (instance type, platform) — not negotiated
-    for info_cap in &["tray", "system", "screenshot", "window", "mouse", "keyboard"] {
+    for info_cap in &[
+        "tray",
+        "system",
+        "screenshot",
+        "window",
+        "mouse",
+        "keyboard",
+        // rsh-lic: advertise target OS so `fleet update` can pick the right
+        // binary without an extra uname probe. "linux-musl" narrows down to
+        // Alpine/static builds that need the musl-linked binary.
+        "linux",
+        "linux-musl",
+        // rsh-6i9e: advertise CPU arch so `fleet update` can route x86_64
+        // vs aarch64 binaries. Backward-compatible: legacy "linux"/"window"
+        // caps remain; new arch-suffixed caps are additive markers.
+        "linux-aarch64",
+        "linux-x86_64",
+        "windows-aarch64",
+        "windows-x86_64",
+    ] {
         if ctx.caps.iter().any(|c| c == *info_cap) && !final_caps.iter().any(|c| c == *info_cap) {
             final_caps.push(info_cap.to_string());
         }
@@ -835,11 +940,7 @@ where
             ctx.device_id.as_deref(),
             ctx.rendezvous_server.as_deref(),
         );
-        mrsh_core::binproto::send_msg(
-            stream,
-            mrsh_core::binproto::msg::AUTH_OK,
-            &payload,
-        ).await?;
+        mrsh_core::binproto::send_msg(stream, mrsh_core::binproto::msg::AUTH_OK, &payload).await?;
     } else {
         let result = protocol::AuthResult {
             success: true,
@@ -1120,16 +1221,34 @@ mod tests {
             paths: None,
             batch_patches: None,
             env_vars: None,
+            track: None,
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
         }
     }
 
     #[test]
     fn default_permissions_allow_everything() {
         let perms = auth::KeyPermissions::default();
-        for req_type in &["exec", "exec-as-user", "write", "ls", "read", "cat",
-                          "shell", "shell-persistent", "connect", "ping", "screenshot"] {
-            assert!(check_permission(&make_req(req_type), &perms).is_none(),
-                    "{} should be allowed with default perms", req_type);
+        for req_type in &[
+            "exec",
+            "exec-as-user",
+            "write",
+            "ls",
+            "read",
+            "cat",
+            "shell",
+            "shell-persistent",
+            "connect",
+            "ping",
+            "screenshot",
+        ] {
+            assert!(
+                check_permission(&make_req(req_type), &perms).is_none(),
+                "{} should be allowed with default perms",
+                req_type
+            );
         }
     }
 
@@ -1255,7 +1374,11 @@ mod tests {
         for cmd in &["reboot", "shutdown", "sleep", "lock"] {
             let mut req = make_req("native");
             req.command = Some(cmd.to_string());
-            assert!(check_permission(&req, &perms).is_some(), "no-reboot should deny {}", cmd);
+            assert!(
+                check_permission(&req, &perms).is_some(),
+                "no-reboot should deny {}",
+                cmd
+            );
         }
     }
 
@@ -1271,5 +1394,28 @@ mod tests {
         assert!(check_permission(&req, &perms).is_none());
         req.command = Some("reboot".to_string());
         assert!(check_permission(&req, &perms).is_none());
+    }
+
+    /// rsh-5264.6: the new request type `self-update-from-rdv` must share the
+    /// same `allow_self_update` permission gate as the legacy `self-update`.
+    /// A key denied self-update must also be denied from-rdv.
+    #[test]
+    fn self_update_from_rdv_shares_self_update_perm_gate() {
+        let mut perms = auth::KeyPermissions::default();
+        perms.allow_self_update = false;
+        // Both must be denied with the same kind of error.
+        assert!(
+            check_permission(&make_req("self-update"), &perms).is_some(),
+            "self-update must be denied when allow_self_update=false"
+        );
+        assert!(
+            check_permission(&make_req("self-update-from-rdv"), &perms).is_some(),
+            "self-update-from-rdv must be denied when allow_self_update=false"
+        );
+
+        // Both must be allowed when the key is permitted.
+        perms.allow_self_update = true;
+        assert!(check_permission(&make_req("self-update"), &perms).is_none());
+        assert!(check_permission(&make_req("self-update-from-rdv"), &perms).is_none());
     }
 }

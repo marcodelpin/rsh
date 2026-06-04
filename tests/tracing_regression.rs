@@ -19,7 +19,10 @@ fn tracing_appender_builder_does_not_panic_on_unwritable_dir() {
         .build(bad_dir);
 
     // Must return Err, not panic
-    assert!(result.is_err(), "builder should return Err for unwritable directory, not panic");
+    assert!(
+        result.is_err(),
+        "builder should return Err for unwritable directory, not panic"
+    );
 }
 
 #[test]
@@ -37,5 +40,8 @@ fn tracing_appender_builder_ok_maps_to_none_gracefully() {
         .build(bad_dir)
         .ok();
 
-    assert!(layer.is_none(), "unwritable dir should produce None via .ok()");
+    assert!(
+        layer.is_none(),
+        "unwritable dir should produce None via .ok()"
+    );
 }

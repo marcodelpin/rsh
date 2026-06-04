@@ -31,11 +31,7 @@ pub struct DiscoveredPeer {
 ///
 /// Broadcasts a PeerDiscovery "ping" on the given port, waits `timeout` for responses.
 /// Returns all peers that responded.
-pub async fn discover_lan(
-    port: u16,
-    timeout: Duration,
-    local_id: &str,
-) -> Vec<DiscoveredPeer> {
+pub async fn discover_lan(port: u16, timeout: Duration, local_id: &str) -> Vec<DiscoveredPeer> {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
@@ -82,16 +78,18 @@ pub async fn discover_lan(
             Ok(Ok((n, src))) => {
                 if let Ok(resp) = proto::RendezvousMessage::decode(&buf[..n])
                     && let Some(proto::rendezvous_message::Union::PeerDiscovery(pd)) = resp.union
-                        && pd.cmd == "pong" && pd.id != local_id {
-                            let service_port = pd.misc.parse::<u16>().unwrap_or(0);
-                            peers.push(DiscoveredPeer {
-                                id: pd.id,
-                                hostname: pd.hostname,
-                                platform: pd.platform,
-                                addr: src,
-                                service_port,
-                            });
-                        }
+                    && pd.cmd == "pong"
+                    && pd.id != local_id
+                {
+                    let service_port = pd.misc.parse::<u16>().unwrap_or(0);
+                    peers.push(DiscoveredPeer {
+                        id: pd.id,
+                        hostname: pd.hostname,
+                        platform: pd.platform,
+                        addr: src,
+                        service_port,
+                    });
+                }
             }
             Ok(Err(e)) => {
                 tracing::debug!("discovery: recv error: {}", e);
@@ -151,7 +149,12 @@ pub async fn run_discovery_responder(
     let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::debug!("discovery responder: bind {}:{} failed: {} (non-fatal)", "0.0.0.0", DISCOVERY_PORT, e);
+            tracing::debug!(
+                "discovery responder: bind {}:{} failed: {} (non-fatal)",
+                "0.0.0.0",
+                DISCOVERY_PORT,
+                e
+            );
             return;
         }
     };

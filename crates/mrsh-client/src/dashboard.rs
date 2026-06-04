@@ -9,18 +9,20 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use mrsh_core::config::Config;
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
-    Frame, Terminal,
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    },
 };
-use mrsh_core::config::Config;
 
 use crate::fleet::{self, HostStatus};
 
@@ -143,14 +145,15 @@ impl App {
 
     fn open_menu(&mut self) {
         if let Some(idx) = self.table_state.selected()
-            && idx < self.hosts.len() {
-                let mut list_state = ListState::default();
-                list_state.select(Some(0));
-                self.menu = Some(MenuState {
-                    host_idx: idx,
-                    list_state,
-                });
-            }
+            && idx < self.hosts.len()
+        {
+            let mut list_state = ListState::default();
+            list_state.select(Some(0));
+            self.menu = Some(MenuState {
+                host_idx: idx,
+                list_state,
+            });
+        }
     }
 
     fn close_menu(&mut self) {
@@ -198,16 +201,19 @@ pub async fn run_dashboard() -> io::Result<()> {
         } => {
             // Print the command to run after exiting TUI
             let cmd = match action {
-                HostAction::Shell => format!("rsh -h {} -p {} shell", hostname, port),
-                HostAction::Browse => format!("rsh -h {} -p {} browse", hostname, port),
-                HostAction::Sftp => format!("rsh -h {} -p {} sftp", hostname, port),
-                HostAction::Exec => format!("rsh -h {} -p {} exec", hostname, port),
-                HostAction::Push => format!("rsh -h {} -p {} push", hostname, port),
-                HostAction::Pull => format!("rsh -h {} -p {} pull", hostname, port),
+                HostAction::Shell => format!("mrsh -h {} -p {} shell", hostname, port),
+                HostAction::Browse => format!("mrsh -h {} -p {} browse", hostname, port),
+                HostAction::Sftp => format!("mrsh -h {} -p {} sftp", hostname, port),
+                HostAction::Exec => format!("mrsh -h {} -p {} exec", hostname, port),
+                HostAction::Push => format!("mrsh -h {} -p {} push", hostname, port),
+                HostAction::Pull => format!("mrsh -h {} -p {} pull", hostname, port),
                 HostAction::Screenshot => {
-                    format!("rsh -h {} -p {} screenshot", hostname, port)
+                    format!("mrsh -h {} -p {} screenshot", hostname, port)
                 }
-                HostAction::Logs => format!("rsh -h {} -p {} exec \"Get-EventLog -LogName System -Newest 20\"", hostname, port),
+                HostAction::Logs => format!(
+                    "mrsh -h {} -p {} exec \"Get-EventLog -LogName System -Newest 20\"",
+                    hostname, port
+                ),
             };
             eprintln!("→ {} ({})", host, cmd);
 
@@ -248,7 +254,9 @@ pub async fn run_dashboard() -> io::Result<()> {
 async fn run_dashboard_interactive() -> io::Result<DashboardResult> {
     let config = Config::load();
     if config.hosts.is_empty() && config.rendezvous_server.is_none() {
-        eprintln!("No hosts configured and no rendezvous server. Use `rsh config-edit` to add hosts.");
+        eprintln!(
+            "No hosts configured and no rendezvous server. Use `mrsh config-edit` to add hosts."
+        );
         return Ok(DashboardResult::Quit);
     }
 
@@ -319,51 +327,50 @@ async fn run_loop(
 
         // Poll for keyboard events
         if event::poll(POLL_TIMEOUT)?
-            && let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && key.code == KeyCode::Char('c')
-                {
-                    return Ok(DashboardResult::Quit);
-                }
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Ok(DashboardResult::Quit);
+            }
 
-                if app.menu.is_some() {
-                    // Menu mode
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => app.close_menu(),
-                        KeyCode::Up | KeyCode::Char('k') => app.menu_prev(),
-                        KeyCode::Down | KeyCode::Char('j') => app.menu_next(),
-                        KeyCode::Enter => {
-                            if let Some((idx, action)) = app.menu_select() {
-                                let h = &app.hosts[idx];
-                                return Ok(DashboardResult::Action {
-                                    host: h.name.clone(),
-                                    hostname: h.hostname.clone(),
-                                    port: h.port,
-                                    action,
-                                });
-                            }
+            if app.menu.is_some() {
+                // Menu mode
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => app.close_menu(),
+                    KeyCode::Up | KeyCode::Char('k') => app.menu_prev(),
+                    KeyCode::Down | KeyCode::Char('j') => app.menu_next(),
+                    KeyCode::Enter => {
+                        if let Some((idx, action)) = app.menu_select() {
+                            let h = &app.hosts[idx];
+                            return Ok(DashboardResult::Action {
+                                host: h.name.clone(),
+                                hostname: h.hostname.clone(),
+                                port: h.port,
+                                action,
+                            });
                         }
-                        _ => {}
                     }
-                } else {
-                    // Table mode
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(DashboardResult::Quit),
-                        KeyCode::Up | KeyCode::Char('k') => app.prev(),
-                        KeyCode::Down | KeyCode::Char('j') => app.next(),
-                        KeyCode::Enter => app.open_menu(),
-                        KeyCode::Char('r') if !app.refreshing => {
-                            // Force refresh
-                            app.refreshing = true;
-                            spawn_refresh(&app.config, &refresh_tx);
-                        }
-                        _ => {}
+                    _ => {}
+                }
+            } else {
+                // Table mode
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(DashboardResult::Quit),
+                    KeyCode::Up | KeyCode::Char('k') => app.prev(),
+                    KeyCode::Down | KeyCode::Char('j') => app.next(),
+                    KeyCode::Enter => app.open_menu(),
+                    KeyCode::Char('r') if !app.refreshing => {
+                        // Force refresh
+                        app.refreshing = true;
+                        spawn_refresh(&app.config, &refresh_tx);
                     }
+                    _ => {}
                 }
             }
+        }
     }
 }
 
@@ -372,7 +379,7 @@ async fn run_loop(
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
-        Constraint::Min(5),   // table
+        Constraint::Min(5),    // table
         Constraint::Length(1), // footer
     ])
     .split(f.area());
@@ -419,7 +426,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(vec![
-        "Name", "Hostname", "Port", "Status", "Version", "Latency", "Transport",
+        "Name",
+        "Hostname",
+        "Port",
+        "Status",
+        "Version",
+        "Latency",
+        "Transport",
     ])
     .style(
         Style::default()
@@ -518,17 +531,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_menu(f: &mut Frame, host_name: &str, list_state: &mut ListState) {
     let actions = HostAction::all();
-    let items: Vec<ListItem> = actions
-        .iter()
-        .map(|a| ListItem::new(a.label()))
-        .collect();
+    let items: Vec<ListItem> = actions.iter().map(|a| ListItem::new(a.label())).collect();
 
     let menu_height = (actions.len() as u16) + 2; // +2 for border
     let menu_width = 42;
     let area = f.area();
     let x = area.width.saturating_sub(menu_width) / 2;
     let y = area.height.saturating_sub(menu_height) / 2;
-    let menu_area = Rect::new(x, y, menu_width.min(area.width), menu_height.min(area.height));
+    let menu_area = Rect::new(
+        x,
+        y,
+        menu_width.min(area.width),
+        menu_height.min(area.height),
+    );
 
     // Clear background
     f.render_widget(Clear, menu_area);
@@ -568,11 +583,18 @@ mod tests {
                 caps: vec![],
                 latency_ms: 12,
                 error: None,
+                error_kind: None,
                 device_id: None,
                 rendezvous_server: None,
                 rendezvous_key: None,
                 quic_port: None,
                 transport: "tls",
+                rdv_version: None,
+                last_update_status: None,
+                last_update_at_unix: None,
+                track: None,
+                auto_upgrade: None,
+                conn_mode: "direct".to_string(),
             },
             HostStatus {
                 name: "lab".into(),
@@ -583,11 +605,18 @@ mod tests {
                 caps: vec![],
                 latency_ms: 0,
                 error: Some("timeout".into()),
+                error_kind: Some(crate::fleet::ProbeErrorKind::Timeout),
                 device_id: None,
                 rendezvous_server: None,
                 rendezvous_key: None,
                 quic_port: None,
                 transport: "",
+                rdv_version: None,
+                last_update_status: None,
+                last_update_at_unix: None,
+                track: None,
+                auto_upgrade: None,
+                conn_mode: String::new(),
             },
         ]
     }

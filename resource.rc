@@ -1,0 +1,31 @@
+// resource.rc — Windows resources for mrsh.exe
+// Icon
+1 ICON "icon.ico"
+
+// Application manifest
+#define RT_MANIFEST 24
+1 RT_MANIFEST "mrsh.exe.manifest"
+
+// Version information
+1 VERSIONINFO
+FILEVERSION 1,10,51,0
+PRODUCTVERSION 1,10,51,0
+FILETYPE 0x1
+{
+  BLOCK "StringFileInfo"
+  {
+    BLOCK "040904E4"
+    {
+      VALUE "ProductName",    "Remote Shell (mrsh)"
+      VALUE "FileDescription","Remote Shell Tool"
+      VALUE "CompanyName",    "MDP"
+      VALUE "LegalCopyright", "Copyright 2026 MDP"
+      VALUE "FileVersion",    "1.10.51.0"
+      VALUE "ProductVersion", "1.10.51.0"
+    }
+  }
+  BLOCK "VarFileInfo"
+  {
+    VALUE "Translation", 0x0409, 0x04E4
+  }
+}

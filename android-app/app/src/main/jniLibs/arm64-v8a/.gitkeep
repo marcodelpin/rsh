@@ -1,0 +1,7 @@
+# Placeholder. The cross-compiled mrsh aarch64-linux-android binary lands here
+# as `libmrsh.so` during build (C3 — scripts/build-android-apk.sh).
+#
+# The lib*.so naming + jniLibs placement is what lets the APK installer extract
+# the binary into the device's nativeLibraryDir with the execute bit set, which
+# is the only path on Android Q+ that bypasses the W^X exec restriction inside
+# /data/data/<pkg>/files (Permission denied otherwise).

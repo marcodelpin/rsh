@@ -96,8 +96,7 @@ fn write_entry(log_dir: &Path, entry: &LogEntry) -> std::io::Result<()> {
         .append(true)
         .open(&path)?;
 
-    let json = serde_json::to_string(entry)
-        .map_err(|e| std::io::Error::other(e))?;
+    let json = serde_json::to_string(entry).map_err(|e| std::io::Error::other(e))?;
     writeln!(file, "{}", json)?;
     Ok(())
 }
@@ -116,20 +115,21 @@ pub fn rotate_logs(log_dir: &Path, retain_days: u32) {
         let name = name.to_string_lossy();
         // Parse YYYY-MM.jsonl
         if let Some(stem) = name.strip_suffix(".jsonl")
-            && let Ok(date) = NaiveDate::parse_from_str(&format!("{}-01", stem), "%Y-%m-%d") {
-                // If the entire month is before cutoff, delete
-                let last_day = if date.month() == 12 {
-                    NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)
-                } else {
-                    NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)
-                };
-                if let Some(last) = last_day {
-                    let month_end = last - chrono::Duration::days(1);
-                    if month_end < cutoff {
-                        let _ = fs::remove_file(entry.path());
-                    }
+            && let Ok(date) = NaiveDate::parse_from_str(&format!("{}-01", stem), "%Y-%m-%d")
+        {
+            // If the entire month is before cutoff, delete
+            let last_day = if date.month() == 12 {
+                NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)
+            } else {
+                NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)
+            };
+            if let Some(last) = last_day {
+                let month_end = last - chrono::Duration::days(1);
+                if month_end < cutoff {
+                    let _ = fs::remove_file(entry.path());
                 }
             }
+        }
     }
 }
 
@@ -180,11 +180,7 @@ pub fn query_logs(log_dir: &Path, filter: &LogFilter) -> Vec<LogEntry> {
 
     let mut files: Vec<_> = dir_entries
         .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with(".jsonl")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl"))
         .collect();
     files.sort_by_key(|e| e.file_name());
 
@@ -206,21 +202,24 @@ pub fn query_logs(log_dir: &Path, filter: &LogFilter) -> Vec<LogEntry> {
 
             // Apply filters
             if let Some(ref host_filter) = filter.host
-                && !entry.host.contains(host_filter.as_str()) {
-                    continue;
-                }
+                && !entry.host.contains(host_filter.as_str())
+            {
+                continue;
+            }
 
             if let Some(since) = filter.since
                 && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start)
-                    && dt.date_naive() < since {
-                        continue;
-                    }
+                && dt.date_naive() < since
+            {
+                continue;
+            }
 
             if let Some(until) = filter.until
                 && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start)
-                    && dt.date_naive() > until {
-                        continue;
-                    }
+                && dt.date_naive() > until
+            {
+                continue;
+            }
 
             entries.push(entry);
         }
@@ -236,10 +235,12 @@ pub fn summarize_by_host(entries: &[LogEntry]) -> Vec<HostSummary> {
     let mut map: HashMap<String, HostSummary> = HashMap::new();
 
     for entry in entries {
-        let summary = map.entry(entry.host.clone()).or_insert_with(|| HostSummary {
-            host: entry.host.clone(),
-            ..Default::default()
-        });
+        let summary = map
+            .entry(entry.host.clone())
+            .or_insert_with(|| HostSummary {
+                host: entry.host.clone(),
+                ..Default::default()
+            });
         summary.total_seconds += entry.duration_s;
         summary.command_count += 1;
 
@@ -378,7 +379,11 @@ mod tests {
         tracker.finish(0);
 
         // Read back
-        let filter = LogFilter { host: None, since: None, until: None };
+        let filter = LogFilter {
+            host: None,
+            since: None,
+            until: None,
+        };
         let entries = query_logs(&dir, &filter);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, "test-host");
@@ -397,7 +402,11 @@ mod tests {
         let tracker = SessionTracker::start("srv", 9822, "exec", Some("hostname"), &dir);
         tracker.finish(1);
 
-        let filter = LogFilter { host: None, since: None, until: None };
+        let filter = LogFilter {
+            host: None,
+            since: None,
+            until: None,
+        };
         let entries = query_logs(&dir, &filter);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].args.as_deref(), Some("hostname"));
@@ -415,7 +424,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
 
-        let filter = LogFilter { host: None, since: None, until: None };
+        let filter = LogFilter {
+            host: None,
+            since: None,
+            until: None,
+        };
         let entries = query_logs(&dir, &filter);
         assert!(entries.is_empty());
 
@@ -424,7 +437,11 @@ mod tests {
 
     #[test]
     fn query_nonexistent_dir() {
-        let filter = LogFilter { host: None, since: None, until: None };
+        let filter = LogFilter {
+            host: None,
+            since: None,
+            until: None,
+        };
         let entries = query_logs(Path::new("/nonexistent/path"), &filter);
         assert!(entries.is_empty());
     }
@@ -520,7 +537,11 @@ not json at all
 "#;
         fs::write(dir.join("2026-01.jsonl"), content).unwrap();
 
-        let filter = LogFilter { host: None, since: None, until: None };
+        let filter = LogFilter {
+            host: None,
+            since: None,
+            until: None,
+        };
         let result = query_logs(&dir, &filter);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].host, "ok");
@@ -559,9 +580,9 @@ not json at all
         ];
         let result = summarize_by_host(&entries);
         assert_eq!(result.len(), 3);
-        assert_eq!(result[0].host, "long");   // 100s first
+        assert_eq!(result[0].host, "long"); // 100s first
         assert_eq!(result[1].host, "medium"); // 50s second
-        assert_eq!(result[2].host, "short");  // 1s last
+        assert_eq!(result[2].host, "short"); // 1s last
     }
 
     #[test]
@@ -573,7 +594,13 @@ not json at all
         ];
         let result = summarize_by_host(&entries);
         assert_eq!(result.len(), 1);
-        assert!(result[0].first_seen.as_ref().unwrap().contains("2026-01-15"));
+        assert!(
+            result[0]
+                .first_seen
+                .as_ref()
+                .unwrap()
+                .contains("2026-01-15")
+        );
     }
 
     // ── rotate_logs ──

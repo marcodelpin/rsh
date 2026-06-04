@@ -15,9 +15,9 @@ use anyhow::{Result, bail};
 use mrsh_core::protocol;
 
 #[cfg(unix)]
-use std::time::Duration;
-#[cfg(unix)]
 use mrsh_core::wire;
+#[cfg(unix)]
+use std::time::Duration;
 
 #[cfg(unix)]
 use tracing::{debug, info, warn};
@@ -121,10 +121,7 @@ pub async fn stop_master(host: &str, port: u16) -> Result<()> {
             eprintln!("Master stopped for {}:{}", host, port);
             Ok(())
         }
-        Ok(Ok(resp)) => bail!(
-            "master returned error: {}",
-            resp.error.unwrap_or_default()
-        ),
+        Ok(Ok(resp)) => bail!("master returned error: {}", resp.error.unwrap_or_default()),
         Ok(Err(e)) => bail!("master communication error: {}", e),
         Err(_) => bail!("timeout communicating with master"),
     }
@@ -138,11 +135,7 @@ pub async fn stop_master(_host: &str, _port: u16) -> Result<()> {
 /// Run as control master: hold authenticated connection, serve via UDS.
 /// Blocks until stopped (Ctrl+C, idle timeout, or --mux-stop).
 #[cfg(unix)]
-pub async fn run_master<S>(
-    host: &str,
-    port: u16,
-    client: crate::client::RshClient<S>,
-) -> Result<()>
+pub async fn run_master<S>(host: &str, port: u16, client: crate::client::RshClient<S>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -264,15 +257,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
     loop {
-        let req: protocol::Request = match tokio::time::timeout(
-            Duration::from_secs(60),
-            wire::recv_json(&mut stream),
-        )
-        .await
-        {
-            Ok(Ok(req)) => req,
-            _ => break, // Client disconnected or timeout
-        };
+        let req: protocol::Request =
+            match tokio::time::timeout(Duration::from_secs(60), wire::recv_json(&mut stream)).await
+            {
+                Ok(Ok(req)) => req,
+                _ => break, // Client disconnected or timeout
+            };
 
         // Control commands
         if req.req_type == "control-stop" {
@@ -344,7 +334,10 @@ impl Drop for SocketCleanup {
 /// Returns None for commands that cannot be muxed (streaming, binary transfer).
 pub fn build_mux_request(cmd: &str, args: &[String]) -> Option<protocol::Request> {
     let req = match cmd {
-        "ping" | "server-version" => crate::client::simple_request("ping"),
+        "ping" => crate::client::simple_request("ping"),
+        // server-version is known from the authenticated handshake.
+        // Routing it through mux degrades it to a ping and prints "pong".
+        "server-version" => return None,
         "exec" => {
             if args.len() < 2 {
                 return None;
@@ -355,12 +348,7 @@ pub fn build_mux_request(cmd: &str, args: &[String]) -> Option<protocol::Request
         }
         "ls" => {
             let mut req = crate::client::simple_request("ls");
-            req.path = Some(
-                args.get(1)
-                    .map(|s| s.as_str())
-                    .unwrap_or(".")
-                    .to_string(),
-            );
+            req.path = Some(args.get(1).map(|s| s.as_str()).unwrap_or(".").to_string());
             req
         }
         "cat" => {
@@ -494,6 +482,11 @@ mod tests {
     #[test]
     fn build_mux_request_push_returns_none() {
         assert!(build_mux_request("push", &[]).is_none());
+    }
+
+    #[test]
+    fn build_mux_request_server_version_returns_none() {
+        assert!(build_mux_request("server-version", &[]).is_none());
     }
 
     #[test]

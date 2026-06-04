@@ -1,7 +1,7 @@
 //! Exec safety guard — blocks commands that would kill/stop this mrsh process.
 //!
 //! AI agents frequently use mrsh for remote management. Without server-side
-//! guards, a command like `taskkill /im rsh.exe /f` sent via `rsh exec`
+//! guards, a command like `taskkill /im mrsh.exe /f` sent via `mrsh exec`
 //! kills the server, cutting off the agent's only access channel.
 //!
 //! This module detects self-destructive patterns and rejects them with a
@@ -26,42 +26,56 @@ pub fn check_exec(command: &str) -> SafetyVerdict {
     // Remove extra whitespace for reliable matching
     let normalized: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // Pattern 1: taskkill targeting rsh
+    // Pattern 1: taskkill targeting mrsh/rsh (substring: "mrsh" contains "rsh")
     if normalized.contains("taskkill") && normalized.contains("rsh") {
-        return block("taskkill would kill the mrsh process serving this connection. \
-            Use 'rsh self-update' for safe binary replacement, or schedule \
-            via schtask if you need to restart.");
+        return block(
+            "taskkill would kill the mrsh process serving this connection. \
+            Use 'mrsh self-update' for safe binary replacement, or schedule \
+            via schtask if you need to restart.",
+        );
     }
 
-    // Pattern 2: Stop-Service / net stop targeting rsh
-    if (normalized.contains("stop-service") || normalized.contains("net stop"))
-        && (normalized.contains("rsh") || normalized.contains("mrsh")
+    // Pattern 2: Stop-Service / Restart-Service / net stop targeting rsh
+    if (normalized.contains("stop-service")
+        || normalized.contains("restart-service")
+        || normalized.contains("net stop"))
+        && (normalized.contains("rsh")
+            || normalized.contains("mrsh")
             || normalized.contains("remote shell"))
     {
-        return block("Stopping the mrsh service would cut off this connection. \
-            Use 'rsh self-update' for safe binary replacement.");
+        return block(
+            "Stopping/restarting the mrsh service would cut off this connection. \
+            Use 'mrsh self-update' for safe binary replacement (restarts via schtask).",
+        );
     }
 
-    // Pattern 3: Stop-Process targeting rsh
+    // Pattern 3: Stop-Process targeting mrsh/rsh
     if normalized.contains("stop-process") && normalized.contains("rsh") {
-        return block("Stop-Process would kill the mrsh process serving this connection. \
-            Use 'rsh self-update' for safe replacement.");
+        return block(
+            "Stop-Process would kill the mrsh process serving this connection. \
+            Use 'mrsh self-update' for safe replacement.",
+        );
     }
 
-    // Pattern 4: Remove-Item / del targeting rsh.exe binary
+    // Pattern 4: Remove-Item / del targeting mrsh.exe/rsh.exe binary
     if (normalized.contains("remove-item") || normalized.contains("del "))
         && normalized.contains("rsh.exe")
     {
-        return block("Deleting rsh.exe while it's running would prevent service restart. \
-            Push the new binary as rsh-new.exe first, then use 'rsh self-update'.");
+        return block(
+            "Deleting mrsh.exe while it's running would prevent service restart. \
+            Push the new binary as mrsh-new.exe first, then use 'mrsh self-update'.",
+        );
     }
 
     // Pattern 5: sc delete targeting mrsh service
-    if normalized.contains("sc") && normalized.contains("delete")
+    if normalized.contains("sc")
+        && normalized.contains("delete")
         && (normalized.contains("rsh") || normalized.contains("mrsh"))
     {
-        return block("Deleting the mrsh service registration would prevent restart. \
-            Use 'rsh self-update' or manual schtask-based update instead.");
+        return block(
+            "Deleting the mrsh service registration would prevent restart. \
+            Use 'mrsh self-update' or manual schtask-based update instead.",
+        );
     }
 
     SafetyVerdict::Allow
@@ -91,6 +105,8 @@ mod tests {
         assert!(is_blocked("taskkill /im rsh.exe /f"));
         assert!(is_blocked("taskkill /IM rsh.exe"));
         assert!(is_blocked("TASKKILL /F /IM rsh.exe"));
+        assert!(is_blocked("taskkill /im mrsh.exe /f"));
+        assert!(is_blocked("TASKKILL /F /IM mrsh.exe"));
     }
 
     #[test]
@@ -99,6 +115,11 @@ mod tests {
         assert!(is_blocked("net stop rsh"));
         assert!(is_blocked("net stop mrsh"));
         assert!(is_blocked("Stop-Service 'mrsh'"));
+        assert!(is_blocked("Restart-Service mrsh"));
+        assert!(is_blocked("Restart-Service mrsh -Force"));
+        assert!(is_blocked(
+            "Restart-Service rsh -Force -EA SilentlyContinue"
+        ));
     }
 
     #[test]
@@ -112,6 +133,8 @@ mod tests {
     fn blocks_delete_binary() {
         assert!(is_blocked("Remove-Item C:\\ProgramData\\mrsh\\rsh.exe"));
         assert!(is_blocked("del C:\\ProgramData\\mrsh\\rsh.exe"));
+        assert!(is_blocked("Remove-Item C:\\ProgramData\\mrsh\\mrsh.exe"));
+        assert!(is_blocked("del C:\\ProgramData\\mrsh\\mrsh.exe"));
     }
 
     #[test]
@@ -141,6 +164,8 @@ mod tests {
     fn allows_mrsh_client_commands() {
         // Running mrsh as a client command is fine
         assert!(is_allowed("rsh -h other-host ping"));
-        assert!(is_allowed("C:\\ProgramData\\mrsh\\rsh.exe -h 192.168.1.1 exec hostname"));
+        assert!(is_allowed(
+            "C:\\ProgramData\\mrsh\\rsh.exe -h 192.168.1.1 exec hostname"
+        ));
     }
 }

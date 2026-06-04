@@ -17,8 +17,10 @@ It replaces SSH for Windows targets with ed25519 auth, file transfer, GUI automa
   Port 22 covers hosts running mrsh on the SSH port. No manual -p needed.
 - **SSH FALLBACK**: If all TLS ports fail, mrsh automatically falls back to
   standard SSH on port 22 (via russh). This makes mrsh a drop-in ssh
-  replacement for hosts that only have OpenSSH (Proxmox, generic Linux).
+  replacement for hosts that only have OpenSSH (Proxmox, generic Linux, Windows).
   Supported over SSH: exec, push, pull, ping. No GUI/fleet/screenshot.
+  v1.10.18+: SSH push/pull detects remote OS — uses PowerShell on Windows,
+  `cat` on Unix. All paths normalized to POSIX (forward slashes).
 - **FIREWALL**: On install (--install) or first startup, mrsh MUST open firewall
   for all ports it listens on. Without this, LAN clients get "connection refused".
   - Windows: `netsh advfirewall firewall add rule name="mrsh-inbound" dir=in action=allow protocol=TCP localport=8822 profile=private`
@@ -80,7 +82,8 @@ It replaces SSH for Windows targets with ed25519 auth, file transfer, GUI automa
   Falls back to service (8822) if tray is down, then SSH (22).
 - Service (port 8822): runs as SYSTEM via SCM. Use -p 8822 ONLY for:
   (a) admin operations, (b) unattended machines.
-- Launch tray from service: `mrsh -h <host> -p 8822 exec 'schtasks /run /tn mrsh-tray'`
+- Launch tray from service: `mrsh -h <host> -p 8822 tray-start`
+  (replaces manual `exec 'schtasks /run /tn mrsh-tray'` — handles task creation + launch)
 - `ensure_tray_task` auto-heals tray scheduled task at service startup.
 - Tray icon: blue = idle, RED = active connections.
 - Toast notifications: ONLY on first connection after 5+ minutes idle.

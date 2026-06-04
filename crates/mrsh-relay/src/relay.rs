@@ -128,7 +128,10 @@ pub async fn connect_relay(relay_addr: &str, uuid: &str, licence_key: &str) -> R
     };
 
     let framed = codec::encode_frame(&msg.encode_to_vec());
-    stream.write_all(&framed).await.context("send RequestRelay")?;
+    stream
+        .write_all(&framed)
+        .await
+        .context("send RequestRelay")?;
 
     // After sending, the connection is handed off to hbbr for pairing.
     // No explicit response — the stream becomes a raw tunnel once paired.
@@ -200,8 +203,15 @@ impl RelayServer {
 
             tokio::spawn(async move {
                 let result = serve_one(
-                    stream, waiting, &key, active, total, session_sem, max_waiting,
-                    session_timeout, peer_ip,
+                    stream,
+                    waiting,
+                    &key,
+                    active,
+                    total,
+                    session_sem,
+                    max_waiting,
+                    session_timeout,
+                    peer_ip,
                 )
                 .await;
                 // Always release the per-IP slot when this connection is done.
@@ -261,7 +271,10 @@ async fn serve_one(
     if let Some(sender) = map.remove(&uuid) {
         // Second connection — deliver our stream to the first, which drives the bridge.
         drop(map);
-        tracing::info!("relay paired uuid={}… peer={peer_ip}", &uuid[..uuid.len().min(8)]);
+        tracing::info!(
+            "relay paired uuid={}… peer={peer_ip}",
+            &uuid[..uuid.len().min(8)]
+        );
         let _ = sender.send(stream);
         return Ok(());
     }
@@ -301,8 +314,10 @@ async fn serve_one(
     let _session_permit = match session_sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
-            bail!("relay session limit reached, rejecting uuid={}… from {peer_ip}",
-                &uuid[..uuid.len().min(8)]);
+            bail!(
+                "relay session limit reached, rejecting uuid={}… from {peer_ip}",
+                &uuid[..uuid.len().min(8)]
+            );
         }
     };
 
@@ -328,7 +343,9 @@ async fn serve_one(
     });
 
     // Race the bridge against the session timeout.
-    let bridge = async { let _ = tokio::join!(fwd, rev); };
+    let bridge = async {
+        let _ = tokio::join!(fwd, rev);
+    };
     let _ = timeout(session_timeout, bridge).await;
 
     active.fetch_sub(1, Ordering::Relaxed);
@@ -360,6 +377,7 @@ mod tests {
         assert_eq!(srv.stats(), (0, 0));
     }
 
+    #[allow(dead_code)]
     fn test_limits() -> RelayLimits {
         RelayLimits {
             max_sessions: 100,
@@ -414,7 +432,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             s.write_all(b"PING").await.unwrap();
             let mut buf = vec![0u8; 64];
-            let n = timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+            let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
 
@@ -428,7 +449,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             s.write_all(b"PONG").await.unwrap();
             let mut buf = vec![0u8; 64];
-            let n = timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+            let n = timeout(Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
             String::from_utf8_lossy(&buf[..n]).to_string()
         });
 
@@ -452,14 +476,23 @@ mod tests {
         tokio::spawn(async move {
             let (s, peer) = listener.accept().await.unwrap();
             let _ = serve_one(
-                s, waiting, "secret", active, total, session_sem,
-                limits.max_waiting, limits.session_timeout, peer.ip(),
+                s,
+                waiting,
+                "secret",
+                active,
+                total,
+                session_sem,
+                limits.max_waiting,
+                limits.session_timeout,
+                peer.ip(),
             )
             .await;
         });
 
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(&relay_handshake("uuid", "wrong")).await.unwrap();
+        s.write_all(&relay_handshake("uuid", "wrong"))
+            .await
+            .unwrap();
 
         // Server closes on auth failure.
         let mut buf = [0u8; 1];
@@ -488,7 +521,9 @@ mod tests {
             }
         });
 
-        let _stream = connect_relay(&addr.to_string(), "my-uuid", "my-key").await.unwrap();
+        let _stream = connect_relay(&addr.to_string(), "my-uuid", "my-key")
+            .await
+            .unwrap();
         checker.await.unwrap();
     }
 
@@ -576,7 +611,15 @@ mod tests {
                 let ss2 = ss.clone();
                 tokio::spawn(async move {
                     let _ = serve_one(
-                        s, w2, "", a2, t2, ss2, 2, Duration::from_secs(60), peer.ip(),
+                        s,
+                        w2,
+                        "",
+                        a2,
+                        t2,
+                        ss2,
+                        2,
+                        Duration::from_secs(60),
+                        peer.ip(),
                     )
                     .await;
                 });

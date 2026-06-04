@@ -28,6 +28,10 @@ desktop.ini
 !.env.example
 !.env.template
 *.pem
+# rsh-c1fm: the release-signing PUBLIC key is intentionally committed (it is
+# already embedded in every binary; build.rs embeds it on hosts lacking the
+# workstation S:/ path). Private keys (*.pem above) stay ignored.
+!crates/mrsh-core/release-pubkey.pub.pem
 *.key
 *.crt
 id_rsa*
@@ -51,10 +55,16 @@ tmp/
 .temp/
 *.tmp
 *.cache
+.cache/
 *.bak
 *.backup
 *.backup.*
 *.old
+*.orig
+*.rej
+__pycache__/
+*.pyc
+node_modules/
 
 # ============================================================================
 # 5. DATABASES
@@ -77,6 +87,10 @@ tmp/
 .claude/cache/
 .claude/tsc-cache/
 .claude/.coordination-session-id
+.claude/worktrees/
+.claude/tasks/
+.claude/sessions/
+.claude/*lock
 claude-flow
 claude-flow.config.json
 .tldr/
@@ -124,3 +138,9 @@ mrsh-*-linux-install.sh
 # Dolt database files
 .dolt/
 .beads/.beads-credential-key
+
+# Ad-hoc investigation outputs
+result.md
+
+# Per-host bootstrap kits (contain authorized_keys + RendezvousKey)
+install-kits/

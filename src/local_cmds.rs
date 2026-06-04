@@ -68,7 +68,9 @@ pub fn run_log_query(args: &[String]) -> Result<()> {
     if entries.is_empty() {
         eprintln!("No session log entries found in {}", log_dir.display());
         if !config.session_log {
-            eprintln!("Hint: session logging is disabled. Remove 'SessionLog false' from ~/.mrsh/config to re-enable.");
+            eprintln!(
+                "Hint: session logging is disabled. Remove 'SessionLog false' from ~/.mrsh/config to re-enable."
+            );
         }
         return Ok(());
     }
@@ -192,8 +194,8 @@ pub fn run_install_pack(args: &[String]) -> Result<()> {
                     // Could be a key string or a path to a file
                     let path = std::path::Path::new(k);
                     if path.exists() {
-                        let content =
-                            std::fs::read_to_string(path).with_context(|| format!("read key file: {}", k))?;
+                        let content = std::fs::read_to_string(path)
+                            .with_context(|| format!("read key file: {}", k))?;
                         extra_keys.push(content.trim().to_string());
                     } else {
                         extra_keys.push(k.clone());
@@ -250,7 +252,12 @@ pub fn run_install_pack(args: &[String]) -> Result<()> {
                 group = Some(other.strip_prefix("--group=").unwrap().to_string());
             }
             other if other.starts_with("--rendezvous-server=") => {
-                rendezvous_server = Some(other.strip_prefix("--rendezvous-server=").unwrap().to_string());
+                rendezvous_server = Some(
+                    other
+                        .strip_prefix("--rendezvous-server=")
+                        .unwrap()
+                        .to_string(),
+                );
             }
             _ => {
                 bail!(

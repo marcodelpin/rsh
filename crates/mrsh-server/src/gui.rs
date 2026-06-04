@@ -74,6 +74,41 @@ fn handle_mouse(action: &str, args: &str) -> Response {
             unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
             ok_response("ok")
         }
+        // click_at/down_at/up_at: atomic move+button in a SINGLE SendInput batch
+        // using MOUSEEVENTF_ABSOLUTE. The coord-less "click" above fires at the
+        // current cursor position, racing a separate "move" RPC — on WPF custom
+        // WindowChrome the kernel hit-tests an off-by-a-pixel down event as
+        // HTCAPTION/HTSYSMENU and opens the system menu instead of activating the
+        // toolbar button. Binding move+down+up to the target coords atomically
+        // removes the race and the NC-boundary misfire (rsh-oz4i).
+        "click_at" => {
+            let (x, y) = parse_xy(args);
+            let inputs = [
+                mouse_abs_input(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+                mouse_abs_input(x, y, MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE),
+                mouse_abs_input(x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE),
+            ];
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            ok_response("ok")
+        }
+        "down_at" => {
+            let (x, y) = parse_xy(args);
+            let inputs = [
+                mouse_abs_input(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+                mouse_abs_input(x, y, MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_ABSOLUTE),
+            ];
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            ok_response("ok")
+        }
+        "up_at" => {
+            let (x, y) = parse_xy(args);
+            let inputs = [
+                mouse_abs_input(x, y, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+                mouse_abs_input(x, y, MOUSEEVENTF_LEFTUP | MOUSEEVENTF_ABSOLUTE),
+            ];
+            unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            ok_response("ok")
+        }
         "scroll" => {
             let delta: i32 = args.trim().parse().unwrap_or(120);
             let inputs = [INPUT {
@@ -298,6 +333,44 @@ fn parse_xy(args: &str) -> (i32, i32) {
     }
 }
 
+/// Normalize a pixel coordinate to the 0..=65535 range SendInput expects for
+/// MOUSEEVENTF_ABSOLUTE. Maps pixel [0, dim-1] linearly onto [0, 65535] so the
+/// target pixel is hit exactly (no off-by-one into an adjacent NC region).
+/// `dim` is the primary-screen extent in pixels (SM_CXSCREEN / SM_CYSCREEN).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn normalize_abs(coord: i32, dim: i32) -> i32 {
+    if dim <= 1 {
+        return 0;
+    }
+    let c = coord.clamp(0, dim - 1) as i64;
+    ((c * 65535) / (dim as i64 - 1)) as i32
+}
+
+/// Build a MOUSEEVENTF_ABSOLUTE MOUSEINPUT for the given pixel coords + flags.
+/// Coords are normalized against the primary screen extents.
+#[cfg(target_os = "windows")]
+fn mouse_abs_input(
+    x: i32,
+    y: i32,
+    flags: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalize_abs(x, sw),
+                dy: normalize_abs(y, sh),
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    }
+}
+
 /// Map named key to Windows virtual key code.
 #[cfg(target_os = "windows")]
 fn named_key_to_vk(name: &str) -> u16 {
@@ -356,7 +429,6 @@ fn ok_response(output: &str) -> Response {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +443,46 @@ mod tests {
     fn parse_xy_invalid() {
         assert_eq!(parse_xy("invalid"), (0, 0));
         assert_eq!(parse_xy(""), (0, 0));
+    }
+
+    #[test]
+    fn normalize_abs_endpoints() {
+        // pixel 0 → 0, last pixel → 65535 (exact endpoints)
+        assert_eq!(normalize_abs(0, 1920), 0);
+        assert_eq!(normalize_abs(1919, 1920), 65535);
+        assert_eq!(normalize_abs(0, 1080), 0);
+        assert_eq!(normalize_abs(1079, 1080), 65535);
+    }
+
+    #[test]
+    fn normalize_abs_midpoint() {
+        // ~middle pixel maps to ~middle of the normalized range
+        let mid = normalize_abs(960, 1920);
+        assert!((32000..=33000).contains(&mid), "mid was {mid}");
+    }
+
+    #[test]
+    fn normalize_abs_toolbar_band() {
+        // rsh-oz4i target: toolbar Configurazione at (1759,130) on 1920x1080.
+        // Must land at a stable normalized coord, NOT clamp to 0/65535.
+        let nx = normalize_abs(1759, 1920);
+        let ny = normalize_abs(130, 1080);
+        assert!((59000..61000).contains(&nx), "nx was {nx}");
+        assert!((7000..9000).contains(&ny), "ny was {ny}");
+    }
+
+    #[test]
+    fn normalize_abs_clamps_out_of_range() {
+        // negative + over-extent clamp into valid range, never panic / wrap
+        assert_eq!(normalize_abs(-50, 1920), 0);
+        assert_eq!(normalize_abs(5000, 1920), 65535);
+    }
+
+    #[test]
+    fn normalize_abs_degenerate_dim() {
+        // dim <= 1 is degenerate (no real screen) → 0, no divide-by-zero
+        assert_eq!(normalize_abs(100, 1), 0);
+        assert_eq!(normalize_abs(100, 0), 0);
     }
 
     #[test]

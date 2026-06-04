@@ -18,7 +18,11 @@ fn is_blocked_target(target: &str) -> bool {
     // Split host:port — handle both "host:port" and "[ipv6]:port"
     let host = if target.starts_with('[') {
         // IPv6 bracket notation
-        target.split(']').next().unwrap_or("").trim_start_matches('[')
+        target
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
     } else {
         target.split(':').next().unwrap_or("")
     };
@@ -49,8 +53,7 @@ fn is_blocked_target(target: &str) -> bool {
     let host_lower = host.to_ascii_lowercase();
     host_lower == "metadata.google.internal"
         || host_lower == "metadata.google"
-        || host_lower.ends_with(".internal")
-            && host_lower.contains("metadata")
+        || host_lower.ends_with(".internal") && host_lower.contains("metadata")
 }
 
 /// Check if a tunnel target is allowed by the server's PermitOpen-style rules.
@@ -67,9 +70,10 @@ pub fn is_tunnel_allowed(target: &str, allowed: &[String]) -> bool {
         // Wildcard port: "host:*" matches "host:ANYTHING"
         if let Some(host_prefix) = pattern.strip_suffix(":*")
             && let Some(target_host) = target.rsplit_once(':').map(|(h, _)| h)
-                && target_host == host_prefix {
-                    return true;
-                }
+            && target_host == host_prefix
+        {
+            return true;
+        }
     }
     false
 }
@@ -81,7 +85,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     if is_blocked_target(target) {
-        anyhow::bail!("tunnel target blocked (cloud metadata/unspecified): {}", target);
+        anyhow::bail!(
+            "tunnel target blocked (cloud metadata/unspecified): {}",
+            target
+        );
     }
 
     // Normalize "localhost" → "127.0.0.1" to avoid IPv6 ::1 resolution.
@@ -93,7 +100,10 @@ where
         target.to_string()
     };
 
-    info!("tunnel connect to {} (resolved: {})", target, resolved_target);
+    info!(
+        "tunnel connect to {} (resolved: {})",
+        target, resolved_target
+    );
 
     let target_stream = TcpStream::connect(&resolved_target)
         .await

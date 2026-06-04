@@ -1,0 +1,10 @@
+.gradle/
+build/
+*.iml
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Embedded native binary is built by scripts/build-android-apk.sh — do NOT commit.
+app/src/main/jniLibs/arm64-v8a/libmrsh.so

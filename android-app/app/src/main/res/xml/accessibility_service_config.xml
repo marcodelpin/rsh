@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AccessibilityService config for mrsh-android (rsh-9mzt).
+  - accessibilityEventTypes=all so the service receives every event (we filter in code, but having all available means setText/findByText work regardless of which app changed).
+  - canPerformGestures=true unlocks dispatchGesture (tap/swipe).
+  - canRetrieveWindowContent=true unlocks AccessibilityNodeInfo introspection (find by text, setText).
+  - canTakeScreenshot=true unlocks AccessibilityService.takeScreenshot (API 30+ silent screencap without MediaProjection consent).
+  - flagRequestTouchExplorationMode disabled — we are NOT a screen reader, we are an automation bridge.
+-->
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canRequestEnhancedWebAccessibility="false"
+    android:canRequestTouchExplorationMode="false"
+    android:description="@string/accessibility_service_description"
+    android:summary="@string/accessibility_service_summary" />

@@ -99,6 +99,21 @@ pub struct Request {
     pub batch_patches: Option<Vec<BatchPatchItem>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_vars: Option<Vec<String>>,
+    // rsh-5264.6: self-update-from-rdv parameters.
+    /// Release track to query on rdv (`stable` | `canary` | `dev`). None = use server default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// Pin a specific version on rdv (e.g. `1.10.30`). None = accept rdv's `latest_version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Allow a downgrade when `version` is older than the running binary.
+    /// Default is to reject downgrades. None or Some(false) = reject; Some(true) = allow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_downgrade: Option<bool>,
+    /// Skip Ed25519 signature verification (DEV ONLY — emits WARN log).
+    /// Required while `SIGNING_PUBLIC_KEY_PEM` is empty in source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_no_verify: Option<bool>,
 }
 
 /// Server response.
@@ -224,6 +239,10 @@ mod tests {
             paths: None,
             batch_patches: None,
             env_vars: None,
+            track: None,
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"exec\""));
@@ -382,7 +401,10 @@ mod tests {
         let req: AuthRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.auth_type, "auth");
         assert!(req.public_key.is_some());
-        assert!(req.key_type.is_none(), "legacy format omits key_type for ed25519");
+        assert!(
+            req.key_type.is_none(),
+            "legacy format omits key_type for ed25519"
+        );
         assert_eq!(req.version.as_deref(), Some("4.38.2"));
     }
 
@@ -436,7 +458,10 @@ mod tests {
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"output\":\"DESKTOP-TLC-800\""));
         assert!(!json.contains("\"error\""), "absent error must be omitted");
-        assert!(!json.contains("\"binary\""), "absent binary must be omitted");
+        assert!(
+            !json.contains("\"binary\""),
+            "absent binary must be omitted"
+        );
     }
 
     /// Sync request with path: {"type":"sync","path":"/C/Users","syncType":"push"}
@@ -447,5 +472,78 @@ mod tests {
         assert_eq!(req.req_type, "sync");
         assert_eq!(req.path.as_deref(), Some("/C/Users"));
         assert_eq!(req.sync_type.as_deref(), Some("push"));
+    }
+
+    /// rsh-5264.6: legacy Request without track/version/allow_downgrade/insecure_no_verify
+    /// must deserialize successfully — older clients (1.10.31 and earlier) never sent
+    /// these fields, and `#[serde(default)]` on the new fields preserves wire compat.
+    #[test]
+    fn legacy_request_without_self_update_from_rdv_fields_parses() {
+        let json = r#"{"type":"self-update","path":"C:\\ProgramData\\mrsh\\mrsh-new.exe"}"#;
+        let req: Request = serde_json::from_str(json).expect("legacy json must deserialize");
+        assert_eq!(req.req_type, "self-update");
+        assert_eq!(
+            req.path.as_deref(),
+            Some("C:\\ProgramData\\mrsh\\mrsh-new.exe")
+        );
+        assert!(
+            req.track.is_none(),
+            "legacy request has no track field"
+        );
+        assert!(req.version.is_none());
+        assert!(req.allow_downgrade.is_none());
+        assert!(req.insecure_no_verify.is_none());
+    }
+
+    /// rsh-5264.6: serialized Request omits the new fields when None — protects
+    /// older servers that may reject extra fields when configured strictly.
+    #[test]
+    fn request_omits_new_self_update_from_rdv_fields_when_none() {
+        let req = Request {
+            req_type: "self-update-from-rdv".to_string(),
+            command: None,
+            path: None,
+            content: None,
+            binary: None,
+            gzip: None,
+            sync_type: None,
+            delta: None,
+            signatures: None,
+            paths: None,
+            batch_patches: None,
+            env_vars: None,
+            track: Some("stable".to_string()),
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Present field is included
+        assert!(json.contains("\"track\":\"stable\""));
+        // Absent fields are omitted
+        assert!(
+            !json.contains("\"version\""),
+            "absent version must be omitted"
+        );
+        assert!(
+            !json.contains("\"allow_downgrade\""),
+            "absent allow_downgrade must be omitted"
+        );
+        assert!(
+            !json.contains("\"insecure_no_verify\""),
+            "absent insecure_no_verify must be omitted"
+        );
+    }
+
+    /// rsh-5264.6: full self-update-from-rdv request roundtrips.
+    #[test]
+    fn self_update_from_rdv_request_roundtrip() {
+        let json = r#"{"type":"self-update-from-rdv","track":"canary","version":"1.10.32","allow_downgrade":true,"insecure_no_verify":true}"#;
+        let req: Request = serde_json::from_str(json).unwrap();
+        assert_eq!(req.req_type, "self-update-from-rdv");
+        assert_eq!(req.track.as_deref(), Some("canary"));
+        assert_eq!(req.version.as_deref(), Some("1.10.32"));
+        assert_eq!(req.allow_downgrade, Some(true));
+        assert_eq!(req.insecure_no_verify, Some(true));
     }
 }

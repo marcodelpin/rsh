@@ -136,6 +136,39 @@ pub fn discover_key() -> Option<SshKeyPair> {
     None
 }
 
+/// rsh-m852: returns a hint when `ssh_dir` holds a non-ed25519 private key
+/// (e.g. `id_rsa`), which mrsh cannot use. Factored out of
+/// [`discover_key_or_explain`] so it is testable without touching `$HOME`.
+fn unsupported_key_hint(ssh_dir: &std::path::Path) -> Option<String> {
+    // Common non-ed25519 private keys that mrsh does not support.
+    for name in ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_dsa"] {
+        if ssh_dir.join(name).exists() {
+            return Some(format!(
+                "found ~/.ssh/{name} but mrsh requires an ed25519 key — generate one \
+                 with `ssh-keygen -t ed25519` (or `mrsh keys gen`), or pass `-i <ed25519-key>`"
+            ));
+        }
+    }
+    None
+}
+
+/// rsh-m852: like [`discover_key`] but returns a descriptive error when no
+/// usable ed25519 key is found. mrsh only supports ed25519, so when the user
+/// has a non-ed25519 key (e.g. `~/.ssh/id_rsa`) but no ed25519 key, the bare
+/// "no SSH key found" message is misleading — a key DOES exist, it is just an
+/// unsupported type. This points the user at the actual problem.
+pub fn discover_key_or_explain() -> anyhow::Result<SshKeyPair> {
+    if let Some(kp) = discover_key() {
+        return Ok(kp);
+    }
+    if let Some(home) = dirs::home_dir()
+        && let Some(hint) = unsupported_key_hint(&home.join(".ssh"))
+    {
+        anyhow::bail!("{hint}");
+    }
+    anyhow::bail!("no SSH key found (tried ~/.ssh/id_ed25519 and ~/.ssh/id_*)")
+}
+
 /// SHA256 fingerprint of a raw ed25519 public key, in "SHA256:<base64>" format.
 pub fn key_fingerprint(raw_key: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -151,6 +184,9 @@ pub fn key_fingerprint(raw_key: &[u8]) -> String {
 /// When `strict` is true (recommended for servers), refuses to load if permissions are insecure.
 /// When `strict` is false, only warns.
 pub fn load_authorized_keys(path: &Path, strict: bool) -> Result<Vec<AuthorizedKey>> {
+    #[cfg(not(unix))]
+    let _ = strict;
+
     // Check file permissions on Unix
     #[cfg(unix)]
     {
@@ -467,10 +503,7 @@ pub fn load_revoked_keys(path: &Path) -> Result<std::collections::HashSet<String
 }
 
 /// Check if a raw ed25519 public key is in the revoked set.
-pub fn is_key_revoked(
-    raw_key: &[u8],
-    revoked: &std::collections::HashSet<String>,
-) -> bool {
+pub fn is_key_revoked(raw_key: &[u8], revoked: &std::collections::HashSet<String>) -> bool {
     if revoked.is_empty() {
         return false;
     }
@@ -526,10 +559,12 @@ pub fn verify_totp(secret_base32: &str, code: &str) -> Result<bool> {
 
     let totp = TOTP::new(
         Algorithm::SHA1,
-        6, // digits
-        1, // skew (allow 1 step before/after)
+        6,  // digits
+        1,  // skew (allow 1 step before/after)
         30, // step (seconds)
         secret_bytes,
+        Some("mrsh".to_string()), // issuer (totp-rs >=5.7)
+        "mrsh-user".to_string(),  // account_name (totp-rs >=5.7)
     )
     .map_err(|e| anyhow::anyhow!("invalid TOTP config: {}", e))?;
 
@@ -574,10 +609,11 @@ pub fn check_recovery_code(
     let code_hash = format!("{:x}", Sha256::digest(code.as_bytes()));
 
     if let Some(hashes) = recovery_map.get_mut(fingerprint)
-        && let Some(pos) = hashes.iter().position(|h| h == &code_hash) {
-            hashes.remove(pos);
-            return true;
-        }
+        && let Some(pos) = hashes.iter().position(|h| h == &code_hash)
+    {
+        hashes.remove(pos);
+        return true;
+    }
     false
 }
 
@@ -618,6 +654,8 @@ pub fn generate_totp_secret() -> String {
         1,
         30,
         totp_rs::Secret::generate_secret().to_bytes().unwrap(),
+        Some("mrsh".to_string()), // issuer (totp-rs >=5.7)
+        "mrsh-user".to_string(),  // account_name (totp-rs >=5.7)
     )
     .expect("valid TOTP config");
     totp_rs::Secret::Raw(totp.secret.clone())
@@ -744,6 +782,20 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_key_hint_detects_id_rsa() {
+        // rsh-m852: an id_rsa present (no usable ed25519) must yield an actionable
+        // hint instead of the misleading bare "no SSH key found".
+        let dir = tempfile::tempdir().unwrap();
+        // empty ~/.ssh → no hint (caller emits the generic message)
+        assert!(super::unsupported_key_hint(dir.path()).is_none());
+        // id_rsa present → hint names the key and points at ed25519
+        std::fs::write(dir.path().join("id_rsa"), b"dummy").unwrap();
+        let hint = super::unsupported_key_hint(dir.path()).expect("hint for id_rsa");
+        assert!(hint.contains("id_rsa"), "hint should name the key: {hint}");
+        assert!(hint.contains("ed25519"), "hint should mention ed25519: {hint}");
+    }
+
+    #[test]
     fn load_authorized_keys_from_tempfile() {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let pub_bytes = signing_key.verifying_key().to_bytes();
@@ -789,7 +841,12 @@ mod tests {
         // strict=true should fail
         let result = load_authorized_keys(&ak_path, true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("insecure permissions"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("insecure permissions")
+        );
 
         // strict=false should succeed (just warns)
         let result = load_authorized_keys(&ak_path, false);

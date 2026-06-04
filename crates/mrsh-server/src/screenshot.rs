@@ -34,7 +34,29 @@ pub fn handle_screenshot(display_idx: u32, quality: u8, scale: u8) -> Response {
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "android")]
+    {
+        match capture_screen_android(display_idx, quality, scale) {
+            Ok(b64) => Response {
+                success: true,
+                output: Some(b64),
+                error: None,
+                size: None,
+                binary: Some(true),
+                gzip: None,
+            },
+            Err(e) => Response {
+                success: false,
+                output: None,
+                error: Some(e.to_string()),
+                size: None,
+                binary: None,
+                gzip: None,
+            },
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
     {
         match capture_screen_linux(display_idx, quality, scale) {
             Ok(b64) => Response {
@@ -84,7 +106,7 @@ pub fn is_black_image(rgba_data: &[u8], threshold: u8) -> bool {
 
 /// Try running a screenshot command with a timeout.
 /// Spawns the process and polls with try_wait to avoid indefinite blocking.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
 fn try_screenshot_cmd(cmd: &str, args: &[&str], timeout_secs: u64) -> bool {
     use std::process::Command;
     let mut child = match Command::new(cmd).args(args).spawn() {
@@ -108,9 +130,46 @@ fn try_screenshot_cmd(cmd: &str, args: &[&str], timeout_secs: u64) -> bool {
     }
 }
 
+/// Capture screen on Android using `/system/bin/screencap -p -` which writes a PNG to stdout.
+/// Converts to JPEG via the `image` crate. Works on Termux without root for the user's own surface;
+/// on most automotive head-units screencap is permitted because the boot image enables it.
+/// Returns base64-encoded JPEG.
+#[cfg(target_os = "android")]
+fn capture_screen_android(_display: u32, quality: u8, _scale: u8) -> anyhow::Result<String> {
+    use base64::Engine;
+    use std::process::Command;
+
+    let output = Command::new("/system/bin/screencap")
+        .args(["-p"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("screencap spawn failed: {} (binary missing or no permission)", e))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "screencap exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let png_data = output.stdout;
+    if png_data.is_empty() {
+        anyhow::bail!("screencap produced empty output (likely SELinux denial or no display)");
+    }
+
+    let img = image::load_from_memory(&png_data)?;
+    let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality.clamp(1, 100));
+    img.write_with_encoder(encoder)?;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg_buf.into_inner());
+    Ok(b64)
+}
+
 /// Capture screen on Linux using available tools (grim for Wayland, scrot/import for X11).
 /// Returns base64-encoded JPEG.
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
 fn capture_screen_linux(_display: u32, quality: u8, _scale: u8) -> anyhow::Result<String> {
     use base64::Engine;
 
@@ -145,10 +204,8 @@ fn capture_screen_linux(_display: u32, quality: u8, _scale: u8) -> anyhow::Resul
 
     let img = image::load_from_memory(&png_data)?;
     let mut jpeg_buf = std::io::Cursor::new(Vec::new());
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-        &mut jpeg_buf,
-        quality.clamp(1, 100),
-    );
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality.clamp(1, 100));
     img.write_with_encoder(encoder)?;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg_buf.into_inner());
@@ -255,10 +312,8 @@ fn capture_screen_windows(_display: u32, quality: u8, scale: u8) -> anyhow::Resu
         .ok_or_else(|| anyhow::anyhow!("failed to create image from raw RGB data"))?;
 
     let mut jpeg_buf = std::io::Cursor::new(Vec::new());
-    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-        &mut jpeg_buf,
-        quality.clamp(1, 100),
-    );
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, quality.clamp(1, 100));
     rgb_image.write_with_encoder(encoder)?;
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg_buf.into_inner());
@@ -318,10 +373,10 @@ mod tests {
         // Create BGRA data with a gradient pattern.
         let mut bgra = vec![0u8; (w * h * 4) as usize];
         for i in 0..(w * h) as usize {
-            bgra[i * 4] = (i % 256) as u8;       // B
+            bgra[i * 4] = (i % 256) as u8; // B
             bgra[i * 4 + 1] = ((i * 2) % 256) as u8; // G
             bgra[i * 4 + 2] = ((i * 3) % 256) as u8; // R
-            bgra[i * 4 + 3] = 255;                     // A
+            bgra[i * 4 + 3] = 255; // A
         }
 
         // BGRA → RGB (same conversion as capture_screen_windows).
@@ -340,17 +395,23 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
         assert!(!b64.is_empty());
         // Decode to verify it's valid base64.
-        let decoded = base64::engine::general_purpose::STANDARD.decode(&b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .unwrap();
         // JPEG magic bytes: FF D8 FF.
-        assert_eq!(&decoded[..3], &[0xFF, 0xD8, 0xFF], "output must be valid JPEG");
+        assert_eq!(
+            &decoded[..3],
+            &[0xFF, 0xD8, 0xFF],
+            "output must be valid JPEG"
+        );
     }
 
     #[test]
     fn screenshot_linux_no_display() {
         #[cfg(not(target_os = "windows"))]
         {
-            let has_display = std::env::var("DISPLAY").is_ok()
-                || std::env::var("WAYLAND_DISPLAY").is_ok();
+            let has_display =
+                std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
             let resp = handle_screenshot(0, 80, 100);
             if has_display {
                 // WSLg or real desktop — screenshot may succeed

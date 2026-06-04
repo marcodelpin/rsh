@@ -102,9 +102,7 @@ pub async fn recv_json_compressed<R: AsyncReadExt + Unpin, T: DeserializeOwned>(
             let decompressed = zstd::decode_all(&data[1..]).context("zstd decompress")?;
             serde_json::from_slice(&decompressed).context("deserialize compressed JSON")
         }
-        RAW_FLAG => {
-            serde_json::from_slice(&data[1..]).context("deserialize JSON")
-        }
+        RAW_FLAG => serde_json::from_slice(&data[1..]).context("deserialize JSON"),
         _ => {
             // Backward compatibility: no flag byte, treat entire payload as raw JSON
             serde_json::from_slice(&data).context("deserialize JSON (legacy)")
@@ -145,6 +143,10 @@ mod tests {
             paths: None,
             batch_patches: None,
             env_vars: None,
+            track: None,
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
         };
 
         send_json(&mut client, &req).await.unwrap();
@@ -174,7 +176,11 @@ mod tests {
         let result = recv_message(&mut server).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("message too large"), "expected 'too large' error, got: {}", err_msg);
+        assert!(
+            err_msg.contains("message too large"),
+            "expected 'too large' error, got: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]

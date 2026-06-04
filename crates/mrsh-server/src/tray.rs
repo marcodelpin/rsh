@@ -27,16 +27,16 @@ const WM_TRAYICON: u32 = 0x0400 + 1; // WM_USER + 1
 mod win32_tray {
     use super::*;
     use std::sync::Mutex;
-    use windows::core::{PCWSTR, w};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-        NOTIFYICONDATAW, Shell_NotifyIconW,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::*;
     #[allow(unused_imports)]
     use windows::Win32::Graphics::Gdi::*;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Shell::{
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::core::{PCWSTR, w};
 
     /// Idle threshold (seconds). Toast only when first connection arrives after
     /// this many seconds of no active connections.
@@ -94,11 +94,10 @@ mod win32_tray {
                             .ok()
                             .and_then(|s| s.as_ref().map(|ts| (ts.port, ts.device_id.clone())))
                             .unwrap_or((9822, String::new()));
-                        let status_text: Vec<u16> =
-                            format!("mrsh v{version} (port {port})")
-                                .encode_utf16()
-                                .chain(std::iter::once(0))
-                                .collect();
+                        let status_text: Vec<u16> = format!("mrsh v{version} (port {port})")
+                            .encode_utf16()
+                            .chain(std::iter::once(0))
+                            .collect();
                         let _ = AppendMenuW(
                             hmenu,
                             MF_STRING | MF_GRAYED,
@@ -107,11 +106,10 @@ mod win32_tray {
                         );
                         // Show DeviceID (clickable → copies to clipboard)
                         if !device_id.is_empty() {
-                            let id_text: Vec<u16> =
-                                format!("ID: {} (click to copy)", device_id)
-                                    .encode_utf16()
-                                    .chain(std::iter::once(0))
-                                    .collect();
+                            let id_text: Vec<u16> = format!("ID: {} (click to copy)", device_id)
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .collect();
                             let _ = AppendMenuW(
                                 hmenu,
                                 MF_STRING,
@@ -120,19 +118,10 @@ mod win32_tray {
                             );
                         }
                         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
-                        let _ = AppendMenuW(
-                            hmenu,
-                            MF_STRING,
-                            IDM_OPEN_LOG as usize,
-                            w!("Open Log"),
-                        );
+                        let _ =
+                            AppendMenuW(hmenu, MF_STRING, IDM_OPEN_LOG as usize, w!("Open Log"));
                         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
-                        let _ = AppendMenuW(
-                            hmenu,
-                            MF_STRING,
-                            IDM_QUIT as usize,
-                            w!("Quit"),
-                        );
+                        let _ = AppendMenuW(hmenu, MF_STRING, IDM_QUIT as usize, w!("Quit"));
 
                         let _ = SetForegroundWindow(hwnd);
                         let _ = TrackPopupMenu(
@@ -154,17 +143,19 @@ mod win32_tray {
                         IDM_COPY_ID => {
                             if let Ok(state) = TRAY_STATE.lock()
                                 && let Some(ts) = state.as_ref()
-                                    && !ts.device_id.is_empty() {
-                                        copy_to_clipboard(&ts.device_id);
-                                    }
+                                && !ts.device_id.is_empty()
+                            {
+                                copy_to_clipboard(&ts.device_id);
+                            }
                         }
                         IDM_OPEN_LOG => super::open_log_file(),
                         IDM_QUIT => {
                             tracing::info!("tray quit requested");
                             if let Ok(state) = TRAY_STATE.lock()
-                                && let Some(ts) = state.as_ref() {
-                                    ts.cancel.cancel();
-                                }
+                                && let Some(ts) = state.as_ref()
+                            {
+                                ts.cancel.cancel();
+                            }
                             PostQuitMessage(0);
                         }
                         _ => {}
@@ -186,12 +177,14 @@ mod win32_tray {
                                             crate::notify::EventKind::Connected => {
                                                 if ts.active_connections == 0 {
                                                     // 0→1 transition: check idle threshold
-                                                    let idle_secs = ts.last_disconnect.elapsed().as_secs();
+                                                    let idle_secs =
+                                                        ts.last_disconnect.elapsed().as_secs();
                                                     if idle_secs >= IDLE_THRESHOLD_SECS {
                                                         first_connect_after_idle = true;
                                                     }
                                                 }
-                                                ts.active_connections = ts.active_connections.saturating_add(1);
+                                                ts.active_connections =
+                                                    ts.active_connections.saturating_add(1);
                                                 tracing::info!(
                                                     "connection from {} ({}) [active: {}]",
                                                     ev.peer.ip(),
@@ -200,13 +193,15 @@ mod win32_tray {
                                                 );
                                             }
                                             crate::notify::EventKind::Disconnected => {
-                                                ts.active_connections = ts.active_connections.saturating_sub(1);
+                                                ts.active_connections =
+                                                    ts.active_connections.saturating_sub(1);
                                                 if ts.active_connections == 0 {
                                                     ts.last_disconnect = std::time::Instant::now();
                                                 }
                                                 tracing::debug!(
                                                     "disconnect {} [active: {}]",
-                                                    ev.peer.ip(), ts.active_connections
+                                                    ev.peer.ip(),
+                                                    ts.active_connections
                                                 );
                                             }
                                         }
@@ -250,9 +245,7 @@ mod win32_tray {
                     let cancelled = TRAY_STATE
                         .lock()
                         .ok()
-                        .and_then(|s| {
-                            s.as_ref().map(|ts| ts.cancel.is_cancelled())
-                        })
+                        .and_then(|s| s.as_ref().map(|ts| ts.cancel.is_cancelled()))
                         .unwrap_or(false);
                     if cancelled {
                         PostQuitMessage(0);
@@ -314,7 +307,7 @@ mod win32_tray {
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
         use windows::Win32::System::Memory::{
-            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+            GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
         };
         use windows::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -327,9 +320,16 @@ mod win32_tray {
                 if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
                     let ptr = GlobalLock(hmem);
                     if !ptr.is_null() {
-                        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, bytes);
+                        std::ptr::copy_nonoverlapping(
+                            wide.as_ptr() as *const u8,
+                            ptr as *mut u8,
+                            bytes,
+                        );
                         let _ = GlobalUnlock(hmem);
-                        let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(windows::Win32::Foundation::HANDLE(hmem.0 as _)));
+                        let _ = SetClipboardData(
+                            CF_UNICODETEXT.0 as u32,
+                            Some(windows::Win32::Foundation::HANDLE(hmem.0 as _)),
+                        );
                     }
                 }
                 let _ = CloseClipboard();
@@ -343,7 +343,11 @@ mod win32_tray {
         port: u16,
         device_id: String,
     ) -> anyhow::Result<()> {
-        tracing::info!("tray: starting Win32 tray on port {} (id: {})", port, device_id);
+        tracing::info!(
+            "tray: starting Win32 tray on port {} (id: {})",
+            port,
+            device_id
+        );
 
         // Set up notification channel for connection events
         let notify_rx = crate::notify::subscribe();
@@ -358,7 +362,8 @@ mod win32_tray {
             device_id: device_id.clone(),
             notify_rx,
             active_connections: 0,
-            last_disconnect: std::time::Instant::now() - std::time::Duration::from_secs(IDLE_THRESHOLD_SECS + 1),
+            last_disconnect: std::time::Instant::now()
+                - std::time::Duration::from_secs(IDLE_THRESHOLD_SECS + 1),
             hwnd_raw: 0,
             icon_normal_raw: 0, // set after icon is loaded
             icon_active_raw: icon_active.0 as isize,
@@ -368,7 +373,7 @@ mod win32_tray {
             let hinstance = GetModuleHandleW(None)?;
 
             // Register window class
-            let class_name = w!("rsh_tray_class");
+            let class_name = w!("mrsh_tray_class");
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(tray_wndproc),
                 hInstance: hinstance.into(),
@@ -381,9 +386,12 @@ mod win32_tray {
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 class_name,
-                w!("rsh tray"),
+                w!("mrsh tray"),
                 WINDOW_STYLE::default(),
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 Some(HWND_MESSAGE),
                 None,
                 Some(hinstance.into()),
@@ -393,8 +401,8 @@ mod win32_tray {
             // Create tray icon — load embedded icon from exe resource (winres),
             // fall back to generic application icon if not embedded.
             let hicon = {
-                use windows::Win32::UI::WindowsAndMessaging::LoadImageW;
                 use windows::Win32::Foundation::HINSTANCE;
+                use windows::Win32::UI::WindowsAndMessaging::LoadImageW;
                 // winres embeds icon as MAKEINTRESOURCE(1) — integer ID, not string.
                 // MAKEINTRESOURCE(1) = pointer with value 1 (low word = resource ID).
                 let res_id = windows::core::PCWSTR(1 as *const u16);
@@ -402,7 +410,8 @@ mod win32_tray {
                     Some(HINSTANCE(hinstance.0)),
                     res_id,
                     windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
-                    0, 0,
+                    0,
+                    0,
                     windows::Win32::UI::WindowsAndMessaging::LR_DEFAULTSIZE,
                 );
                 match exe_icon {
@@ -413,7 +422,12 @@ mod win32_tray {
             let tip_text = if device_id.is_empty() {
                 format!("mrsh v{} (port {})", env!("CARGO_PKG_VERSION"), port)
             } else {
-                format!("mrsh v{} (port {}) ID:{}", env!("CARGO_PKG_VERSION"), port, device_id)
+                format!(
+                    "mrsh v{} (port {}) ID:{}",
+                    env!("CARGO_PKG_VERSION"),
+                    port,
+                    device_id
+                )
             };
             let tooltip = str_to_wide_buf::<128>(&tip_text);
 
@@ -458,7 +472,11 @@ mod win32_tray {
 
 /// Run the system tray icon (blocks the current thread).
 #[cfg(target_os = "windows")]
-pub fn run_tray(cancel: tokio_util::sync::CancellationToken, port: u16, device_id: String) -> anyhow::Result<()> {
+pub fn run_tray(
+    cancel: tokio_util::sync::CancellationToken,
+    port: u16,
+    device_id: String,
+) -> anyhow::Result<()> {
     win32_tray::run(cancel, port, device_id)
 }
 
@@ -470,7 +488,7 @@ fn show_balloon(message: &str) {
         [void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms")
         $n = New-Object System.Windows.Forms.NotifyIcon
         $n.Icon = [System.Drawing.SystemIcons]::Information
-        $n.BalloonTipTitle = "rsh"
+        $n.BalloonTipTitle = "mrsh"
         $n.BalloonTipText = "{}"
         $n.Visible = $true
         $n.ShowBalloonTip(5000)
@@ -479,24 +497,25 @@ fn show_balloon(message: &str) {
         "#,
         message.replace('"', "'")
     );
+    use crate::win_proc::HideWindow;
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .hide_window()
         .spawn();
 }
 
-/// Open the mrsh log file (rsh.log) in the default text editor.
+/// Open the mrsh log file (audit-tray.log) in the default text editor.
 #[cfg(target_os = "windows")]
 fn open_log_file() {
     let data_dir = find_data_dir();
-    let log_path = data_dir.join("rsh.log");
+    let log_path = data_dir.join("audit-tray.log");
     let target = if log_path.exists() {
         log_path
     } else {
         data_dir
     };
-    let _ = std::process::Command::new("explorer")
-        .arg(target)
-        .spawn();
+    use crate::win_proc::HideWindow;
+    let _ = std::process::Command::new("explorer").arg(target).hide_window().spawn();
 }
 
 /// Locate the mrsh data directory.
@@ -513,7 +532,11 @@ fn find_data_dir() -> std::path::PathBuf {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn run_tray(_cancel: tokio_util::sync::CancellationToken, _port: u16, _device_id: String) -> anyhow::Result<()> {
+pub fn run_tray(
+    _cancel: tokio_util::sync::CancellationToken,
+    _port: u16,
+    _device_id: String,
+) -> anyhow::Result<()> {
     anyhow::bail!("system tray not available on this platform")
 }
 
@@ -593,7 +616,11 @@ mod tests {
 
     #[test]
     fn tray_action_all_variants() {
-        let actions = [TrayAction::ShowStatus, TrayAction::OpenLog, TrayAction::Quit];
+        let actions = [
+            TrayAction::ShowStatus,
+            TrayAction::OpenLog,
+            TrayAction::Quit,
+        ];
         // All variants are distinct
         assert_ne!(actions[0], actions[1]);
         assert_ne!(actions[1], actions[2]);

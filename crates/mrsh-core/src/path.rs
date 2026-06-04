@@ -67,7 +67,7 @@ mod tests {
     fn msys_drive_path() {
         assert_eq!(normalize("/c/Users/user"), "C:/Users/user");
         assert_eq!(normalize("/d/Data"), "D:/Data");
-        assert_eq!(normalize("/s/Projects"), "/path/to");
+        assert_eq!(normalize("/s/Projects"), "S:/Projects");
     }
 
     #[test]
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn wsl_mnt_path() {
         assert_eq!(normalize("/mnt/c/Users/user"), "C:/Users/user");
-        assert_eq!(normalize("/path/to"), "/path/to");
+        assert_eq!(normalize("/mnt/s/Projects"), "S:/Projects");
     }
 
     #[test]
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn already_native() {
         assert_eq!(normalize("C:/Users/user"), "C:/Users/user");
-        assert_eq!(normalize("/path/to/file.txt"), "/path/to/file.txt");
+        assert_eq!(normalize("S:/Projects/file.txt"), "S:/Projects/file.txt");
     }
 
     #[test]

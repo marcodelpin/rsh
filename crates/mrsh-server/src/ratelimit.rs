@@ -45,9 +45,10 @@ impl AuthRateLimiter {
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
         let records = self.records.lock().unwrap();
         if let Some(record) = records.get(ip)
-            && let Some(until) = record.banned_until {
-                return Instant::now() < until;
-            }
+            && let Some(until) = record.banned_until
+        {
+            return Instant::now() < until;
+        }
         false
     }
 
@@ -106,9 +107,10 @@ impl AuthRateLimiter {
         records.retain(|_, record| {
             // Keep if banned and ban not expired
             if let Some(until) = record.banned_until
-                && now < until {
-                    return true;
-                }
+                && now < until
+            {
+                return true;
+            }
             // Keep if has recent failures
             record.failures.retain(|t| now.duration_since(*t) < WINDOW);
             !record.failures.is_empty()
@@ -174,5 +176,4 @@ mod tests {
         rl.cleanup();
         // Can't easily test time-based expiry in unit tests without mocking time
     }
-
 }

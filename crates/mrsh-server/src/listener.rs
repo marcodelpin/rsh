@@ -281,15 +281,30 @@ impl Drop for ConnectionPermit {
 
 /// Bind a TCP listener with `SO_REUSEADDR` so we can rebind over zombie sockets
 /// left behind by a crashed process (Windows doesn't auto-clean TIME_WAIT/orphaned sockets).
-/// Uses dual-stack (IPv6 `[::]`) when addr is unspecified, falling back to IPv4 if needed.
+///
+/// Address selection when addr is unspecified (rsh-u62):
+/// - Linux/macOS: IPv6 `[::]` with dual-stack (accepts IPv4-mapped) — works reliably
+/// - Windows: prefer IPv4 `0.0.0.0` to avoid IPV6_V6ONLY quirk on Win10 LTSC/2016/2019
+///   where dual-stack bind succeeds but rejects IPv4 connections silently. Operators
+///   who want IPv6 must specify `[::]:PORT` explicitly.
 async fn bind_reusable(addr: SocketAddr) -> io::Result<TcpListener> {
-    // Try IPv6 dual-stack first (accepts both IPv4 and IPv6 connections)
     if addr.ip().is_unspecified() {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows: bind IPv4 first (more reliable than dual-stack on older Windows)
+            let v4_addr: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, addr.port()).into();
+            if let Ok(listener) = bind_reusable_inner(v4_addr, socket2::Domain::IPV4, false) {
+                return Ok(listener);
+            }
+            // Fall back to IPv6 dual-stack
+        }
+
+        // Linux/macOS or Windows fallback: IPv6 dual-stack
         let v6_addr: SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, addr.port()).into();
         if let Ok(listener) = bind_reusable_inner(v6_addr, socket2::Domain::IPV6, true) {
             return Ok(listener);
         }
-        // Fall back to IPv4-only
+        // Final fallback: IPv4 only
     }
 
     let domain = match addr {
@@ -304,11 +319,7 @@ fn bind_reusable_inner(
     domain: socket2::Domain,
     dual_stack: bool,
 ) -> io::Result<TcpListener> {
-    let socket = socket2::Socket::new(
-        domain,
-        socket2::Type::STREAM,
-        Some(socket2::Protocol::TCP),
-    )?;
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     if dual_stack {
@@ -523,7 +534,10 @@ pub async fn run_stream_listener(
         let permit = match conn_limiter.try_acquire(peer.ip()) {
             Some(p) => p,
             None => {
-                warn!("stream connection limit reached for {}, rejecting", peer.ip());
+                warn!(
+                    "stream connection limit reached for {}, rejecting",
+                    peer.ip()
+                );
                 continue;
             }
         };
@@ -611,7 +625,11 @@ pub async fn run_server(
         "server running: command={}, stream={}{}",
         command_addr,
         stream_addr,
-        if cfg!(feature = "quic") { ", quic=enabled" } else { "" }
+        if cfg!(feature = "quic") {
+            ", quic=enabled"
+        } else {
+            ""
+        }
     );
 
     // Wait for all listeners to finish (they exit on cancel)
@@ -659,6 +677,8 @@ mod tests {
             totp_secrets: vec![],
             totp_recovery_path: None,
             server_key_path: None,
+            device_id: None,
+            rendezvous_server: None,
             authorized_keys_paths: vec![],
         });
 
@@ -846,10 +866,16 @@ mod tests {
 
         // Both ports must still be functional
         let cmd_conn = TcpStream::connect(format!("127.0.0.1:{}", port)).await;
-        assert!(cmd_conn.is_ok(), "command port must survive non-TLS connections");
+        assert!(
+            cmd_conn.is_ok(),
+            "command port must survive non-TLS connections"
+        );
 
         let stream_conn = TcpStream::connect(format!("127.0.0.1:{}", port + 1)).await;
-        assert!(stream_conn.is_ok(), "stream port must be unaffected by command port abuse");
+        assert!(
+            stream_conn.is_ok(),
+            "stream port must be unaffected by command port abuse"
+        );
 
         // TLS handshake on command port still works
         let client_config = tls::client_config();
@@ -859,7 +885,10 @@ mod tests {
             .unwrap();
         let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
         let tls_result = connector.connect(server_name, tcp).await;
-        assert!(tls_result.is_ok(), "TLS must still work after non-TLS abuse");
+        assert!(
+            tls_result.is_ok(),
+            "TLS must still work after non-TLS abuse"
+        );
 
         cancel.cancel();
         let result = handle.await.unwrap();
@@ -924,10 +953,8 @@ mod tests {
 
     #[test]
     fn ip_acl_allowlist_blocks_unlisted() {
-        let acl = IpAccessControl::new(
-            &["192.168.1.0/24".to_string(), "10.0.0.5".to_string()],
-            &[],
-        );
+        let acl =
+            IpAccessControl::new(&["192.168.1.0/24".to_string(), "10.0.0.5".to_string()], &[]);
         assert!(acl.is_allowed("192.168.1.100".parse().unwrap()));
         assert!(acl.is_allowed("10.0.0.5".parse().unwrap()));
         assert!(!acl.is_allowed("10.0.0.6".parse().unwrap()));
@@ -936,10 +963,8 @@ mod tests {
 
     #[test]
     fn ip_acl_denylist_blocks_listed() {
-        let acl = IpAccessControl::new(
-            &[],
-            &["10.0.0.0/8".to_string(), "192.168.1.99".to_string()],
-        );
+        let acl =
+            IpAccessControl::new(&[], &["10.0.0.0/8".to_string(), "192.168.1.99".to_string()]);
         assert!(!acl.is_allowed("10.0.0.1".parse().unwrap()));
         assert!(!acl.is_allowed("10.255.255.255".parse().unwrap()));
         assert!(!acl.is_allowed("192.168.1.99".parse().unwrap()));
@@ -950,20 +975,14 @@ mod tests {
     #[test]
     fn ip_acl_deny_takes_precedence() {
         // IP is in both allow and deny — deny wins
-        let acl = IpAccessControl::new(
-            &["10.0.0.0/8".to_string()],
-            &["10.0.0.5".to_string()],
-        );
+        let acl = IpAccessControl::new(&["10.0.0.0/8".to_string()], &["10.0.0.5".to_string()]);
         assert!(acl.is_allowed("10.0.0.1".parse().unwrap()));
         assert!(!acl.is_allowed("10.0.0.5".parse().unwrap())); // deny wins
     }
 
     #[test]
     fn ip_acl_cidr_ipv6() {
-        let acl = IpAccessControl::new(
-            &["fd00::/8".to_string()],
-            &[],
-        );
+        let acl = IpAccessControl::new(&["fd00::/8".to_string()], &[]);
         assert!(acl.is_allowed("fd00::1".parse().unwrap()));
         assert!(acl.is_allowed("fdff::1".parse().unwrap()));
         assert!(!acl.is_allowed("fe80::1".parse().unwrap()));
@@ -995,7 +1014,11 @@ mod tests {
         for i in 0..4 {
             let ip: IpAddr = format!("10.0.0.{}", i + 1).parse().unwrap();
             let permit = limiter.try_acquire(ip);
-            assert!(permit.is_some(), "connection {} should be accepted below start threshold", i);
+            assert!(
+                permit.is_some(),
+                "connection {} should be accepted below start threshold",
+                i
+            );
             permits.push(permit.unwrap());
         }
     }
@@ -1038,7 +1061,10 @@ mod tests {
                 break;
             }
         }
-        assert!(all_rejected, "at full threshold, all connections should be rejected");
+        assert!(
+            all_rejected,
+            "at full threshold, all connections should be rejected"
+        );
     }
 
     #[test]
@@ -1068,8 +1094,16 @@ mod tests {
         }
         // With 50% rate at 0 connections, we expect roughly half accepted
         // Allow wide margin for randomness
-        assert!(accepted > 10, "should accept some connections (got {})", accepted);
-        assert!(rejected > 10, "should reject some connections (got {})", rejected);
+        assert!(
+            accepted > 10,
+            "should accept some connections (got {})",
+            accepted
+        );
+        assert!(
+            rejected > 10,
+            "should reject some connections (got {})",
+            rejected
+        );
     }
 
     #[test]

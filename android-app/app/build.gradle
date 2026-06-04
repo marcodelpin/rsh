@@ -1,0 +1,91 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'it.mdp.mrsh'
+    compileSdk 35
+
+    // AGP 7+ requires explicit opt-in for AIDL compilation. Needed for
+    // src/main/aidl/it/mdp/mrsh/IUserService.aidl (rsh-a88j Shizuku bridge).
+    buildFeatures {
+        aidl true
+        buildConfig true
+    }
+
+    // Reuse fleet keystore convention (mdp-updater pattern).
+    // Path search: env MDP_DEBUG_KEYSTORE → ~/.android/mdp-keystore.keystore → debug.keystore
+    signingConfigs {
+        debug {
+            def ksFromEnv = System.getenv("MDP_DEBUG_KEYSTORE")
+            def ksHome = "${System.getProperty('user.home')}/.android/mdp-keystore.keystore"
+            def ksDefault = "${System.getProperty('user.home')}/.android/debug.keystore"
+            def ksPath = ksFromEnv ?: (file(ksHome).exists() ? ksHome : ksDefault)
+            storeFile file(ksPath)
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+
+    defaultConfig {
+        applicationId "it.mdp.mrsh"
+        minSdk 26
+        targetSdk 30       // API 30 required for MANAGE_EXTERNAL_STORAGE manifest declaration + ACTION_MANAGE_APP_ALL_FILES_ACCESS intent (rsh-viro); FGS rules still permissive until API 31
+        versionCode 15
+        versionName "0.1.14"
+        ndk {
+            // arm64-v8a: M20, HU K706, GPU Android emulators
+            // armeabi-v7a: Galaxy Note 3 (hlte) LineageOS 18.1 (rsh-a88j F3 enable)
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+        debug {
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // jniLibs/arm64-v8a/libmrsh.so is the cross-compiled aarch64-linux-android mrsh binary
+    // renamed with lib*.so prefix/suffix so the APK installer places it in nativeLibraryDir
+    // (the only path on Android Q+ that bypasses W^X exec restrictions).
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    // Prevent the build system from stripping debug symbols from the embedded binary
+    // (it is already stripped by the Rust cross-compile pipeline; we just don't want re-strip).
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+            keepDebugSymbols += ['*/arm64-v8a/libmrsh.so', '*/armeabi-v7a/libmrsh.so']
+        }
+    }
+}
+
+dependencies {
+    // Shizuku SDK — optional binder bridge for shell-uid ops (silent APK install,
+    // input injection, dumpsys cross-app) on phones where the Shizuku service is
+    // running (rooted via Magisk OR ADB-started via Wireless Debugging Android 11+).
+    // bd: rsh-a88j (absorb-D). Falls back to PackageInstaller user-prompt path
+    // when Shizuku is absent.
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+}

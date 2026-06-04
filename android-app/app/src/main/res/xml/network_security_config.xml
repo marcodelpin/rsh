@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network security config — allow cleartext HTTP for internal .mdp / .omni
+  fleet domains. Public internet stays HTTPS-only.
+  bd: rsh-crxd (absorb-F HTTP endpoint).
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">mdp</domain>
+        <domain includeSubdomains="true">omni</domain>
+        <domain includeSubdomains="true">local</domain>
+        <domain includeSubdomains="true">192.0.2.0/24</domain>
+        <domain includeSubdomains="true">192.168.20.0/24</domain>
+        <domain includeSubdomains="true">10.99.0.0/16</domain>
+        <domain includeSubdomains="true">10.47.0.0/16</domain>
+        <domain includeSubdomains="true">100.64.0.0/10</domain>
+        <domain includeSubdomains="true">169.254.0.0/16</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

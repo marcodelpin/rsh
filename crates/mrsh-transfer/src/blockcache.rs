@@ -486,7 +486,10 @@ mod tests {
 
         // Re-index must fail — file no longer exists.
         let result = cache.index_file(test_file.to_str().unwrap());
-        assert!(result.is_err(), "index_file must fail for deleted file, not return stale cache");
+        assert!(
+            result.is_err(),
+            "index_file must fail for deleted file, not return stale cache"
+        );
     }
 
     /// Index file → modify content (same name) → re-index detects change.
@@ -502,7 +505,10 @@ mod tests {
         std::fs::write(&test_file, vec![0x02u8; 6000]).unwrap();
 
         let info2 = cache.index_file(test_file.to_str().unwrap()).unwrap();
-        assert_ne!(info1.content_hash, info2.content_hash, "content hash must change after modification");
+        assert_ne!(
+            info1.content_hash, info2.content_hash,
+            "content hash must change after modification"
+        );
         assert_eq!(info2.size, 6000);
     }
 

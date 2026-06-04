@@ -4,7 +4,7 @@
 use mrsh_core::protocol::{self, Response};
 use tracing::debug;
 
-use crate::{exec, exec_user, fileops, gui, screenshot, selfupdate, session, sync};
+use crate::{exec, exec_user, fileops, gui, screenshot, selfupdate, service, session, sync};
 
 /// Result of dispatching a request.
 pub enum DispatchResult {
@@ -146,10 +146,71 @@ pub async fn dispatch(
             let path = match req.path.as_deref() {
                 Some(p) => p,
                 None => {
-                    return DispatchResult::Response(Response::error("missing path for self-update"));
+                    return DispatchResult::Response(Response::error(
+                        "missing path for self-update",
+                    ));
                 }
             };
             DispatchResult::Response(selfupdate::handle_self_update(path))
+        }
+
+        // rsh-5264.6: operator-triggered pull. Server fetches the latest
+        // signed binary from rdv (which the operator pre-published via
+        // `mrsh rdv publish`), verifies signature, then invokes the standard
+        // swap flow. Sibling of "self-update" (direct-push) — both share the
+        // `allow_self_update` permission gate.
+        "self-update-from-rdv" => {
+            let track = req.track.clone().unwrap_or_default();
+            let version_pin = req.version.clone();
+            let allow_downgrade = req.allow_downgrade.unwrap_or(false);
+            let insecure_no_verify = req.insecure_no_verify.unwrap_or(false);
+            DispatchResult::Response(
+                selfupdate::handle_self_update_from_rdv(
+                    track,
+                    version_pin,
+                    allow_downgrade,
+                    insecure_no_verify,
+                )
+                .await,
+            )
+        }
+
+        // Launch tray in user session (from service context)
+        "tray-start" => {
+            #[cfg(target_os = "windows")]
+            {
+                let exe = std::env::current_exe()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                service::ensure_tray_task(&exe);
+                // Check if tray is now running
+                use crate::win_proc::HideWindow;
+                let check = std::process::Command::new("tasklist")
+                    .args(["/fi", "imagename eq mrsh.exe", "/fo", "csv", "/nh"])
+                    .hide_window()
+                    .output();
+                let tray_count = check
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .filter(|l| l.contains("mrsh.exe"))
+                            .count()
+                    })
+                    .unwrap_or(0);
+                // >1 means service + tray are both running
+                if tray_count > 1 {
+                    DispatchResult::Response(Response::ok(Some("tray started".to_string())))
+                } else {
+                    DispatchResult::Response(Response::error(
+                        "tray task launched but tray not detected yet (may take a few seconds)",
+                    ))
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                DispatchResult::Response(Response::error("tray-start is Windows-only"))
+            }
         }
 
         // Client sends Command="mouse move 500 300" as single string
@@ -312,7 +373,6 @@ async fn handle_native_command(cmd: &str, args: &[&str]) -> Response {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +392,10 @@ mod tests {
             paths: None,
             batch_patches: None,
             env_vars: None,
+            track: None,
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
         }
     }
 
@@ -490,12 +554,12 @@ mod tests {
         // Client sends Command="mouse pos" as single string
         let mut req = make_request("input");
         req.command = Some("mouse pos".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         // On non-Windows: error about platform, but should parse correctly
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
-            assert!(resp.error.unwrap().contains("not available"));
+            assert!(!_resp.success);
+            assert!(_resp.error.unwrap().contains("not available"));
         }
     }
 
@@ -515,11 +579,11 @@ mod tests {
     async fn input_keyboard_command_format() {
         let mut req = make_request("input");
         req.command = Some("key type hello".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
-            assert!(resp.error.unwrap().contains("not available"));
+            assert!(!_resp.success);
+            assert!(_resp.error.unwrap().contains("not available"));
         }
     }
 
@@ -528,11 +592,11 @@ mod tests {
     async fn input_window_command_format() {
         let mut req = make_request("input");
         req.command = Some("window list".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
-            assert!(resp.error.unwrap().contains("not available"));
+            assert!(!_resp.success);
+            assert!(_resp.error.unwrap().contains("not available"));
         }
     }
 
@@ -541,11 +605,11 @@ mod tests {
     async fn input_mouse_drag_format() {
         let mut req = make_request("input");
         req.command = Some("mouse drag 100 200 300 400".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
-            assert!(resp.error.unwrap().contains("not available"));
+            assert!(!_resp.success);
+            assert!(_resp.error.unwrap().contains("not available"));
         }
     }
 
@@ -554,11 +618,11 @@ mod tests {
     async fn native_info_command() {
         let mut req = make_request("native");
         req.command = Some("info".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         // On Linux: native commands delegate to exec (PowerShell) which fails
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
+            assert!(!_resp.success);
         }
     }
 
@@ -567,11 +631,11 @@ mod tests {
     async fn native_ps_command() {
         let mut req = make_request("native");
         req.command = Some("ps".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         // On Linux: native commands delegate to exec (PowerShell) which fails
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
+            assert!(!_resp.success);
         }
     }
 
@@ -580,16 +644,14 @@ mod tests {
     async fn exec_dispatches_command() {
         let mut req = make_request("exec");
         req.command = Some("echo test".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         // On Linux: powershell not available, but dispatch happens
         // On Windows: would execute powershell
         #[cfg(not(target_os = "windows"))]
         {
             // exec uses powershell -NoProfile -Command, which doesn't exist on Linux
             // but the dispatch itself should happen (not "unknown type")
-            assert!(
-                !resp.error.as_deref().unwrap_or("").contains("unknown")
-            );
+            assert!(!_resp.error.as_deref().unwrap_or("").contains("unknown"));
         }
     }
 
@@ -691,7 +753,10 @@ mod tests {
         req.path = Some("".to_string()); // empty string
         match dispatch(&req, &store).await {
             DispatchResult::Hijack(HijackAction::ShellPersistent { session_id, .. }) => {
-                assert!(session_id.is_none(), "empty session_id should be filtered to None");
+                assert!(
+                    session_id.is_none(),
+                    "empty session_id should be filtered to None"
+                );
             }
             _ => panic!("expected Hijack::ShellPersistent"),
         }
@@ -907,7 +972,13 @@ mod tests {
         req.command = Some("whoami".to_string());
         let resp = handle_request(&req).await;
         // On non-Windows: may fail but should NOT be "unknown command"
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown command")
+        );
     }
 
     // --- input with extra args passed through ---
@@ -916,13 +987,13 @@ mod tests {
     async fn input_args_joined() {
         let mut req = make_request("input");
         req.command = Some("mouse move 500 300".to_string());
-        let resp = handle_request(&req).await;
+        let _resp = handle_request(&req).await;
         // Dispatched to gui::handle_input("mouse", "move", "500 300")
         // On non-Windows: error about platform
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(!resp.success);
-            assert!(resp.error.unwrap().contains("not available"));
+            assert!(!_resp.success);
+            assert!(_resp.error.unwrap().contains("not available"));
         }
     }
 
@@ -934,7 +1005,13 @@ mod tests {
         req.command = Some("clip-get".to_string());
         let resp = handle_request(&req).await;
         // Should dispatch (not unknown native command)
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown native")
+        );
     }
 
     // --- native clip-set dispatches with args ---
@@ -944,7 +1021,13 @@ mod tests {
         let mut req = make_request("native");
         req.command = Some("clip-set hello world".to_string());
         let resp = handle_request(&req).await;
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown native")
+        );
     }
 
     // --- native tail dispatches ---
@@ -954,7 +1037,13 @@ mod tests {
         let mut req = make_request("native");
         req.command = Some("tail C:/some/file.log 50".to_string());
         let resp = handle_request(&req).await;
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown native"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown native")
+        );
     }
 
     // --- dispatch ping directly via dispatch() ---
@@ -985,7 +1074,11 @@ mod tests {
         match dispatch(&req, &store).await {
             DispatchResult::Response(resp) => {
                 assert!(!resp.success);
-                assert!(resp.error.unwrap().contains("unknown command: totally-invalid"));
+                assert!(
+                    resp.error
+                        .unwrap()
+                        .contains("unknown command: totally-invalid")
+                );
             }
             _ => panic!("expected Response for unknown"),
         }
@@ -1009,7 +1102,13 @@ mod tests {
         // command is None → defaults to ""
         let resp = handle_request(&req).await;
         // Should dispatch (not unknown), might succeed or fail depending on platform
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown command")
+        );
     }
 
     // --- exec with env_vars ---
@@ -1020,7 +1119,13 @@ mod tests {
         req.command = Some("echo test".to_string());
         req.env_vars = Some(vec!["MY_VAR=hello".to_string()]);
         let resp = handle_request(&req).await;
-        assert!(!resp.error.as_deref().unwrap_or("").contains("unknown command"));
+        assert!(
+            !resp
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown command")
+        );
     }
 
     // --- native kill with valid-looking pid dispatches ---

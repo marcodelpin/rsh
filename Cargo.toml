@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.9.9"
+version = "1.10.55"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/marcodelpin/mrsh"
@@ -38,7 +38,7 @@ ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 rand = "0.8"
 sha2 = "0.10"
 md-5 = "0.10"
-totp-rs = { version = "5.7", features = ["gen_secret"] }
+totp-rs = { version = "5.7", features = ["gen_secret", "otpauth"] }
 
 # Protobuf
 prost = "0.13"
@@ -74,6 +74,10 @@ mrsh-client = { path = "crates/mrsh-client" }
 name = "mrsh"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "mrsh"
+path = "src/lib.rs"
 
 [[bin]]
 name = "mrsh"
@@ -129,9 +133,15 @@ read-only = ["no-exec", "no-shell"]
 tempfile = "3"
 mrsh-transfer.workspace = true
 mrsh-relay.workspace = true
+rustls = { version = "0.23", features = ["ring"] }
+blake3 = "1"
+
+[[example]]
+name = "fs_demo"
+path = "examples/fs_demo.rs"
 
 [build-dependencies]
-winres = "0.1"
+embed-resource = "3"
 
 [profile.release]
 lto = true

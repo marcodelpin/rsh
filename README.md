@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#features">Features</a> &middot;
+  <a href="#production-install">Install</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
   <a href="#usage">Usage</a> &middot;
   <a href="#building">Building</a> &middot;
@@ -50,6 +51,50 @@ Because `ssh` was designed in 1995 when "fleet management" meant horses, and the
 | **Config** | SSH-style config file, Ratatui TUI editor, TUI host picker (fuzzy search), auto-DeviceID, `--log-file` |
 | **SSH** | Transparent SSH fallback, SFTP, agent forwarding (`-A`), local/reverse port forwarding (`-L`/`-R`) |
 | **Security** | Per-key permissions (no-exec, no-gui, no-reboot, no-clipboard, no-screenshot), rate limiting |
+
+## Production Install
+
+No source checkout required. Downloads the pre-built binary, verifies the checksum, and places it in `/usr/local/bin/mrsh`.
+
+### Linux (x86\_64 · aarch64 · musl)
+
+```bash
+# Latest release (auto-detects glibc vs musl, x86_64 vs aarch64)
+curl -fsSL http://git.example.local/privati/remote-tools/raw/branch/master/scripts/mrsh-install.sh | bash
+
+# Pin a version, custom install dir (no sudo)
+VERSION=v1.10.49 MRSH_INSTALL_DIR=~/.local/bin \
+  bash <(curl -fsSL http://git.example.local/privati/remote-tools/raw/branch/master/scripts/mrsh-install.sh)
+```
+
+The script: detects platform → downloads binary + `.sha256` from the Forgejo release →
+verifies checksum (aborts on mismatch) → installs to `MRSH_INSTALL_DIR/mrsh`.
+
+### Windows
+
+```powershell
+# Download and install mrsh.exe from the latest release
+$tag  = (Invoke-RestMethod 'http://git.example.local/api/v1/repos/privati/remote-tools/releases?limit=1')[0].tag_name
+$base = "http://git.example.local/privati/remote-tools/releases/download/$tag"
+Invoke-WebRequest "$base/mrsh.exe" -OutFile "$env:TEMP\mrsh.exe"
+# Verify: compare hash with mrsh.exe.sha256 from the same release page
+New-Item -ItemType Directory -Force 'C:\ProgramData\mrsh'
+Copy-Item "$env:TEMP\mrsh.exe" 'C:\ProgramData\mrsh\mrsh.exe'
+& 'C:\ProgramData\mrsh\mrsh.exe' --install
+Start-Service mrsh
+```
+
+### Release artifacts
+
+Each release at `http://git.example.local/privati/remote-tools/releases` includes:
+
+| File | Platform |
+|------|----------|
+| `mrsh.exe` | Windows x64 (MSVC, Win10+) |
+| `mrsh-linux` | Linux x86\_64 (glibc 2.17+) |
+| `mrsh-linux-aarch64` | Linux ARM64 |
+| `mrsh-linux-musl` | Linux x86\_64 static (musl — Alpine, containers) |
+| `*.sha256` | Checksum file for each binary |
 
 ## Quick Start
 
@@ -108,6 +153,12 @@ mrsh -h host --delete push ./src C:\app\src
 
 # Bandwidth limit
 mrsh -h host --bwlimit 1024 push ./large-file.bin C:\data\
+
+# Relay-backed batch upload via one shared SOCKS5 proxy
+mrsh -h relay push-via-batch ./export ftp://user:pass@host/path/ --include '*.tif' --parallel 4
+
+# Relay-backed batch download from a manifest (local file or URL)
+mrsh -h relay pull-via-batch ftp://user:pass@host/path/ ./import --manifest files.jsonl --resume
 ```
 
 ### Shell Sessions

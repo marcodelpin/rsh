@@ -100,21 +100,19 @@ mod win {
     use anyhow::{Context, Result};
     use tracing::debug;
 
-    use windows::core::BOOL;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        DuplicateTokenEx, SecurityImpersonation, TokenPrimary, SECURITY_ATTRIBUTES,
-        TOKEN_ALL_ACCESS,
+        DuplicateTokenEx, SECURITY_ATTRIBUTES, SecurityImpersonation, TOKEN_ALL_ACCESS,
+        TokenPrimary,
     };
     use windows::Win32::System::Pipes::CreatePipe;
-    use windows::Win32::System::RemoteDesktop::{
-        WTSGetActiveConsoleSessionId, WTSQueryUserToken,
-    };
+    use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
     use windows::Win32::System::Threading::{
-        CreateProcessAsUserW, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW,
-        PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
+        CREATE_NO_WINDOW, CreateProcessAsUserW, GetExitCodeProcess, PROCESS_INFORMATION,
+        STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
     };
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::core::BOOL;
 
     /// Execute a command in the logged-in user's desktop session with hidden window.
     /// Returns (combined stdout+stderr output, success).
@@ -172,15 +170,8 @@ mod win {
         // Stdin pipe: child gets immediate EOF
         let mut stdin_read = HANDLE::default();
         let mut stdin_write = HANDLE::default();
-        unsafe {
-            CreatePipe(
-                &mut stdin_read,
-                &mut stdin_write,
-                Some(&sa as *const _),
-                0,
-            )
-        }
-        .context("CreatePipe stdin")?;
+        unsafe { CreatePipe(&mut stdin_read, &mut stdin_write, Some(&sa as *const _), 0) }
+            .context("CreatePipe stdin")?;
         let _ = unsafe { CloseHandle(stdin_write) }; // child reads EOF immediately
 
         // 5. Build PowerShell command line (with env vars prepended)

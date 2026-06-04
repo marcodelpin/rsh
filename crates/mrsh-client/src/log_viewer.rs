@@ -9,16 +9,16 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, TableState},
-    Frame, Terminal,
 };
 
 use crate::session_log::{self, HostSummary, LogEntry, LogFilter};
@@ -34,6 +34,7 @@ enum View {
 // ── Application state ───────────────────────────────────────────
 
 struct App {
+    #[allow(dead_code)]
     log_dir: PathBuf,
     all_entries: Vec<LogEntry>,
     filtered: Vec<usize>, // indices into all_entries
@@ -80,11 +81,7 @@ impl App {
                 let e = &self.all_entries[i];
                 e.host.to_lowercase().contains(&q)
                     || e.cmd.to_lowercase().contains(&q)
-                    || e.args
-                        .as_deref()
-                        .unwrap_or("")
-                        .to_lowercase()
-                        .contains(&q)
+                    || e.args.as_deref().unwrap_or("").to_lowercase().contains(&q)
             })
             .collect();
 
@@ -156,10 +153,7 @@ impl App {
 pub fn run_log_viewer() -> io::Result<()> {
     let log_dir = session_log::default_log_dir();
     if !log_dir.exists() {
-        eprintln!(
-            "No session logs found at {}",
-            log_dir.display()
-        );
+        eprintln!("No session logs found at {}", log_dir.display());
         return Ok(());
     }
 
@@ -197,9 +191,7 @@ fn run_loop(
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && key.code == KeyCode::Char('c')
-            {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                 return Ok(());
             }
             match key.code {
@@ -231,7 +223,7 @@ fn run_loop(
 fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
         Constraint::Length(3), // filter bar
-        Constraint::Min(5),   // table
+        Constraint::Min(5),    // table
         Constraint::Length(1), // footer
     ])
     .split(f.area());
@@ -327,7 +319,11 @@ fn draw_entries(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
     let header = Row::new(vec![
-        "Host", "Commands", "Total Time", "First Seen", "Last Seen",
+        "Host",
+        "Commands",
+        "Total Time",
+        "First Seen",
+        "Last Seen",
     ])
     .style(
         Style::default()
@@ -406,7 +402,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn sample_entries() -> Vec<LogEntry> {
         vec![

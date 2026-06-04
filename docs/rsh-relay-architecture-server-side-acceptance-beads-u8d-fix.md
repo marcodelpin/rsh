@@ -2,7 +2,7 @@
 
 <!-- Added via KB MCP -->
 *Created: 2026-03-13 14:34*
-*Scope: project:/path/to/00-09_System/worktrees/remote-tools/rsh*
+*Scope: project:/path/to/repo*
 
 ## Problem
 

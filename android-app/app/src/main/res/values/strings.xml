@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">mrsh</string>
+    <string name="accessibility_service_description">mrsh-android automation bridge: enables programmatic tap/swipe, text-input, find-by-text, and silent screenshot via the AccessibilityService API. Use only if you trust this app.</string>
+    <string name="accessibility_service_summary">Automate other apps via mrsh exec (tap, swipe, set text, screenshot).</string>
+</resources>

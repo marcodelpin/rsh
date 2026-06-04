@@ -78,11 +78,7 @@ pub fn parse_tunnel_spec(local_bind: &str, remote_target: &str) -> Result<(Strin
 /// Since "connect" hijacks the mrsh connection, this function handles exactly
 /// one tunneled connection per mrsh session. For multiple simultaneous tunnels,
 /// the caller should establish multiple mrsh connections.
-pub async fn run_tunnel<S>(
-    stream: &mut S,
-    local_bind: &str,
-    remote_target: &str,
-) -> Result<()>
+pub async fn run_tunnel<S>(stream: &mut S, local_bind: &str, remote_target: &str) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -92,15 +88,12 @@ where
 
     let local_addr = listener.local_addr().context("get local address")?;
     info!(
-        "tunnel listening on {} → forwarding to {} via rsh",
+        "tunnel listening on {} → forwarding to {} via mrsh",
         local_addr, remote_target
     );
 
     // Accept one connection (connect hijacks the stream)
-    let (local_stream, peer) = listener
-        .accept()
-        .await
-        .context("accept local connection")?;
+    let (local_stream, peer) = listener.accept().await.context("accept local connection")?;
     local_stream.set_nodelay(true).ok();
     info!("tunnel: accepted local connection from {}", peer);
 
@@ -118,6 +111,10 @@ where
         paths: None,
         batch_patches: None,
         env_vars: None,
+        track: None,
+        version: None,
+        allow_downgrade: None,
+        insecure_no_verify: None,
     };
     wire::send_json(stream, &connect_req)
         .await
@@ -134,7 +131,10 @@ where
         );
     }
 
-    info!("tunnel: server connected to {}, relaying traffic", remote_target);
+    info!(
+        "tunnel: server connected to {}, relaying traffic",
+        remote_target
+    );
 
     // Relay bidirectionally: local TCP ↔ mrsh wire protocol
     relay_tunnel(stream, local_stream).await?;
@@ -207,6 +207,10 @@ where
             paths: None,
             batch_patches: None,
             env_vars: None,
+            track: None,
+            version: None,
+            allow_downgrade: None,
+            insecure_no_verify: None,
         };
         if let Err(e) = wire::send_json(&mut stream, &connect_req).await {
             error!("tunnel: send connect: {}", e);
@@ -240,10 +244,7 @@ where
 /// - Local → rsh: read raw TCP bytes, send as length-prefixed frames
 /// - mrsh → Local: receive length-prefixed frames, write raw TCP bytes
 /// - Empty frame (length=0) signals EOF from either direction
-async fn relay_tunnel<S>(
-    rsh_stream: &mut S,
-    local_stream: TcpStream,
-) -> Result<()>
+async fn relay_tunnel<S>(rsh_stream: &mut S, local_stream: TcpStream) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -360,6 +361,10 @@ where
                         paths: None,
                         batch_patches: None,
                         env_vars: None,
+                        track: None,
+                        version: None,
+                        allow_downgrade: None,
+                        insecure_no_verify: None,
                     };
 
                     if let Err(e) = wire::send_json(&mut rsh_stream, &connect_req).await {
@@ -520,8 +525,14 @@ mod tests {
                 paths: None,
                 batch_patches: None,
                 env_vars: None,
+                track: None,
+                version: None,
+                allow_downgrade: None,
+                insecure_no_verify: None,
             };
-            wire::send_json(&mut mrsh_client, &connect_req).await.unwrap();
+            wire::send_json(&mut mrsh_client, &connect_req)
+                .await
+                .unwrap();
 
             let ack: protocol::Response = wire::recv_json(&mut mrsh_client).await.unwrap();
             assert!(ack.success);
@@ -546,13 +557,10 @@ mod tests {
         drop(local_conn);
 
         // Wait for tunnel and server to finish
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                tunnel_handle.await.unwrap();
-                server_handle.await.unwrap();
-            },
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tunnel_handle.await.unwrap();
+            server_handle.await.unwrap();
+        })
         .await;
     }
 
@@ -600,8 +608,14 @@ mod tests {
                 paths: None,
                 batch_patches: None,
                 env_vars: None,
+                track: None,
+                version: None,
+                allow_downgrade: None,
+                insecure_no_verify: None,
             };
-            wire::send_json(&mut mrsh_client, &connect_req).await.unwrap();
+            wire::send_json(&mut mrsh_client, &connect_req)
+                .await
+                .unwrap();
 
             let ack: protocol::Response = wire::recv_json(&mut mrsh_client).await.unwrap();
             assert!(ack.success);
@@ -617,13 +631,10 @@ mod tests {
         let n = local_conn.read(&mut buf).await.unwrap();
         assert_eq!(n, 0, "expected EOF from local connection");
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                tunnel_handle.await.unwrap();
-                server_handle.await.unwrap();
-            },
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tunnel_handle.await.unwrap();
+            server_handle.await.unwrap();
+        })
         .await;
     }
 
@@ -666,8 +677,14 @@ mod tests {
                 paths: None,
                 batch_patches: None,
                 env_vars: None,
+                track: None,
+                version: None,
+                allow_downgrade: None,
+                insecure_no_verify: None,
             };
-            wire::send_json(&mut mrsh_client, &connect_req).await.unwrap();
+            wire::send_json(&mut mrsh_client, &connect_req)
+                .await
+                .unwrap();
 
             let ack: protocol::Response = wire::recv_json(&mut mrsh_client).await.unwrap();
             // Server rejected — should not relay
@@ -678,13 +695,10 @@ mod tests {
         // Connect so the tunnel_handle can proceed
         let _local = TcpStream::connect(local_addr).await.unwrap();
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                tunnel_handle.await.unwrap();
-                server_handle.await.unwrap();
-            },
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tunnel_handle.await.unwrap();
+            server_handle.await.unwrap();
+        })
         .await;
     }
 
@@ -898,9 +912,8 @@ mod tests {
         let local_addr = free_port().await;
 
         // connect_fn always fails
-        let connect_fn = || async {
-            Err::<tokio::io::DuplexStream, _>(anyhow::anyhow!("cannot connect"))
-        };
+        let connect_fn =
+            || async { Err::<tokio::io::DuplexStream, _>(anyhow::anyhow!("cannot connect")) };
 
         let tunnel_handle = tokio::spawn(async move {
             run_multi_tunnel(&local_addr.to_string(), "db:5432", connect_fn).await
@@ -912,14 +925,11 @@ mod tests {
         let mut conn = TcpStream::connect(local_addr).await.unwrap();
         // The local stream should be dropped by the server
         let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            conn.read(&mut buf),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), conn.read(&mut buf)).await;
         // Should get EOF or timeout (stream dropped by multi-tunnel on connect_fn error)
         match result {
-            Ok(Ok(0)) => {} // EOF — expected
+            Ok(Ok(0)) => {}  // EOF — expected
             Ok(Err(_)) => {} // read error — acceptable
             Err(_) => {}     // timeout — also acceptable
             Ok(Ok(_)) => panic!("expected connection close when connect_fn fails"),
@@ -947,8 +957,7 @@ mod tests {
                 if n == 0 {
                     // First connection — reject
                     tokio::spawn(async move {
-                        let _: protocol::Request =
-                            wire::recv_json(&mut server_end).await.unwrap();
+                        let _: protocol::Request = wire::recv_json(&mut server_end).await.unwrap();
                         let ack = protocol::Response {
                             success: false,
                             output: None,
@@ -976,11 +985,7 @@ mod tests {
         // First connection — rejected, should get dropped
         let mut conn1 = TcpStream::connect(local_addr).await.unwrap();
         let mut buf = [0u8; 1];
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            conn1.read(&mut buf),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), conn1.read(&mut buf)).await;
         drop(conn1);
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

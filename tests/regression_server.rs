@@ -42,7 +42,9 @@ fn screenshot_no_display_returns_error_not_hang() {
     if !resp.success {
         let err = resp.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("no display") || err.contains("no screenshot tool"),
+            err.contains("no display")
+                || err.contains("no screenshot tool")
+                || err.contains("display may be locked"),
             "expected display-related error, got: {}",
             err
         );
@@ -61,9 +63,8 @@ fn screenshot_does_not_panic_without_display() {
         std::env::remove_var("WAYLAND_DISPLAY");
     }
 
-    let result = std::panic::catch_unwind(|| {
-        mrsh_server::screenshot::handle_screenshot(0, 80, 100)
-    });
+    let result =
+        std::panic::catch_unwind(|| mrsh_server::screenshot::handle_screenshot(0, 80, 100));
 
     unsafe {
         if let Some(val) = old_display {
@@ -74,7 +75,10 @@ fn screenshot_does_not_panic_without_display() {
         }
     }
 
-    assert!(result.is_ok(), "screenshot handler must not panic on headless system");
+    assert!(
+        result.is_ok(),
+        "screenshot handler must not panic on headless system"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +131,9 @@ async fn relay_connect_returns_error_on_immediate_disconnect() {
             // Error is the expected outcome — relay rejected/dropped.
         }
         Err(_) => {
-            panic!("connect_relay hung (timeout) on immediate disconnect — regression of 2026-03-17-002");
+            panic!(
+                "connect_relay hung (timeout) on immediate disconnect — regression of 2026-03-17-002"
+            );
         }
     }
 }
@@ -170,11 +176,9 @@ async fn relay_server_rejects_wrong_key_not_hang() {
             // Connection established but server should close after auth failure.
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 1];
-            let read_result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                stream.read(&mut buf),
-            )
-            .await;
+            let read_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+                    .await;
             match read_result {
                 Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
                     // EOF or error or timeout — server closed, which is correct
@@ -206,7 +210,9 @@ async fn relay_server_rejects_wrong_key_not_hang() {
 async fn exec_output_captured_correctly() {
     let resp = mrsh_server::exec::handle_exec("echo regression_test_output", &[]).await;
     assert!(resp.success, "echo command should succeed");
-    let output = resp.output.expect("output must not be None — pipe handle regression");
+    let output = resp
+        .output
+        .expect("output must not be None — pipe handle regression");
     assert!(
         output.contains("regression_test_output"),
         "stdout must be captured, got: {}",
@@ -220,7 +226,9 @@ async fn exec_output_captured_correctly() {
 async fn exec_captures_stdout_and_stderr() {
     let resp =
         mrsh_server::exec::handle_exec("echo STDOUT_PART && echo STDERR_PART >&2", &[]).await;
-    let output = resp.output.expect("output must not be None — pipe handle regression");
+    let output = resp
+        .output
+        .expect("output must not be None — pipe handle regression");
     assert!(
         output.contains("STDOUT_PART"),
         "stdout must be captured, got: {}",
@@ -271,7 +279,10 @@ async fn exec_stream_output_not_lost() {
         }
     }
 
-    assert!(got_output, "streaming output must not be lost (regression of pipe handle issue)");
+    assert!(
+        got_output,
+        "streaming output must not be lost (regression of pipe handle issue)"
+    );
     assert_eq!(exit_code, 0);
     handle.await.unwrap().unwrap();
 }
@@ -321,8 +332,8 @@ fn selfupdate_bat_template_has_retry_and_timeout() {
     );
 
     assert!(
-        selfupdate_src.contains(r#"copy /y "{new}" "{exe}""#),
-        "bat template must contain copy command for new binary"
+        selfupdate_src.contains(r#"copy /y "{new}" "{exe}.incoming""#),
+        "bat template must contain staged copy command for new binary"
     );
 
     // Verify fallback: if rename fails, stop service first then retry rename
@@ -360,7 +371,12 @@ fn selfupdate_bat_template_has_retry_and_timeout() {
 /// as `long = "..."` (double-dash), not single-dash short flags.
 #[test]
 fn cli_flags_are_double_dash_convention() {
-    let main_src = include_str!("../src/main.rs");
+    // Cli struct lives in cli.rs since the rsh-4hv refactor; main.rs only
+    // imports and instantiates it.
+    let main_src = concat!(
+        include_str!("../src/main.rs"),
+        include_str!("../src/cli.rs"),
+    );
 
     // Verify --install is defined as a long flag (double-dash)
     assert!(
@@ -399,7 +415,11 @@ fn cli_flags_are_double_dash_convention() {
 /// Ensures that if someone changes the flag definitions, the test will catch it.
 #[test]
 fn cli_install_not_defined_as_short_flag_only() {
-    let main_src = include_str!("../src/main.rs");
+    // Cli struct lives in cli.rs since the rsh-4hv refactor.
+    let main_src = concat!(
+        include_str!("../src/main.rs"),
+        include_str!("../src/cli.rs"),
+    );
 
     // The dangerous scenario: someone defines `#[arg(short)]` for install
     // without `long`, which would make it `-i` only (like Go's single-dash).
@@ -544,10 +564,7 @@ fn dashboard_run_loop_does_not_inline_await_fleet_status() {
             }
 
             // Check for direct fleet::status().await outside spawn_refresh
-            if !inside_spawn_refresh
-                && line.contains("fleet::status")
-                && line.contains(".await")
-            {
+            if !inside_spawn_refresh && line.contains("fleet::status") && line.contains(".await") {
                 panic!(
                     "run_loop directly awaits fleet::status (must use spawn_refresh): {}",
                     line.trim()
@@ -621,10 +638,12 @@ async fn relay_proxy_bidirectional_transfers_data() {
     )
     .await;
 
-    assert!(result.is_ok(), "read must not timeout — proxy must forward tray response");
+    assert!(
+        result.is_ok(),
+        "read must not timeout — proxy must forward tray response"
+    );
     assert_eq!(
-        &response,
-        b"YART_OLLEH",
+        &response, b"YART_OLLEH",
         "proxy must forward data bidirectionally — tray reverses the input"
     );
 
@@ -651,23 +670,36 @@ fn relay_connect_options_target_port_zero_for_auto_try() {
         target_port: 0, // tray-first signal
         force_relay: false,
         enrollment_token: String::new(),
+        own_device_id: None, // sys-1qgww: no self-loop in this test
     };
-    assert_eq!(auto_opts.target_port, 0, "auto-try must send target_port=0 for tray-first");
-    assert_eq!(auto_opts.port, 8822, "P2P port stays at default for direct attempts");
+    assert_eq!(
+        auto_opts.target_port, 0,
+        "auto-try must send target_port=0 for tray-first"
+    );
+    assert_eq!(
+        auto_opts.port, 8822,
+        "P2P port stays at default for direct attempts"
+    );
 
     // Simulate explicit -p 8822: target_port should match
     let explicit_opts = RelayConnectOptions {
         target_port: 8822,
         ..auto_opts.clone()
     };
-    assert_eq!(explicit_opts.target_port, 8822, "explicit -p 8822 must send 8822 (SYSTEM)");
+    assert_eq!(
+        explicit_opts.target_port, 8822,
+        "explicit -p 8822 must send 8822 (SYSTEM)"
+    );
 
     // Simulate explicit -p 9822: target_port should match
     let tray_opts = RelayConnectOptions {
         target_port: 9822,
         ..auto_opts.clone()
     };
-    assert_eq!(tray_opts.target_port, 9822, "explicit -p 9822 must send 9822 (tray)");
+    assert_eq!(
+        tray_opts.target_port, 9822,
+        "explicit -p 9822 must send 9822 (tray)"
+    );
 }
 
 /// Regression: rendezvous resolve_with_port receives target_port from client.
@@ -686,5 +718,8 @@ fn relay_notification_carries_target_port() {
         target_port: 9822,
         ..notif
     };
-    assert_eq!(notif_explicit.target_port, 9822, "explicit tray port preserved");
+    assert_eq!(
+        notif_explicit.target_port, 9822,
+        "explicit tray port preserved"
+    );
 }

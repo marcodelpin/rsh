@@ -3,9 +3,9 @@
 //! Handles LOG_QUERY messages: reads a file, optionally filters with regex,
 //! streams matching lines as LOG_DATA, ends with LOG_END stats.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use mrsh_core::binproto::{self, msg};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info};
 
 /// Handle a LOG_QUERY request: read file, filter, stream results.
@@ -20,8 +20,10 @@ pub async fn handle_log_query<S: AsyncRead + AsyncWrite + Unpin>(
     let case_insensitive = flags & binproto::LOG_FLAG_CASE_INSENSITIVE != 0;
     let invert = flags & binproto::LOG_FLAG_INVERT != 0;
 
-    info!("log query: path={} pattern={:?} tail={} offset={} follow={}",
-        path, pattern, tail_lines, byte_offset, follow);
+    info!(
+        "log query: path={} pattern={:?} tail={} offset={} follow={}",
+        path, pattern, tail_lines, byte_offset, follow
+    );
 
     // Validate path exists
     let metadata = match std::fs::metadata(&path) {
@@ -61,12 +63,9 @@ pub async fn handle_log_query<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // Read file
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path))?;
+    let content = std::fs::read_to_string(&path).with_context(|| format!("read {}", path))?;
 
     let all_lines: Vec<&str> = content.lines().collect();
-    let total_lines = all_lines.len() as u64;
-
     // Determine which lines to process
     let lines_to_scan: Vec<&str> = if tail_lines > 0 && tail_lines < all_lines.len() as u32 {
         // Tail mode: scan only the last N lines
@@ -77,7 +76,11 @@ pub async fn handle_log_query<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut lines_scanned: u64 = 0;
     let mut matches_found: u64 = 0;
-    let max = if max_matches == 0 { u64::MAX } else { max_matches as u64 };
+    let max = if max_matches == 0 {
+        u64::MAX
+    } else {
+        max_matches as u64
+    };
 
     for line in &lines_to_scan {
         lines_scanned += 1;
@@ -106,13 +109,17 @@ pub async fn handle_log_query<S: AsyncRead + AsyncWrite + Unpin>(
     let end_payload = binproto::build_log_end(lines_scanned, matches_found, final_offset);
     binproto::send_msg(stream, msg::LOG_END, &end_payload).await?;
 
-    debug!("log query complete: scanned={} matched={}", lines_scanned, matches_found);
+    debug!(
+        "log query complete: scanned={} matched={}",
+        lines_scanned, matches_found
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::bail;
     use std::io::Write;
 
     /// Helper: create temp file, run log_query, collect results from a mock stream.
@@ -132,16 +139,11 @@ mod tests {
         // Use duplex stream as mock
         let (mut client, mut server) = tokio::io::duplex(64 * 1024);
 
-        let handle = tokio::spawn(async move {
-            handle_log_query(&payload, &mut server).await
-        });
+        let handle = tokio::spawn(async move { handle_log_query(&payload, &mut server).await });
 
         // Read responses
         let mut lines = Vec::new();
-        let mut scanned = 0u64;
-        let mut matched = 0u64;
-
-        loop {
+        let (scanned, matched) = loop {
             let (type_id, data) = binproto::recv_msg(&mut client).await?;
             match type_id {
                 msg::LOG_DATA => {
@@ -149,9 +151,7 @@ mod tests {
                 }
                 msg::LOG_END => {
                     let (s, m, _) = binproto::parse_log_end(&data)?;
-                    scanned = s;
-                    matched = m;
-                    break;
+                    break (s, m);
                 }
                 msg::ERROR => {
                     let err = binproto::parse_error(&data)?;
@@ -159,7 +159,7 @@ mod tests {
                 }
                 other => bail!("unexpected message type: 0x{:02x}", other),
             }
-        }
+        };
 
         handle.await??;
         Ok((lines, scanned, matched))
@@ -167,9 +167,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_all_lines() {
-        let (lines, scanned, matched) = run_query(
-            "line1\nline2\nline3\n", "", 0, 0, 0
-        ).await.unwrap();
+        let (lines, scanned, matched) = run_query("line1\nline2\nline3\n", "", 0, 0, 0)
+            .await
+            .unwrap();
         assert_eq!(lines, vec!["line1", "line2", "line3"]);
         assert_eq!(scanned, 3);
         assert_eq!(matched, 3);
@@ -178,8 +178,14 @@ mod tests {
     #[tokio::test]
     async fn query_with_pattern() {
         let (lines, _, matched) = run_query(
-            "error: disk full\ninfo: ok\nerror: timeout\n", "error", 0, 0, 0
-        ).await.unwrap();
+            "error: disk full\ninfo: ok\nerror: timeout\n",
+            "error",
+            0,
+            0,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(lines, vec!["error: disk full", "error: timeout"]);
         assert_eq!(matched, 2);
     }
@@ -190,8 +196,11 @@ mod tests {
             "ERROR: one\nerror: two\nInfo: three\n",
             "error",
             binproto::LOG_FLAG_CASE_INSENSITIVE,
-            0, 0
-        ).await.unwrap();
+            0,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(lines, vec!["ERROR: one", "error: two"]);
     }
 
@@ -201,25 +210,24 @@ mod tests {
             "keep\nskip\nkeep2\n",
             "skip",
             binproto::LOG_FLAG_INVERT,
-            0, 0
-        ).await.unwrap();
+            0,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(lines, vec!["keep", "keep2"]);
     }
 
     #[tokio::test]
     async fn query_tail() {
-        let (lines, scanned, _) = run_query(
-            "a\nb\nc\nd\ne\n", "", 0, 2, 0
-        ).await.unwrap();
+        let (lines, scanned, _) = run_query("a\nb\nc\nd\ne\n", "", 0, 2, 0).await.unwrap();
         assert_eq!(lines, vec!["d", "e"]);
         assert_eq!(scanned, 2);
     }
 
     #[tokio::test]
     async fn query_max_matches() {
-        let (lines, _, matched) = run_query(
-            "a\nb\nc\nd\ne\n", "", 0, 0, 3
-        ).await.unwrap();
+        let (lines, _, matched) = run_query("a\nb\nc\nd\ne\n", "", 0, 0, 3).await.unwrap();
         assert_eq!(lines.len(), 3);
         assert_eq!(matched, 3);
     }
@@ -229,8 +237,12 @@ mod tests {
         let (lines, _, matched) = run_query(
             "error: 1\ninfo: 2\nerror: 3\ninfo: 4\nerror: 5\n",
             "error",
-            0, 3, 0  // tail 3 lines, then grep
-        ).await.unwrap();
+            0,
+            3,
+            0, // tail 3 lines, then grep
+        )
+        .await
+        .unwrap();
         // Last 3 lines: "info: 4", "error: 5" — wait, that's only matching "error: 5"
         // Actually last 3 lines of 5: "error: 3", "info: 4", "error: 5"
         assert_eq!(lines, vec!["error: 3", "error: 5"]);
@@ -239,9 +251,10 @@ mod tests {
 
     #[tokio::test]
     async fn query_nonexistent_file() {
-        let result = run_query(
-            "", "", 0, 0, 0  // This creates a file, but let's test missing path
-        ).await;
+        let _result = run_query(
+            "", "", 0, 0, 0, // This creates a file, but let's test missing path
+        )
+        .await;
         // This test uses a valid temp file, so it works.
         // Test actual missing file separately:
         let payload = binproto::build_log_query("/nonexistent/file.log", "", 0, 0, 0, 0);
