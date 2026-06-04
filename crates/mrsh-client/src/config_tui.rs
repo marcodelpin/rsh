@@ -237,11 +237,10 @@ impl App {
             self.cfg.rendezvous_servers = split_servers(&self.inputs[2]);
             self.cfg.rendezvous_key = opt_str(&self.inputs[3]);
             self.cfg.session_log = parse_bool_default(&self.inputs[4], true);
-            if let Ok(days) = self.inputs[5].trim().parse::<u32>() {
-                if days > 0 {
+            if let Ok(days) = self.inputs[5].trim().parse::<u32>()
+                && days > 0 {
                     self.cfg.session_log_retain = days;
                 }
-            }
             self.dirty = true;
             return;
         }
@@ -754,15 +753,14 @@ fn handle_list(app: &mut App, code: KeyCode, mods: KeyModifiers) -> io::Result<b
         }
 
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
-            if !app.cfg.hosts.is_empty() {
-                if let Some(idx) = app.selected_index() {
+            if !app.cfg.hosts.is_empty()
+                && let Some(idx) = app.selected_index() {
                     app.delete_idx = idx;
                     app.confirm_action = ConfirmAction::Delete;
                     app.confirm_msg =
                         format!("Delete {:?}? (y/n)", app.cfg.hosts[idx].pattern);
                     app.screen = Screen::Confirm;
                 }
-            }
             Ok(false)
         }
 

@@ -4,7 +4,7 @@
 //! - Buffered (`handle_exec`): waits for process to complete, returns full output.
 //! - Streaming (`handle_exec_stream`): sends stdout/stderr chunks as they arrive.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use mrsh_core::binproto::{self, msg};
 use mrsh_core::protocol::Response;
 use std::process::Stdio;
@@ -93,7 +93,7 @@ async fn run_command(command: &str, env_vars: &[String]) -> anyhow::Result<(Stri
 }
 
 #[cfg(target_os = "windows")]
-fn build_command(command: &str) -> tokio::process::Command {
+pub fn build_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("powershell");
     cmd.args(["-NoProfile", "-Command", command]);
     // HideWindow equivalent via creation flags
@@ -102,7 +102,7 @@ fn build_command(command: &str) -> tokio::process::Command {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn build_command(command: &str) -> tokio::process::Command {
+pub fn build_command(command: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.args(["-c", command]);
     cmd

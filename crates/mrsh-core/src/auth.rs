@@ -573,12 +573,11 @@ pub fn check_recovery_code(
     use sha2::{Digest, Sha256};
     let code_hash = format!("{:x}", Sha256::digest(code.as_bytes()));
 
-    if let Some(hashes) = recovery_map.get_mut(fingerprint) {
-        if let Some(pos) = hashes.iter().position(|h| h == &code_hash) {
+    if let Some(hashes) = recovery_map.get_mut(fingerprint)
+        && let Some(pos) = hashes.iter().position(|h| h == &code_hash) {
             hashes.remove(pos);
             return true;
         }
-    }
     false
 }
 

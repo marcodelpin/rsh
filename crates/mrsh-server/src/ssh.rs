@@ -13,12 +13,11 @@
 //!
 //! Compiled only with `--features ssh`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::{debug, info, warn};
+use tracing::info;
 
 use crate::handler::ServerContext;
 

@@ -8,6 +8,7 @@ pub mod fileops;
 pub mod gui;
 pub mod handler;
 pub mod listener;
+pub mod log_query;
 pub mod mux;
 pub mod notify;
 pub mod plugin;

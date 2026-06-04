@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.6.0"
+version = "1.7.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/marcodelpin/mrsh"
@@ -102,7 +102,7 @@ ssh-key.workspace = true
 rand.workspace = true
 sha2.workspace = true
 base64 = "0.22"
-dirs = "5"
+dirs = "6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -115,12 +115,12 @@ windows = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_Wind
 quic = ["mrsh-server/quic", "mrsh-client/quic", "quinn"]
 ssh = ["mrsh-server/ssh", "mrsh-client/ssh-client"]
 no-toast = []
-no-exec = []
-no-shell = []
-no-reboot = []
-no-screenshot = []
-no-self-update = []
-no-clipboard = []
+no-exec = ["mrsh-server/no-exec"]
+no-shell = ["mrsh-server/no-shell"]
+no-reboot = ["mrsh-server/no-reboot"]
+no-screenshot = ["mrsh-server/no-screenshot"]
+no-self-update = ["mrsh-server/no-self-update"]
+no-clipboard = ["mrsh-server/no-clipboard"]
 no-relay = []
 read-only = ["no-exec", "no-shell"]
 

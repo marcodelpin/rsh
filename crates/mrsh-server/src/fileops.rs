@@ -26,7 +26,7 @@ fn sanitize_path(path: &str) -> Result<&str, String> {
 pub fn handle_ls(path: &str) -> Response {
     let path = match sanitize_path(path) {
         Ok(p) => p,
-        Err(e) => return error_response(&e),
+        Err(e) => return Response::error(&e),
     };
     debug!("ls: {}", path);
 
@@ -57,7 +57,7 @@ pub fn handle_ls(path: &str) -> Response {
 pub fn handle_read(path: &str) -> Response {
     let path = match sanitize_path(path) {
         Ok(p) => p,
-        Err(e) => return error_response(&e),
+        Err(e) => return Response::error(&e),
     };
     debug!("read: {}", path);
 
@@ -88,7 +88,7 @@ pub fn handle_read(path: &str) -> Response {
 pub fn handle_write(path: &str, content_b64: &str) -> Response {
     let path = match sanitize_path(path) {
         Ok(p) => p,
-        Err(e) => return error_response(&e),
+        Err(e) => return Response::error(&e),
     };
     debug!("write: {}", path);
 
@@ -215,16 +215,6 @@ fn days_to_date(mut days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-fn error_response(msg: &str) -> Response {
-    Response {
-        success: false,
-        output: None,
-        error: Some(msg.to_string()),
-        size: None,
-        binary: None,
-        gzip: None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

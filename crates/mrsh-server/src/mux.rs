@@ -248,11 +248,10 @@ mod server {
 
                 MsgType::ChannelData => {
                     let channels = self.channels.read().await;
-                    if let Some(ch) = channels.get(&msg.channel_id) {
-                        if !ch.closed.load(Ordering::Acquire) {
+                    if let Some(ch) = channels.get(&msg.channel_id)
+                        && !ch.closed.load(Ordering::Acquire) {
                             let _ = ch.data_tx.send(msg.payload).await;
                         }
-                    }
                 }
 
                 MsgType::ChannelEOF => {
@@ -607,17 +606,54 @@ mod server {
         };
 
         let command = String::from_utf8_lossy(&cmd_data).to_string();
-        let resp = crate::exec::handle_exec(&command, &[]).await;
-
         ch.confirm().await;
 
-        let resp_bytes = if resp.success {
-            resp.output.unwrap_or_default().into_bytes()
-        } else {
-            format!("ERROR: {}", resp.error.unwrap_or_default()).into_bytes()
-        };
+        // Stream exec output as ChannelData chunks (like SSH exec channel).
+        use tokio::process::Command;
+        use tokio::io::AsyncReadExt;
 
-        let _ = ch.write_data(&resp_bytes).await;
+        let mut cmd = crate::exec::build_command(&command);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let mut stdout = child.stdout.take().expect("stdout piped");
+                let mut stderr = child.stderr.take().expect("stderr piped");
+                let mut buf = vec![0u8; 32768];
+                let mut err_buf = vec![0u8; 8192];
+                let mut stdout_done = false;
+                let mut stderr_done = false;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = stdout.read(&mut buf), if !stdout_done => {
+                            match result {
+                                Ok(0) => stdout_done = true,
+                                Ok(n) => { let _ = ch.write_data(&buf[..n]).await; }
+                                Err(_) => stdout_done = true,
+                            }
+                        }
+                        result = stderr.read(&mut err_buf), if !stderr_done => {
+                            match result {
+                                Ok(0) => stderr_done = true,
+                                Ok(n) => { let _ = ch.write_data(&err_buf[..n]).await; }
+                                Err(_) => stderr_done = true,
+                            }
+                        }
+                    }
+                    if stdout_done && stderr_done { break; }
+                }
+
+                let _ = child.wait().await;
+            }
+            Err(e) => {
+                let _ = ch.write_data(format!("ERROR: spawn failed: {}\n", e).as_bytes()).await;
+            }
+        }
+
         ch.send_eof().await;
         ch.close_channel().await;
     }

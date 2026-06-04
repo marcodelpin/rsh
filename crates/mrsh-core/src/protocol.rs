@@ -111,6 +111,32 @@ pub struct Response {
     pub gzip: Option<bool>,
 }
 
+impl Response {
+    /// Create an error response with the given message.
+    pub fn error(msg: &str) -> Self {
+        Self {
+            success: false,
+            output: None,
+            error: Some(msg.to_string()),
+            size: None,
+            binary: None,
+            gzip: None,
+        }
+    }
+
+    /// Create a success response with optional output.
+    pub fn ok(output: Option<String>) -> Self {
+        Self {
+            success: true,
+            output,
+            error: None,
+            size: None,
+            binary: None,
+            gzip: None,
+        }
+    }
+}
+
 /// Delta transfer operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaOp {

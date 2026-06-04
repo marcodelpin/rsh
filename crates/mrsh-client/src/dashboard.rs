@@ -142,8 +142,8 @@ impl App {
     }
 
     fn open_menu(&mut self) {
-        if let Some(idx) = self.table_state.selected() {
-            if idx < self.hosts.len() {
+        if let Some(idx) = self.table_state.selected()
+            && idx < self.hosts.len() {
                 let mut list_state = ListState::default();
                 list_state.select(Some(0));
                 self.menu = Some(MenuState {
@@ -151,7 +151,6 @@ impl App {
                     list_state,
                 });
             }
-        }
     }
 
     fn close_menu(&mut self) {
@@ -319,8 +318,8 @@ async fn run_loop(
         }
 
         // Poll for keyboard events
-        if event::poll(POLL_TIMEOUT)? {
-            if let Event::Key(key) = event::read()? {
+        if event::poll(POLL_TIMEOUT)?
+            && let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -365,7 +364,6 @@ async fn run_loop(
                     }
                 }
             }
-        }
     }
 }
 

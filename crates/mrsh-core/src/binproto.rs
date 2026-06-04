@@ -72,6 +72,11 @@ pub mod msg {
     pub const SYNC_REQ: u8 = 0x90;
     pub const SYNC_RESP: u8 = 0x91;
 
+    // Log query (remote grep/tail)
+    pub const LOG_QUERY: u8 = 0xA0;
+    pub const LOG_DATA: u8 = 0xA1;
+    pub const LOG_END: u8 = 0xA2;
+
     // Generic request/response (for commands not yet migrated to binary)
     pub const REQUEST: u8 = 0xF0;
     pub const RESPONSE: u8 = 0xF1;
@@ -356,6 +361,66 @@ pub fn build_error(error: &str) -> Vec<u8> {
 pub fn parse_error(data: &[u8]) -> Result<String> {
     let (error, _) = decode_str(data, 0)?;
     Ok(error.to_string())
+}
+
+// ── Log query ───────────────────────────────────────────────────
+
+/// Flags for LOG_QUERY.
+pub const LOG_FLAG_FOLLOW: u8 = 0x01;
+pub const LOG_FLAG_CASE_INSENSITIVE: u8 = 0x02;
+pub const LOG_FLAG_INVERT: u8 = 0x04;
+
+/// Build LOG_QUERY payload: path + pattern + flags + tail_lines + byte_offset + max_matches.
+pub fn build_log_query(
+    path: &str,
+    pattern: &str,
+    flags: u8,
+    tail_lines: u32,
+    byte_offset: u64,
+    max_matches: u32,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_str(&mut buf, path);
+    encode_str(&mut buf, pattern);
+    buf.push(flags);
+    buf.extend_from_slice(&tail_lines.to_be_bytes());
+    buf.extend_from_slice(&byte_offset.to_be_bytes());
+    buf.extend_from_slice(&max_matches.to_be_bytes());
+    buf
+}
+
+/// Parse LOG_QUERY payload.
+pub fn parse_log_query(data: &[u8]) -> Result<(String, String, u8, u32, u64, u32)> {
+    let (path, off) = decode_str(data, 0)?;
+    let (pattern, off) = decode_str(data, off)?;
+    if data.len() < off + 1 + 4 + 8 + 4 {
+        bail!("LOG_QUERY payload too short");
+    }
+    let flags = data[off];
+    let tail_lines = u32::from_be_bytes(data[off + 1..off + 5].try_into()?);
+    let byte_offset = u64::from_be_bytes(data[off + 5..off + 13].try_into()?);
+    let max_matches = u32::from_be_bytes(data[off + 13..off + 17].try_into()?);
+    Ok((path.to_string(), pattern.to_string(), flags, tail_lines, byte_offset, max_matches))
+}
+
+/// Build LOG_END payload: lines_scanned + matches_found + final_offset.
+pub fn build_log_end(lines_scanned: u64, matches_found: u64, final_offset: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(24);
+    buf.extend_from_slice(&lines_scanned.to_be_bytes());
+    buf.extend_from_slice(&matches_found.to_be_bytes());
+    buf.extend_from_slice(&final_offset.to_be_bytes());
+    buf
+}
+
+/// Parse LOG_END payload.
+pub fn parse_log_end(data: &[u8]) -> Result<(u64, u64, u64)> {
+    if data.len() < 24 {
+        bail!("LOG_END payload too short");
+    }
+    let lines_scanned = u64::from_be_bytes(data[0..8].try_into()?);
+    let matches_found = u64::from_be_bytes(data[8..16].try_into()?);
+    let final_offset = u64::from_be_bytes(data[16..24].try_into()?);
+    Ok((lines_scanned, matches_found, final_offset))
 }
 
 // ── Tests ───────────────────────────────────────────────────────

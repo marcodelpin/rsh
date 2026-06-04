@@ -78,7 +78,7 @@ pub async fn dispatch(
         "read" | "cat" => {
             let path = match req.path.as_deref() {
                 Some(p) => p,
-                None => return DispatchResult::Response(error_response("missing path")),
+                None => return DispatchResult::Response(Response::error("missing path")),
             };
             DispatchResult::Response(fileops::handle_read(path))
         }
@@ -86,11 +86,11 @@ pub async fn dispatch(
         "write" => {
             let path = match req.path.as_deref() {
                 Some(p) => p,
-                None => return DispatchResult::Response(error_response("missing path")),
+                None => return DispatchResult::Response(Response::error("missing path")),
             };
             let content = match req.content.as_deref() {
                 Some(c) => c,
-                None => return DispatchResult::Response(error_response("missing content")),
+                None => return DispatchResult::Response(Response::error("missing content")),
             };
             DispatchResult::Response(fileops::handle_write(path, content))
         }
@@ -99,7 +99,7 @@ pub async fn dispatch(
             let target = match req.command.as_deref() {
                 Some(t) => t.to_string(),
                 None => {
-                    return DispatchResult::Response(error_response(
+                    return DispatchResult::Response(Response::error(
                         "missing target (command field)",
                     ));
                 }
@@ -146,7 +146,7 @@ pub async fn dispatch(
             let path = match req.path.as_deref() {
                 Some(p) => p,
                 None => {
-                    return DispatchResult::Response(error_response("missing path for self-update"));
+                    return DispatchResult::Response(Response::error("missing path for self-update"));
                 }
             };
             DispatchResult::Response(selfupdate::handle_self_update(path))
@@ -157,7 +157,7 @@ pub async fn dispatch(
             let cmd_str = req.command.as_deref().unwrap_or("");
             let parts: Vec<&str> = cmd_str.split_whitespace().collect();
             if parts.len() < 2 {
-                DispatchResult::Response(error_response(
+                DispatchResult::Response(Response::error(
                     "input requires: <type> <action> [args...]",
                 ))
             } else {
@@ -175,7 +175,7 @@ pub async fn dispatch(
             let cmd_str = req.command.as_deref().unwrap_or("");
             let parts: Vec<&str> = cmd_str.split_whitespace().collect();
             if parts.is_empty() {
-                return DispatchResult::Response(error_response(
+                return DispatchResult::Response(Response::error(
                     "native requires: <command> [args...]",
                 ));
             }
@@ -202,7 +202,7 @@ pub async fn dispatch(
             DispatchResult::Response(screenshot::handle_screenshot(display, quality, scale))
         }
 
-        other => DispatchResult::Response(error_response(&format!("unknown command: {}", other))),
+        other => DispatchResult::Response(Response::error(&format!("unknown command: {}", other))),
     }
 }
 
@@ -211,9 +211,9 @@ pub async fn handle_request(req: &protocol::Request) -> Response {
     let store = session::SessionStore::new();
     match dispatch(req, &store).await {
         DispatchResult::Response(r) => r,
-        DispatchResult::Hijack(_) => error_response("hijack not supported in this context"),
+        DispatchResult::Hijack(_) => Response::error("hijack not supported in this context"),
         DispatchResult::SyncStream(_) => {
-            error_response("sync stream not supported in this context")
+            Response::error("sync stream not supported in this context")
         }
     }
 }
@@ -240,7 +240,7 @@ async fn handle_session_command(
         "kill" => {
             let id = match path {
                 Some(id) => id,
-                None => return error_response("missing session id"),
+                None => return Response::error("missing session id"),
             };
             if store.kill(id).await {
                 Response {
@@ -252,10 +252,10 @@ async fn handle_session_command(
                     gzip: None,
                 }
             } else {
-                error_response(&format!("session not found: {}", id))
+                Response::error(&format!("session not found: {}", id))
             }
         }
-        other => error_response(&format!("unknown session command: {}", other)),
+        other => Response::error(&format!("unknown session command: {}", other)),
     }
 }
 
@@ -286,7 +286,7 @@ async fn handle_native_command(cmd: &str, args: &[&str]) -> Response {
                 Ok(pid) => {
                     exec::handle_exec(&format!("Stop-Process -Id {} -Force", pid), &[]).await
                 }
-                Err(_) => error_response("invalid pid: must be a positive integer"),
+                Err(_) => Response::error("invalid pid: must be a positive integer"),
             }
         }
         "tail" => {
@@ -308,20 +308,10 @@ async fn handle_native_command(cmd: &str, args: &[&str]) -> Response {
             let text = args.join(" ");
             exec::handle_exec(&format!("Set-Clipboard -Value '{}'", text.replace('\'', "''")), &[]).await
         }
-        other => error_response(&format!("unknown native command: {}", other)),
+        other => Response::error(&format!("unknown native command: {}", other)),
     }
 }
 
-fn error_response(msg: &str) -> Response {
-    Response {
-        success: false,
-        output: None,
-        error: Some(msg.to_string()),
-        size: None,
-        binary: None,
-        gzip: None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

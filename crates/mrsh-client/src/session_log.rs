@@ -97,7 +97,7 @@ fn write_entry(log_dir: &Path, entry: &LogEntry) -> std::io::Result<()> {
         .open(&path)?;
 
     let json = serde_json::to_string(entry)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| std::io::Error::other(e))?;
     writeln!(file, "{}", json)?;
     Ok(())
 }
@@ -115,8 +115,8 @@ pub fn rotate_logs(log_dir: &Path, retain_days: u32) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Parse YYYY-MM.jsonl
-        if let Some(stem) = name.strip_suffix(".jsonl") {
-            if let Ok(date) = NaiveDate::parse_from_str(&format!("{}-01", stem), "%Y-%m-%d") {
+        if let Some(stem) = name.strip_suffix(".jsonl")
+            && let Ok(date) = NaiveDate::parse_from_str(&format!("{}-01", stem), "%Y-%m-%d") {
                 // If the entire month is before cutoff, delete
                 let last_day = if date.month() == 12 {
                     NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)
@@ -130,7 +130,6 @@ pub fn rotate_logs(log_dir: &Path, retain_days: u32) {
                     }
                 }
             }
-        }
     }
 }
 
@@ -206,27 +205,22 @@ pub fn query_logs(log_dir: &Path, filter: &LogFilter) -> Vec<LogEntry> {
             };
 
             // Apply filters
-            if let Some(ref host_filter) = filter.host {
-                if !entry.host.contains(host_filter.as_str()) {
+            if let Some(ref host_filter) = filter.host
+                && !entry.host.contains(host_filter.as_str()) {
                     continue;
                 }
-            }
 
-            if let Some(since) = filter.since {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start) {
-                    if dt.date_naive() < since {
+            if let Some(since) = filter.since
+                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start)
+                    && dt.date_naive() < since {
                         continue;
                     }
-                }
-            }
 
-            if let Some(until) = filter.until {
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start) {
-                    if dt.date_naive() > until {
+            if let Some(until) = filter.until
+                && let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.start)
+                    && dt.date_naive() > until {
                         continue;
                     }
-                }
-            }
 
             entries.push(entry);
         }

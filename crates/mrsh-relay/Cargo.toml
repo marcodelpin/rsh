@@ -6,13 +6,10 @@ license = "MIT"
 description = "Clean-room relay and rendezvous client — wire-compatible with RustDesk hbbs/hbbr"
 
 [dependencies]
-mrsh-core.workspace = true
 prost.workspace = true
-serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 rand.workspace = true
 sha2.workspace = true
 hex = "0.4"

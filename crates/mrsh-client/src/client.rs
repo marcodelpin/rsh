@@ -1,9 +1,9 @@
 //! Core client — TLS connect, ed25519 auth, request/response.
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use mrsh_core::{auth, protocol, tls, wire};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -188,7 +188,7 @@ fn read_password(username: &str, host: &str) -> Result<String> {
     use std::io::{BufRead, Write};
 
     let stdin = std::io::stdin();
-    if atty::is(atty::Stream::Stdin) {
+    if std::io::stdin().is_terminal() {
         // Interactive terminal: show prompt, hide input
         eprint!("{}@{}'s password: ", username, host);
         std::io::stderr().flush().ok();
@@ -199,24 +199,6 @@ fn read_password(username: &str, host: &str) -> Result<String> {
         let mut line = String::new();
         stdin.lock().read_line(&mut line).context("read password from stdin")?;
         Ok(line.trim_end().to_string())
-    }
-}
-
-/// Read TOTP code from terminal or piped stdin.
-fn read_totp_code() -> Result<String> {
-    use std::io::{BufRead, Write};
-
-    let stdin = std::io::stdin();
-    if atty::is(atty::Stream::Stdin) {
-        eprint!("TOTP code: ");
-        std::io::stderr().flush().ok();
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line).context("read TOTP code")?;
-        Ok(line.trim().to_string())
-    } else {
-        let mut line = String::new();
-        stdin.lock().read_line(&mut line).context("read TOTP code from stdin")?;
-        Ok(line.trim().to_string())
     }
 }
 
@@ -259,7 +241,7 @@ fn parse_ipv6_host(host: &str, port: u16) -> Option<std::net::SocketAddr> {
             .trim_end_matches(']')
             .parse()
             .ok()?;
-        let scope_id: u32 = scope_part.parse().unwrap_or_else(|_| {
+        let scope_id: u32 = scope_part.parse().unwrap_or({
             #[cfg(unix)]
             {
                 use std::ffi::CString;
@@ -362,124 +344,13 @@ impl<S> RshClient<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> RshClient<S> {
-    /// Authenticate using ed25519 challenge-response.
-    async fn authenticate(&mut self, key_pair: &auth::SshKeyPair) -> Result<()> {
-        // Step 1: Send AuthRequest
-        // For ed25519: old protocol (raw 32-byte key, no key_type) for backward compat.
-        // For other key types: new protocol (SSH wire format with key_type).
-        let (pub_key_b64, key_type) = if key_pair.key_type == "ssh-ed25519" {
-            // Old format: raw 32-byte ed25519 key (legacy compat)
-            (key_pair.public_key_base64_raw(), None)
-        } else {
-            // New format: SSH wire format with key_type (v4.18+ servers)
-            (key_pair.public_key_base64_raw(), Some(key_pair.key_type.clone()))
-        };
-        let auth_req = protocol::AuthRequest {
-            auth_type: "auth".to_string(),
-            public_key: Some(pub_key_b64),
-            key_type,
-            username: None,
-            password: None,
-            version: Some(CLIENT_VERSION.to_string()),
-            want_mux: None, // MUX channel protocol not yet implemented in Rust client
-            caps: Some(CLIENT_CAPS.iter().map(|s| s.to_string()).collect()),
-        };
-        wire::send_json(&mut self.stream, &auth_req)
-            .await
-            .context("send auth request")?;
-
-        // Step 2: Receive challenge (or early AuthResult on error)
-        let raw = wire::recv_message(&mut self.stream)
-            .await
-            .context("receive auth challenge")?;
-        // Try as AuthChallenge first; if it fails, check for AuthResult (error)
-        let challenge_bytes = if let Ok(challenge) =
-            serde_json::from_slice::<protocol::AuthChallenge>(&raw)
-        {
-            base64::engine::general_purpose::STANDARD
-                .decode(&challenge.challenge)
-                .context("decode challenge")?
-        } else if let Ok(result) = serde_json::from_slice::<protocol::AuthResult>(&raw) {
-            bail!(
-                "server rejected auth: {}",
-                result.error.unwrap_or_else(|| "unknown error".into())
-            );
-        } else {
-            bail!(
-                "unexpected server response: {}",
-                String::from_utf8_lossy(&raw)
-            );
-        };
-        debug!("received challenge ({} bytes)", challenge_bytes.len());
-
-        // Step 3: Sign and send response
-        let signature = key_pair.sign_challenge(&challenge_bytes);
-        let auth_resp = protocol::AuthResponse {
-            signature: base64::engine::general_purpose::STANDARD.encode(&signature),
-        };
-        wire::send_json(&mut self.stream, &auth_resp)
-            .await
-            .context("send auth response")?;
-
-        // Step 4: Receive next message — could be TotpChallenge or AuthResult
-        let raw = wire::recv_message(&mut self.stream)
-            .await
-            .context("receive post-signature message")?;
-
-        // Try as TotpChallenge first (server requires 2FA for this key)
-        let result = if let Ok(totp_challenge) =
-            serde_json::from_slice::<protocol::TotpChallenge>(&raw)
-        {
-            if totp_challenge.totp_required {
-                debug!("server requires TOTP for this key");
-                let code = read_totp_code()?;
-                let totp_resp = protocol::TotpResponse { totp_code: code };
-                wire::send_json(&mut self.stream, &totp_resp)
-                    .await
-                    .context("send TOTP response")?;
-
-                // Now receive the actual AuthResult
-                let totp_result: protocol::AuthResult =
-                    wire::recv_json(&mut self.stream)
-                        .await
-                        .context("receive auth result after TOTP")?;
-                totp_result
-            } else {
-                // totp_required=false shouldn't happen, but treat as AuthResult
-                serde_json::from_slice::<protocol::AuthResult>(&raw)
-                    .context("parse auth result")?
-            }
-        } else {
-            // Not a TotpChallenge — must be AuthResult
-            serde_json::from_slice::<protocol::AuthResult>(&raw)
-                .context("parse auth result")?
-        };
-
-        if !result.success {
-            bail!(
-                "authentication failed: {}",
-                result.error.unwrap_or_default()
-            );
-        }
-
-        self.server_version = result.version.clone();
-        self.server_caps = result.caps.unwrap_or_default();
-        self.mux_enabled = result.mux_enabled.unwrap_or(false);
-        info!(
-            "authenticated (server: {}{})",
-            result.version.as_deref().unwrap_or("unknown"),
-            if self.mux_enabled { ", mux" } else { "" }
-        );
-        Ok(())
-    }
-
     /// Authenticate using binary protocol (binproto).
     /// Same challenge-response flow, but binary encoding instead of JSON.
     async fn authenticate_binary(&mut self, key_pair: &auth::SshKeyPair) -> Result<()> {
         use mrsh_core::binproto::{self, msg};
 
         let pub_key_raw = key_pair.public_key_bytes();
-        let caps: Vec<&str> = CLIENT_CAPS.iter().copied().collect();
+        let caps: Vec<&str> = CLIENT_CAPS.to_vec();
         let payload = binproto::build_auth_request(&pub_key_raw, CLIENT_VERSION, &caps);
 
         // Step 1: Send binary AUTH_REQUEST
@@ -539,6 +410,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RshClient<S> {
     }
 
     /// Check if server supports binary protocol.
+    /// Check if server advertises a specific capability.
+    pub fn supports(&self, cap: &str) -> bool {
+        self.server_caps.iter().any(|c| c == cap)
+    }
+
     pub fn supports_binary_proto(&self) -> bool {
         self.server_caps.iter().any(|c| c == "binary-proto")
     }

@@ -80,9 +80,9 @@ pub async fn discover_lan(
         }
         match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
             Ok(Ok((n, src))) => {
-                if let Ok(resp) = proto::RendezvousMessage::decode(&buf[..n]) {
-                    if let Some(proto::rendezvous_message::Union::PeerDiscovery(pd)) = resp.union {
-                        if pd.cmd == "pong" && pd.id != local_id {
+                if let Ok(resp) = proto::RendezvousMessage::decode(&buf[..n])
+                    && let Some(proto::rendezvous_message::Union::PeerDiscovery(pd)) = resp.union
+                        && pd.cmd == "pong" && pd.id != local_id {
                             let service_port = pd.misc.parse::<u16>().unwrap_or(0);
                             peers.push(DiscoveredPeer {
                                 id: pd.id,
@@ -92,8 +92,6 @@ pub async fn discover_lan(
                                 service_port,
                             });
                         }
-                    }
-                }
             }
             Ok(Err(e)) => {
                 tracing::debug!("discovery: recv error: {}", e);
@@ -169,15 +167,12 @@ pub async fn run_discovery_responder(
         tokio::select! {
             _ = cancel.cancelled() => break,
             result = sock.recv_from(&mut buf) => {
-                if let Ok((n, src)) = result {
-                    if let Ok(msg) = proto::RendezvousMessage::decode(&buf[..n]) {
-                        if let Some(proto::rendezvous_message::Union::PeerDiscovery(pd)) = msg.union {
-                            if let Some(resp) = handle_discovery(&pd, &local_id, &hostname, &platform, service_port) {
+                if let Ok((n, src)) = result
+                    && let Ok(msg) = proto::RendezvousMessage::decode(&buf[..n])
+                        && let Some(proto::rendezvous_message::Union::PeerDiscovery(pd)) = msg.union
+                            && let Some(resp) = handle_discovery(&pd, &local_id, &hostname, &platform, service_port) {
                                 let _ = sock.send_to(&resp.encode_to_vec(), src).await;
                             }
-                        }
-                    }
-                }
             }
         }
     }

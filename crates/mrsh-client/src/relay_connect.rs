@@ -50,7 +50,7 @@ pub async fn connect_via_relay(opts: &RelayConnectOptions) -> Result<TlsClient> 
     };
 
     let result = rdv_client
-        .resolve(&opts.device_id)
+        .resolve_with_port(&opts.device_id, opts.port)
         .await
         .context("rendezvous resolve failed")?;
 

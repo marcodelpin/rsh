@@ -12,9 +12,17 @@ use std::sync::OnceLock;
 
 use tokio::sync::broadcast;
 
+/// Type of connection event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EventKind {
+    Connected,
+    Disconnected,
+}
+
 /// A connection event for user notification.
 #[derive(Debug, Clone)]
 pub struct ConnectionEvent {
+    pub kind: EventKind,
     pub peer: SocketAddr,
     pub key_comment: Option<String>,
     pub timestamp: std::time::SystemTime,
@@ -39,8 +47,21 @@ pub fn subscribe() -> Option<broadcast::Receiver<ConnectionEvent>> {
 pub fn notify_connection(peer: SocketAddr, key_comment: Option<String>) {
     if let Some(tx) = SENDER.get() {
         let _ = tx.send(ConnectionEvent {
+            kind: EventKind::Connected,
             peer,
             key_comment,
+            timestamp: std::time::SystemTime::now(),
+        });
+    }
+}
+
+/// Notify about a connection closing.
+pub fn notify_disconnect(peer: SocketAddr) {
+    if let Some(tx) = SENDER.get() {
+        let _ = tx.send(ConnectionEvent {
+            kind: EventKind::Disconnected,
+            peer,
+            key_comment: None,
             timestamp: std::time::SystemTime::now(),
         });
     }

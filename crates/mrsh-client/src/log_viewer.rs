@@ -498,4 +498,160 @@ mod tests {
         app.toggle_view();
         assert_eq!(app.view, View::Entries);
     }
+
+    #[test]
+    fn empty_filter_shows_all() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.refilter();
+        assert_eq!(app.filtered.len(), 3);
+    }
+
+    #[test]
+    fn filter_no_match() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.filter = "zzz-nonexistent".into();
+        app.refilter();
+        assert_eq!(app.filtered.len(), 0);
+        assert!(app.table_state.selected().is_none());
+    }
+
+    #[test]
+    fn filter_by_args() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.filter = "hostname".into();
+        app.refilter();
+        assert_eq!(app.filtered.len(), 1);
+    }
+
+    #[test]
+    fn filter_case_insensitive() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.filter = "GPU".into();
+        app.refilter();
+        assert_eq!(app.filtered.len(), 2);
+    }
+
+    #[test]
+    fn navigation_next_wraps() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.table_state.select(Some(2));
+        app.next();
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn navigation_prev_wraps() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.table_state.select(Some(0));
+        app.prev();
+        assert_eq!(app.table_state.selected(), Some(2));
+    }
+
+    #[test]
+    fn navigation_empty_no_crash() {
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: vec![],
+            filtered: vec![],
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.next();
+        app.prev();
+        assert!(app.table_state.selected().is_none());
+    }
+
+    #[test]
+    fn visible_count_per_view() {
+        let entries = sample_entries();
+        let summaries = session_log::summarize_by_host(&entries);
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries,
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        assert_eq!(app.visible_count(), 3);
+        app.view = View::Summary;
+        assert_eq!(app.visible_count(), 2); // gpu + lab
+    }
+
+    #[test]
+    fn filter_clamps_selection() {
+        let entries = sample_entries();
+        let mut app = App {
+            log_dir: PathBuf::from("/tmp/nonexistent"),
+            all_entries: entries.clone(),
+            filtered: (0..entries.len()).rev().collect(),
+            summaries: vec![],
+            table_state: TableState::default(),
+            filter: String::new(),
+            view: View::Entries,
+        };
+        app.table_state.select(Some(2));
+        app.filter = "lab".into();
+        app.refilter();
+        // Only 1 match, selection should clamp to 0
+        assert_eq!(app.filtered.len(), 1);
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
 }

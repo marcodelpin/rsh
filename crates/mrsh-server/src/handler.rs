@@ -8,6 +8,14 @@ use tracing::{debug, info, warn};
 
 use mrsh_core::{auth, protocol, wire};
 
+/// RAII guard that sends a disconnect notification when dropped.
+struct DisconnectGuard(std::net::SocketAddr);
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        crate::notify::notify_disconnect(self.0);
+    }
+}
+
 use crate::{dispatch, ratelimit, session, shell, sync, tunnel};
 
 /// Send a response, using zstd compression if the client supports it.
@@ -63,12 +71,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Rate limit check — reject banned IPs before wasting TLS/auth resources
-    if let Some(addr) = peer {
-        if ctx.rate_limiter.is_banned(&addr.ip()) {
+    if let Some(addr) = peer
+        && ctx.rate_limiter.is_banned(&addr.ip()) {
             warn!("rate limiter: rejecting banned IP {}", addr.ip());
             return Ok(());
         }
-    }
 
     // Phase 1: Auth (with LoginGraceTime-style timeout)
     let auth_timeout = std::time::Duration::from_secs(30);
@@ -109,6 +116,9 @@ where
     if let Some(addr) = peer {
         crate::notify::notify_connection(addr, client.key_comment.clone());
     }
+
+    // Guard: send disconnect notification when this connection ends (drop)
+    let _disconnect_guard = peer.map(DisconnectGuard);
 
     let use_zstd = client.caps.iter().any(|c| c == "zstd");
     let use_binary = client.caps.iter().any(|c| c == "binary-proto");
@@ -168,6 +178,9 @@ where
                     };
                     crate::exec::handle_exec_stream(&command, &env_vars, &mut stream).await?;
                 }
+                bmsg::LOG_QUERY => {
+                    crate::log_query::handle_log_query(payload, &mut stream).await?;
+                }
                 bmsg::PING => {
                     binproto::send_empty(&mut stream, bmsg::PONG).await?;
                 }
@@ -178,11 +191,10 @@ where
 
                     // Receive PUSH_DATA chunks and write to file
                     let path = std::path::Path::new(&remote_path);
-                    if let Some(parent) = path.parent() {
-                        if !parent.exists() {
+                    if let Some(parent) = path.parent()
+                        && !parent.exists() {
                             std::fs::create_dir_all(parent).ok();
                         }
-                    }
                     let mut file_data = Vec::with_capacity(file_size.min(64 * 1024 * 1024) as usize);
                     loop {
                         let chunk_msg = wire::recv_message(&mut stream).await
@@ -250,13 +262,11 @@ where
                         paths: None, batch_patches: None, env_vars: None,
                     };
                     let resp = dispatch::dispatch(&req, &ctx.session_store).await;
-                    if let dispatch::DispatchResult::Response(r) = resp {
-                        if let Some(ref b64data) = r.output {
-                            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64data) {
+                    if let dispatch::DispatchResult::Response(r) = resp
+                        && let Some(ref b64data) = r.output
+                            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64data) {
                                 binproto::send_msg(&mut stream, bmsg::SCREENSHOT_DATA, &raw).await?;
                             }
-                        }
-                    }
                 }
                 bmsg::SELF_UPDATE => {
                     let path = binproto::parse_pull_req(payload).unwrap_or_default(); // same format
@@ -312,11 +322,10 @@ where
         }
 
         // Apply forced command if set
-        if let Some(ref forced) = client.permissions.forced_command {
-            if req.req_type == "exec" || req.req_type == "exec-as-user" {
+        if let Some(ref forced) = client.permissions.forced_command
+            && (req.req_type == "exec" || req.req_type == "exec-as-user") {
                 req.command = Some(forced.clone());
             }
-        }
 
         match dispatch::dispatch(&req, &ctx.session_store).await {
             dispatch::DispatchResult::Response(response) => {
@@ -718,10 +727,10 @@ where
         if !totp_valid {
             // Try recovery codes
             let mut recovery_used = false;
-            if let Some(ref recovery_path) = ctx.totp_recovery_path {
-                if recovery_path.exists() {
-                    if let Ok(mut recovery_map) = auth::load_totp_recovery(recovery_path) {
-                        if auth::check_recovery_code(
+            if let Some(ref recovery_path) = ctx.totp_recovery_path
+                && recovery_path.exists()
+                    && let Ok(mut recovery_map) = auth::load_totp_recovery(recovery_path)
+                        && auth::check_recovery_code(
                             &totp_resp.totp_code,
                             &key_fingerprint,
                             &mut recovery_map,
@@ -737,9 +746,6 @@ where
                             );
                             recovery_used = true;
                         }
-                    }
-                }
-            }
 
             if !recovery_used {
                 warn!(
@@ -809,7 +815,7 @@ where
 
     Ok(ClientInfo {
         key_comment: matched_key.comment.clone(),
-        client_version: client_version,
+        client_version,
         caps: final_caps,
         permissions: matched_key.permissions.clone(),
         mux_enabled: mux_enabled == Some(true),

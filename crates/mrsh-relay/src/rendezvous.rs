@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{Duration, Instant, timeout};
 
 use crate::codec;
@@ -57,6 +57,8 @@ pub struct RelayNotification {
     pub uuid: String,
     /// Relay server address (hbbr host:port).
     pub relay_server: String,
+    /// Requested target port (0 = default service port, 9822 = tray).
+    pub target_port: u16,
 }
 
 /// Client for hbbs rendezvous protocol.
@@ -219,6 +221,8 @@ struct PeerEntry {
     platform: String,
     /// mrsh command listener port (0 = default 8822).
     service_port: u16,
+    /// Persistent TCP notification stream (for NAT-ed peers that can't receive UDP).
+    tcp_notify: Option<Arc<tokio::sync::Mutex<tokio::net::TcpStream>>>,
 }
 
 /// Default peer expiry time (5 minutes without re-registration).
@@ -335,6 +339,8 @@ impl RendezvousServer {
                 if !rp.id.is_empty() {
                     let has_group = !rp.group_hash.is_empty();
                     let mut map = peers.lock().unwrap();
+                    // Preserve existing TCP notify stream when re-registering via UDP
+                    let existing_tcp = map.get(&rp.id).and_then(|e| e.tcp_notify.clone());
                     map.insert(
                         rp.id.clone(),
                         PeerEntry {
@@ -344,6 +350,7 @@ impl RendezvousServer {
                             hostname: rp.hostname.clone(),
                             platform: rp.platform.clone(),
                             service_port: rp.service_port as u16,
+                            tcp_notify: existing_tcp,
                         },
                     );
                     if has_group {
@@ -616,10 +623,7 @@ impl Client {
             if sock.connect(srv).await.is_err() {
                 continue;
             }
-            match self.do_register(&sock).await {
-                Ok(()) => any_ok = true,
-                Err(_) => {}
-            }
+            if let Ok(()) = self.do_register(&sock).await { any_ok = true }
         }
 
         if any_ok {
@@ -630,6 +634,27 @@ impl Client {
     }
 
     /// Resolve a device ID by trying each configured server.
+    /// Resolve a DeviceID, optionally requesting a specific target port on the device.
+    /// `target_port` = 0 means default (service port 8822), 9822 = tray.
+    pub async fn resolve_with_port(&self, device_id: &str, target_port: u16) -> Result<ResolveResult> {
+        if self.servers.is_empty() {
+            bail!("no rendezvous server configured");
+        }
+
+        let mut last_err = None;
+        for srv in &self.servers {
+            match self.try_server_with_port(device_id, srv, target_port).await {
+                Ok(r) => return Ok(r),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        bail!(
+            "all {} servers failed; last: {}",
+            self.servers.len(),
+            last_err.unwrap()
+        );
+    }
+
     pub async fn resolve(&self, device_id: &str) -> Result<ResolveResult> {
         if self.servers.is_empty() {
             bail!("no rendezvous server configured");
@@ -807,6 +832,21 @@ impl Client {
     }
 
     /// Full resolution against a single server.
+    async fn try_server_with_port(&self, device_id: &str, server: &str, target_port: u16) -> Result<ResolveResult> {
+        let sock = UdpSocket::bind("0.0.0.0:0").await.context("bind UDP")?;
+        sock.connect(server).await.context("connect UDP")?;
+        let _ = self.do_register(&sock).await;
+        let result = self.do_punch_hole(&sock, device_id).await?;
+        if !result.relay_server.is_empty() && result.uuid.is_empty() {
+            let mut result = result;
+            if let Ok(uuid) = self.request_relay_uuid_with_port(server, device_id, &result.relay_server, target_port).await {
+                result.uuid = uuid;
+            }
+            return Ok(result);
+        }
+        Ok(result)
+    }
+
     async fn try_server(&self, device_id: &str, server: &str) -> Result<ResolveResult> {
         let sock = UdpSocket::bind("0.0.0.0:0").await.context("bind UDP")?;
         sock.connect(server).await.context("connect UDP")?;
@@ -867,8 +907,8 @@ impl Client {
         let resp = proto::RendezvousMessage::decode(&buf[..n]).context("decode response")?;
 
         // If server wants our public key, send RegisterPk.
-        if let Some(proto::rendezvous_message::Union::RegisterPeerResponse(pr)) = &resp.union {
-            if pr.request_pk {
+        if let Some(proto::rendezvous_message::Union::RegisterPeerResponse(pr)) = &resp.union
+            && pr.request_pk {
                 // Use a deterministic placeholder key for registration.
                 let pk: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(7).wrapping_add(13) % 255).collect();
 
@@ -891,13 +931,11 @@ impl Client {
                     .context("RegisterPk timeout")?
                     .context("recv RegisterPkResponse")?;
                 let pk_resp = proto::RendezvousMessage::decode(&buf[..n])?;
-                if let Some(proto::rendezvous_message::Union::RegisterPkResponse(r)) = pk_resp.union {
-                    if r.result != proto::register_pk_response::Result::Ok as i32 {
+                if let Some(proto::rendezvous_message::Union::RegisterPkResponse(r)) = pk_resp.union
+                    && r.result != proto::register_pk_response::Result::Ok as i32 {
                         bail!("RegisterPk rejected: {}", r.result);
                     }
-                }
             }
-        }
 
         Ok(())
     }
@@ -1015,6 +1053,36 @@ impl Client {
     }
 
     /// Request a relay UUID from hbbs via TCP (BytesCodec framed).
+    async fn request_relay_uuid_with_port(
+        &self,
+        server: &str,
+        device_id: &str,
+        relay_server: &str,
+        target_port: u16,
+    ) -> Result<String> {
+        let uuid = make_uuid();
+        let tcp = tokio::net::TcpStream::connect(server)
+            .await
+            .context("TCP connect to hbbs")?;
+        let mut tcp = tokio::io::BufWriter::new(tcp);
+        let msg = proto::RendezvousMessage {
+            union: Some(proto::rendezvous_message::Union::RequestRelay(
+                proto::RequestRelay {
+                    id: device_id.to_string(),
+                    uuid: uuid.clone(),
+                    relay_server: relay_server.to_string(),
+                    licence_key: self.licence_key.clone(),
+                    conn_type: proto::ConnType::DefaultConn as i32,
+                    target_port: target_port as i32,
+                    ..Default::default()
+                },
+            )),
+        };
+        codec::write_frame(&mut tcp, &msg.encode_to_vec()).await?;
+        tcp.flush().await?;
+        Ok(uuid)
+    }
+
     async fn request_relay_uuid(
         &self,
         server: &str,
@@ -1124,6 +1192,20 @@ impl Client {
             );
         }
 
+        // Spawn TCP notification listener for NAT traversal.
+        // Opens a persistent TCP connection to hbbs, sends RegisterPeer,
+        // and listens for RelayResponse. This works through symmetric NAT
+        // where UDP notifications from hbbs cannot reach us.
+        {
+            let tcp_cancel = cancel.clone();
+            let tcp_relay_tx = relay_tx.clone();
+            let tcp_reg_bytes = reg_bytes.clone();
+            let tcp_servers = self.servers.clone();
+            tokio::spawn(async move {
+                tcp_notify_loop(tcp_cancel, tcp_relay_tx, &tcp_reg_bytes, &tcp_servers).await;
+            });
+        }
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1136,8 +1218,8 @@ impl Client {
                     }
                 }
                 result = sock.recv_from(&mut buf) => {
-                    if let Ok((n, _src)) = result {
-                        if let Ok(msg) = proto::RendezvousMessage::decode(&buf[..n]) {
+                    if let Ok((n, _src)) = result
+                        && let Ok(msg) = proto::RendezvousMessage::decode(&buf[..n]) {
                             match msg.union {
                                 Some(proto::rendezvous_message::Union::RegisterPeerResponse(_)) => {
                                     tracing::debug!("rendezvous: registered");
@@ -1154,16 +1236,101 @@ impl Client {
                                         let _ = relay_tx.send(RelayNotification {
                                             uuid: rr.uuid,
                                             relay_server: rr.relay_server,
+                                            target_port: rr.target_port as u16,
                                         }).await;
                                     }
                                 }
                                 _ => {}
                             }
                         }
-                    }
                 }
             }
         }
+    }
+}
+
+/// Persistent TCP notification loop: connects to hbbs, registers, and waits for
+/// relay notifications over TCP. Reconnects on failure with backoff.
+/// This is the NAT traversal fix: symmetric NAT blocks UDP replies from hbbs,
+/// but the TCP connection initiated by us stays open through NAT.
+async fn tcp_notify_loop(
+    cancel: tokio_util::sync::CancellationToken,
+    relay_tx: tokio::sync::mpsc::Sender<RelayNotification>,
+    reg_bytes: &[u8],
+    servers: &[String],
+) {
+    let mut backoff = Duration::from_secs(5);
+    let max_backoff = Duration::from_secs(60);
+
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        for srv in servers {
+            let stream = match timeout(Duration::from_secs(10), TcpStream::connect(srv)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    tracing::debug!("tcp notify: connect to {} failed: {}", srv, e);
+                    continue;
+                }
+                Err(_) => {
+                    tracing::debug!("tcp notify: connect to {} timed out", srv);
+                    continue;
+                }
+            };
+
+            tracing::info!("tcp notify: connected to {}, registering via TCP", srv);
+
+            // Send RegisterPeer over TCP (length-prefixed frame).
+            let mut stream = stream;
+            use tokio::io::AsyncWriteExt;
+            let frame = codec::encode_frame(reg_bytes);
+            if let Err(e) = stream.write_all(&frame).await {
+                tracing::warn!("tcp notify: send register to {} failed: {}", srv, e);
+                continue;
+            }
+
+            // Read relay notifications until connection drops.
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = codec::decode_frame(&mut stream) => {
+                        match result {
+                            Ok(data) => {
+                                if let Ok(msg) = proto::RendezvousMessage::decode(&data[..])
+                                    && let Some(proto::rendezvous_message::Union::RelayResponse(rr)) = msg.union
+                                        && !rr.uuid.is_empty() {
+                                            tracing::info!(
+                                                "tcp notify: relay notification uuid={} relay={}",
+                                                rr.uuid, rr.relay_server
+                                            );
+                                            let _ = relay_tx.send(RelayNotification {
+                                                uuid: rr.uuid,
+                                                relay_server: rr.relay_server,
+                                                target_port: rr.target_port as u16,
+                                            }).await;
+                                        }
+                            }
+                            Err(e) => {
+                                tracing::debug!("tcp notify: read from {} failed: {}, reconnecting", srv, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reset backoff on successful connection (even if it eventually disconnected)
+            backoff = Duration::from_secs(5);
+        }
+
+        // Backoff before reconnecting
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(max_backoff);
     }
 }
 
@@ -1184,7 +1351,34 @@ async fn handle_tcp_relay_request(
     .context("tcp relay read timeout")?
     .context("tcp relay read")?;
 
-    let msg = proto::RendezvousMessage::decode(&data[..]).context("decode RequestRelay")?;
+    let msg = proto::RendezvousMessage::decode(&data[..]).context("decode TCP message")?;
+
+    // Handle RegisterPeer via TCP: store the TCP stream for relay notifications.
+    // This is the key fix for NAT-ed peers: they open a persistent TCP connection
+    // to hbbs and receive relay notifications over it instead of unreliable UDP.
+    if let Some(proto::rendezvous_message::Union::RegisterPeer(ref rp)) = msg.union
+        && !rp.id.is_empty() {
+            tracing::info!("rdv tcp: register {} from {} (TCP notify channel)", rp.id, peer);
+            let tcp_stream = Arc::new(tokio::sync::Mutex::new(stream));
+            let mut map = peers.lock().unwrap();
+            let existing = map.get(&rp.id);
+            let addr = existing.map(|e| e.addr).unwrap_or(peer);
+            map.insert(
+                rp.id.clone(),
+                PeerEntry {
+                    addr,
+                    last_seen: Instant::now(),
+                    group_hash: rp.group_hash.clone(),
+                    hostname: rp.hostname.clone(),
+                    platform: rp.platform.clone(),
+                    service_port: rp.service_port as u16,
+                    tcp_notify: Some(tcp_stream),
+                },
+            );
+            // Don't return — the TCP stream is now owned by PeerEntry.
+            // The connection stays open until the peer disconnects.
+            return Ok(());
+        }
 
     if let Some(proto::rendezvous_message::Union::RequestRelay(rr)) = msg.union {
         // Validate key.
@@ -1204,6 +1398,12 @@ async fn handle_tcp_relay_request(
             map.get(&rr.id).map(|e| e.addr)
         };
 
+        // Look up target's TCP notify stream (for NAT-ed peers).
+        let target_tcp = {
+            let map = peers.lock().unwrap();
+            map.get(&rr.id).and_then(|e| e.tcp_notify.clone())
+        };
+
         if let Some(addr) = target_addr {
             let relay = if rr.relay_server.is_empty() {
                 relay_server.to_string()
@@ -1211,19 +1411,44 @@ async fn handle_tcp_relay_request(
                 rr.relay_server
             };
 
-            // Forward RelayResponse to target device via UDP.
+            // Build RelayResponse message (forward target_port from client request).
             let response = proto::RendezvousMessage {
                 union: Some(proto::rendezvous_message::Union::RelayResponse(
                     proto::RelayResponse {
                         uuid: rr.uuid.clone(),
                         relay_server: relay,
                         socket_addr: encode_socket_addr(&peer),
+                        target_port: rr.target_port,
                         ..Default::default()
                     },
                 )),
             };
-            sock.send_to(&response.encode_to_vec(), addr).await?;
-            tracing::info!("rdv: relay {} → {} (uuid={})", rr.id, addr, rr.uuid);
+            let response_bytes = response.encode_to_vec();
+
+            // Try TCP notification first (reliable through NAT), fallback to UDP.
+            let mut sent_tcp = false;
+            if let Some(tcp_stream) = target_tcp {
+                use tokio::io::AsyncWriteExt;
+                let frame = codec::encode_frame(&response_bytes);
+                match timeout(
+                    Duration::from_secs(5),
+                    tcp_stream.lock().await.write_all(&frame),
+                ).await {
+                    Ok(Ok(())) => {
+                        tracing::info!("rdv: relay {} → TCP (uuid={})", rr.id, rr.uuid);
+                        sent_tcp = true;
+                    }
+                    _ => {
+                        tracing::warn!("rdv: TCP notify to {} failed, falling back to UDP", rr.id);
+                    }
+                }
+            }
+
+            // Always send UDP too (belt + suspenders — dedup on receiver side).
+            if !sent_tcp {
+                sock.send_to(&response_bytes, addr).await?;
+                tracing::info!("rdv: relay {} → {} UDP (uuid={})", rr.id, addr, rr.uuid);
+            }
         } else {
             tracing::debug!("rdv: relay for {} — not registered", rr.id);
         }

@@ -15,6 +15,8 @@ const IDM_STATUS: u32 = 1001;
 #[cfg(target_os = "windows")]
 const IDM_OPEN_LOG: u32 = 1002;
 #[cfg(target_os = "windows")]
+const IDM_COPY_ID: u32 = 1004;
+#[cfg(target_os = "windows")]
 const IDM_QUIT: u32 = 1003;
 
 // Custom message for tray icon callbacks
@@ -29,18 +31,33 @@ mod win32_tray {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
         NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::*;
     #[allow(unused_imports)]
     use windows::Win32::Graphics::Gdi::*;
 
+    /// Idle threshold (seconds). Toast only when first connection arrives after
+    /// this many seconds of no active connections.
+    const IDLE_THRESHOLD_SECS: u64 = 300; // 5 minutes
+
     /// Global state accessible from the window procedure.
     struct TrayState {
         cancel: tokio_util::sync::CancellationToken,
         port: u16,
+        device_id: String,
         notify_rx: Option<tokio::sync::broadcast::Receiver<crate::notify::ConnectionEvent>>,
+        /// Number of currently active connections.
+        active_connections: u32,
+        /// When the last connection closed (for idle detection).
+        last_disconnect: std::time::Instant,
+        /// HWND for tray icon updates (stored as isize for Send safety).
+        hwnd_raw: isize,
+        /// Normal icon handle (stored as isize for Send safety).
+        icon_normal_raw: isize,
+        /// Active (red) icon handle (stored as isize for Send safety).
+        icon_active_raw: isize,
     }
 
     static TRAY_STATE: Mutex<Option<TrayState>> = Mutex::new(None);
@@ -52,35 +69,6 @@ mod win32_tray {
             buf[i] = c;
         }
         buf
-    }
-
-    /// Create a simple 16×16 blue square HICON via CreateIcon.
-    fn create_fallback_icon() -> HICON {
-        let size: i32 = 16;
-        let num_pixels = (size * size) as usize;
-        // AND mask: all zeros = fully opaque
-        let and_mask = vec![0u8; num_pixels / 8];
-        // XOR mask: BGR0 per pixel (blue = 0xCC, green = 0x66, red = 0x33)
-        let mut xor_mask = vec![0u8; num_pixels * 4];
-        for pixel in xor_mask.chunks_exact_mut(4) {
-            pixel[0] = 0xCC; // B
-            pixel[1] = 0x66; // G
-            pixel[2] = 0x33; // R
-            pixel[3] = 0x00;
-        }
-        unsafe {
-            let hinstance = GetModuleHandleW(None).unwrap_or_default();
-            CreateIcon(
-                Some(hinstance.into()),
-                size,
-                size,
-                1,  // planes
-                32, // bits per pixel
-                and_mask.as_ptr(),
-                xor_mask.as_ptr(),
-            )
-            .unwrap_or_default()
-        }
     }
 
     /// Window procedure for our hidden tray window.
@@ -101,13 +89,13 @@ mod win32_tray {
                         let hmenu = CreatePopupMenu().unwrap_or_default();
 
                         let version = env!("CARGO_PKG_VERSION");
-                        let port = TRAY_STATE
+                        let (port, device_id) = TRAY_STATE
                             .lock()
                             .ok()
-                            .and_then(|s| s.as_ref().map(|ts| ts.port))
-                            .unwrap_or(9822);
+                            .and_then(|s| s.as_ref().map(|ts| (ts.port, ts.device_id.clone())))
+                            .unwrap_or((9822, String::new()));
                         let status_text: Vec<u16> =
-                            format!("rsh v{version} (port {port})")
+                            format!("mrsh v{version} (port {port})")
                                 .encode_utf16()
                                 .chain(std::iter::once(0))
                                 .collect();
@@ -117,6 +105,20 @@ mod win32_tray {
                             IDM_STATUS as usize,
                             PCWSTR(status_text.as_ptr()),
                         );
+                        // Show DeviceID (clickable → copies to clipboard)
+                        if !device_id.is_empty() {
+                            let id_text: Vec<u16> =
+                                format!("ID: {} (click to copy)", device_id)
+                                    .encode_utf16()
+                                    .chain(std::iter::once(0))
+                                    .collect();
+                            let _ = AppendMenuW(
+                                hmenu,
+                                MF_STRING,
+                                IDM_COPY_ID as usize,
+                                PCWSTR(id_text.as_ptr()),
+                            );
+                        }
                         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, None);
                         let _ = AppendMenuW(
                             hmenu,
@@ -149,14 +151,20 @@ mod win32_tray {
                 WM_COMMAND => {
                     let cmd = (wparam.0 & 0xFFFF) as u32;
                     match cmd {
+                        IDM_COPY_ID => {
+                            if let Ok(state) = TRAY_STATE.lock()
+                                && let Some(ts) = state.as_ref()
+                                    && !ts.device_id.is_empty() {
+                                        copy_to_clipboard(&ts.device_id);
+                                    }
+                        }
                         IDM_OPEN_LOG => super::open_log_file(),
                         IDM_QUIT => {
                             tracing::info!("tray quit requested");
-                            if let Ok(state) = TRAY_STATE.lock() {
-                                if let Some(ts) = state.as_ref() {
+                            if let Ok(state) = TRAY_STATE.lock()
+                                && let Some(ts) = state.as_ref() {
                                     ts.cancel.cancel();
                                 }
-                            }
                             PostQuitMessage(0);
                         }
                         _ => {}
@@ -164,33 +172,79 @@ mod win32_tray {
                     LRESULT(0)
                 }
                 WM_TIMER => {
-                    let events: Vec<crate::notify::ConnectionEvent> = {
+                    // Process connection events: track active count, toast on 0→1 after idle,
+                    // swap icon color based on active connections.
+                    let (toast_msg, icon_change) = {
                         if let Ok(mut state) = TRAY_STATE.lock() {
                             if let Some(ts) = state.as_mut() {
-                                let mut v = Vec::new();
+                                let was_active = ts.active_connections > 0;
+                                let mut first_connect_after_idle = false;
+
                                 if let Some(ref mut rx) = ts.notify_rx {
                                     while let Ok(ev) = rx.try_recv() {
-                                        v.push(ev);
+                                        match ev.kind {
+                                            crate::notify::EventKind::Connected => {
+                                                if ts.active_connections == 0 {
+                                                    // 0→1 transition: check idle threshold
+                                                    let idle_secs = ts.last_disconnect.elapsed().as_secs();
+                                                    if idle_secs >= IDLE_THRESHOLD_SECS {
+                                                        first_connect_after_idle = true;
+                                                    }
+                                                }
+                                                ts.active_connections = ts.active_connections.saturating_add(1);
+                                                tracing::info!(
+                                                    "connection from {} ({}) [active: {}]",
+                                                    ev.peer.ip(),
+                                                    ev.key_comment.as_deref().unwrap_or("unknown"),
+                                                    ts.active_connections,
+                                                );
+                                            }
+                                            crate::notify::EventKind::Disconnected => {
+                                                ts.active_connections = ts.active_connections.saturating_sub(1);
+                                                if ts.active_connections == 0 {
+                                                    ts.last_disconnect = std::time::Instant::now();
+                                                }
+                                                tracing::debug!(
+                                                    "disconnect {} [active: {}]",
+                                                    ev.peer.ip(), ts.active_connections
+                                                );
+                                            }
+                                        }
                                     }
                                 }
-                                v
+
+                                let is_active = ts.active_connections > 0;
+                                let icon_changed = was_active != is_active;
+                                let icon = if icon_changed && ts.hwnd_raw != 0 {
+                                    Some(if is_active {
+                                        (ts.hwnd_raw, ts.icon_active_raw)
+                                    } else {
+                                        (ts.hwnd_raw, ts.icon_normal_raw)
+                                    })
+                                } else {
+                                    None
+                                };
+
+                                let toast = if first_connect_after_idle {
+                                    Some("Remote connection established".to_string())
+                                } else {
+                                    None
+                                };
+
+                                (toast, icon)
                             } else {
-                                Vec::new()
+                                (None, None)
                             }
                         } else {
-                            Vec::new()
+                            (None, None)
                         }
                     };
-                    for event in events {
-                        let who =
-                            event.key_comment.as_deref().unwrap_or("unknown key");
-                        let msg = format!(
-                            "Connection from {} ({})",
-                            event.peer.ip(),
-                            who
-                        );
-                        tracing::info!("tray notification: {}", msg);
+
+                    if let Some(msg) = toast_msg {
                         super::show_balloon(&msg);
+                    }
+                    if let Some((h, icon)) = icon_change {
+                        update_tray_icon(HWND(h as *mut _), HICON(icon as *mut _));
                     }
 
                     let cancelled = TRAY_STATE
@@ -214,21 +268,100 @@ mod win32_tray {
         }
     }
 
+    /// Create a simple colored 16×16 HICON (for tray status indication).
+    fn create_color_icon(r: u8, g: u8, b: u8) -> HICON {
+        let size: i32 = 16;
+        let num_pixels = (size * size) as usize;
+        let and_mask = vec![0u8; num_pixels / 8];
+        let mut xor_mask = vec![0u8; num_pixels * 4];
+        for pixel in xor_mask.chunks_exact_mut(4) {
+            pixel[0] = b; // B
+            pixel[1] = g; // G
+            pixel[2] = r; // R
+            pixel[3] = 0;
+        }
+        unsafe {
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            CreateIcon(
+                Some(hinstance.into()),
+                size,
+                size,
+                1,
+                32,
+                and_mask.as_ptr(),
+                xor_mask.as_ptr(),
+            )
+            .unwrap_or_default()
+        }
+    }
+
+    /// Update the tray icon (swap between normal and active).
+    fn update_tray_icon(hwnd: HWND, icon: HICON) {
+        unsafe {
+            let mut nid = NOTIFYICONDATAW::default();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON;
+            nid.hIcon = icon;
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    /// Copy text to the Windows clipboard.
+    fn copy_to_clipboard(text: &str) {
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+        use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+        unsafe {
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = wide.len() * 2;
+
+            if OpenClipboard(None).is_ok() {
+                let _ = EmptyClipboard();
+                if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
+                    let ptr = GlobalLock(hmem);
+                    if !ptr.is_null() {
+                        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, ptr as *mut u8, bytes);
+                        let _ = GlobalUnlock(hmem);
+                        let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(windows::Win32::Foundation::HANDLE(hmem.0 as _)));
+                    }
+                }
+                let _ = CloseClipboard();
+            }
+        }
+    }
+
     /// Run the tray — creates hidden window, registers tray icon, message loop.
     pub fn run(
         cancel: tokio_util::sync::CancellationToken,
         port: u16,
+        device_id: String,
     ) -> anyhow::Result<()> {
-        tracing::info!("tray: starting Win32 tray on port {}", port);
+        tracing::info!("tray: starting Win32 tray on port {} (id: {})", port, device_id);
 
         // Set up notification channel for connection events
         let notify_rx = crate::notify::subscribe();
 
         // Store state for wndproc
+        // Create colored icon for active connections indication
+        let icon_active = create_color_icon(0xCC, 0x33, 0x33); // Red = active connections
+
         *TRAY_STATE.lock().unwrap() = Some(TrayState {
             cancel: cancel.clone(),
             port,
+            device_id: device_id.clone(),
             notify_rx,
+            active_connections: 0,
+            last_disconnect: std::time::Instant::now() - std::time::Duration::from_secs(IDLE_THRESHOLD_SECS + 1),
+            hwnd_raw: 0,
+            icon_normal_raw: 0, // set after icon is loaded
+            icon_active_raw: icon_active.0 as isize,
         });
 
         unsafe {
@@ -264,7 +397,7 @@ mod win32_tray {
                 use windows::Win32::Foundation::HINSTANCE;
                 // winres embeds icon as MAKEINTRESOURCE(1) — integer ID, not string.
                 // PCWSTR from a raw integer: low word = resource ID, high word = 0.
-                let res_id = windows::core::PCWSTR(1 as *const u16);
+                let res_id = windows::core::PCWSTR(std::ptr::dangling::<u16>());
                 let exe_icon = LoadImageW(
                     Some(HINSTANCE(hinstance.0)),
                     res_id,
@@ -277,7 +410,12 @@ mod win32_tray {
                     _ => LoadIconW(None, IDI_APPLICATION)?,
                 }
             };
-            let tooltip = str_to_wide_buf::<128>(&format!("mrsh v{} (port {})", env!("CARGO_PKG_VERSION"), port));
+            let tip_text = if device_id.is_empty() {
+                format!("mrsh v{} (port {})", env!("CARGO_PKG_VERSION"), port)
+            } else {
+                format!("mrsh v{} (port {}) ID:{}", env!("CARGO_PKG_VERSION"), port, device_id)
+            };
+            let tooltip = str_to_wide_buf::<128>(&tip_text);
 
             let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
             nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -288,6 +426,14 @@ mod win32_tray {
             nid.hIcon = hicon;
             nid.szTip = tooltip;
             let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+
+            // Store hwnd and icon for runtime icon swapping
+            if let Ok(mut state) = TRAY_STATE.lock() {
+                if let Some(ts) = state.as_mut() {
+                    ts.hwnd_raw = hwnd.0 as isize;
+                    ts.icon_normal_raw = hicon.0 as isize;
+                }
+            }
 
             // Timer for checking notifications and cancel token (every 1 second)
             SetTimer(Some(hwnd), 1, 1000, None);
@@ -312,8 +458,8 @@ mod win32_tray {
 
 /// Run the system tray icon (blocks the current thread).
 #[cfg(target_os = "windows")]
-pub fn run_tray(cancel: tokio_util::sync::CancellationToken, port: u16) -> anyhow::Result<()> {
-    win32_tray::run(cancel, port)
+pub fn run_tray(cancel: tokio_util::sync::CancellationToken, port: u16, device_id: String) -> anyhow::Result<()> {
+    win32_tray::run(cancel, port, device_id)
 }
 
 /// Show a Windows balloon/toast notification for a connection event.
@@ -367,7 +513,7 @@ fn find_data_dir() -> std::path::PathBuf {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn run_tray(_cancel: tokio_util::sync::CancellationToken, _port: u16) -> anyhow::Result<()> {
+pub fn run_tray(_cancel: tokio_util::sync::CancellationToken, _port: u16, _device_id: String) -> anyhow::Result<()> {
     anyhow::bail!("system tray not available on this platform")
 }
 

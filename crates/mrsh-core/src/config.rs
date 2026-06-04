@@ -288,11 +288,10 @@ impl Config {
                     }
                 }
                 "sessionlogretain" => {
-                    if current_host.is_none() {
-                        if let Ok(days) = value.parse::<u32>() {
+                    if current_host.is_none()
+                        && let Ok(days) = value.parse::<u32>() {
                             cfg.session_log_retain = days;
                         }
-                    }
                 }
                 _ => {} // Ignore unknown keys
             }
@@ -323,11 +322,10 @@ impl Config {
     /// Check if session logging is enabled for a given host.
     /// Per-host setting overrides global.
     pub fn is_session_log_enabled(&self, host: &str) -> bool {
-        if let Some(hc) = self.find_host(host) {
-            if let Some(enabled) = hc.session_log {
+        if let Some(hc) = self.find_host(host)
+            && let Some(enabled) = hc.session_log {
                 return enabled;
             }
-        }
         self.session_log
     }
 

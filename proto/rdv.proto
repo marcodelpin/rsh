@@ -127,6 +127,8 @@ message RequestRelay {
   string licence_key = 6;
   ConnType conn_type = 7;
   string token = 8;
+  // rsh extension: target port on the device (0 = default 8822, 9822 = tray)
+  int32 target_port = 9;
 }
 
 message RelayResponse {
@@ -139,6 +141,8 @@ message RelayResponse {
   }
   string refuse_reason = 6;
   string version = 7;
+  // rsh extension: requested target port (0 = default 8822, 9822 = tray)
+  int32 target_port = 8;
 }
 
 // --- Same-LAN detection ---

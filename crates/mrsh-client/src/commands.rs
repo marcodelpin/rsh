@@ -412,6 +412,51 @@ pub async fn plugin<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(resp.output.unwrap_or_default())
 }
 
+// ── Log query ──────────────────────────────────────────────────
+
+/// Remote log query: stream matching lines from a file on the server.
+/// Uses binary protocol LOG_QUERY/LOG_DATA/LOG_END.
+pub async fn log_query<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut RshClient<S>,
+    path: &str,
+    pattern: &str,
+    flags: u8,
+    tail_lines: u32,
+    max_matches: u32,
+) -> Result<(u64, u64)> {
+    use mrsh_core::binproto::{self, msg};
+
+    let payload = binproto::build_log_query(path, pattern, flags, tail_lines, 0, max_matches);
+    binproto::send_msg(client.stream_mut(), msg::LOG_QUERY, &payload).await?;
+
+    let mut lines_matched = 0u64;
+    let mut lines_scanned = 0u64;
+
+    loop {
+        let (type_id, data) = binproto::recv_msg(client.stream_mut()).await?;
+        match type_id {
+            msg::LOG_DATA => {
+                let line = String::from_utf8_lossy(&data);
+                println!("{}", line);
+                lines_matched += 1;
+            }
+            msg::LOG_END => {
+                let (scanned, matched, _offset) = binproto::parse_log_end(&data)?;
+                lines_scanned = scanned;
+                lines_matched = matched;
+                break;
+            }
+            msg::ERROR => {
+                let err = binproto::parse_error(&data)?;
+                bail!("server: {}", err);
+            }
+            other => bail!("unexpected message type 0x{:02x}", other),
+        }
+    }
+
+    Ok((lines_scanned, lines_matched))
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 fn check_response(resp: &Response) -> Result<()> {

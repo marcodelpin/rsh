@@ -28,7 +28,7 @@ pub fn handle_input(command: &str, action: &str, args: &str) -> Response {
         "mouse" => handle_mouse(action, args),
         "key" => handle_key(action, args),
         "window" => handle_window(action, args),
-        other => error_response(&format!("unknown input command: {}", other)),
+        other => Response::error(&format!("unknown input command: {}", other)),
     }
 }
 
@@ -89,13 +89,13 @@ fn handle_mouse(action: &str, args: &str) -> Response {
             unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
             ok_response("ok")
         }
-        other => error_response(&format!("unknown mouse action: {}", other)),
+        other => Response::error(&format!("unknown mouse action: {}", other)),
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn handle_mouse(action: &str, _args: &str) -> Response {
-    error_response(&format!("mouse {} not available on this platform", action))
+    Response::error(&format!("mouse {} not available on this platform", action))
 }
 
 // ── Keyboard ───────────────────────────────────────────────────────
@@ -161,13 +161,13 @@ fn handle_key(action: &str, args: &str) -> Response {
             unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
             ok_response("ok")
         }
-        other => error_response(&format!("unknown key action: {}", other)),
+        other => Response::error(&format!("unknown key action: {}", other)),
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 fn handle_key(action: &str, _args: &str) -> Response {
-    error_response(&format!("key {} not available on this platform", action))
+    Response::error(&format!("key {} not available on this platform", action))
 }
 
 // ── Window management ──────────────────────────────────────────────
@@ -222,7 +222,7 @@ fn handle_window(action: &str, args: &str) -> Response {
             unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok() };
             ok_response("ok")
         }
-        other => error_response(&format!("unknown window action: {}", other)),
+        other => Response::error(&format!("unknown window action: {}", other)),
     }
 }
 
@@ -270,7 +270,7 @@ unsafe extern "system" fn enum_windows_callback(
 
 #[cfg(not(target_os = "windows"))]
 fn handle_window(action: &str, _args: &str) -> Response {
-    error_response(&format!("window {} not available on this platform", action))
+    Response::error(&format!("window {} not available on this platform", action))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -345,16 +345,6 @@ fn ok_response(output: &str) -> Response {
     }
 }
 
-fn error_response(msg: &str) -> Response {
-    Response {
-        success: false,
-        output: None,
-        error: Some(msg.to_string()),
-        size: None,
-        binary: None,
-        gzip: None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

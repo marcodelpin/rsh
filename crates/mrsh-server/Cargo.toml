@@ -6,15 +6,14 @@ edition.workspace = true
 [dependencies]
 mrsh-core.workspace = true
 mrsh-transfer.workspace = true
-mrsh-relay.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 rand.workspace = true
 adler32 = "1"
+regex = "1"
 base64 = "0.22"
 zstd = "0.13"
 flate2 = "1"
@@ -40,6 +39,12 @@ nix = { version = "0.29", features = ["signal"] }
 default = []
 quic = ["quinn"]
 ssh = ["russh", "russh-sftp"]
+no-exec = []
+no-shell = []
+no-reboot = []
+no-screenshot = []
+no-self-update = []
+no-clipboard = []
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -55,6 +60,9 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
 ] }
 windows-service = "0.8"
 libloading = "0.8"

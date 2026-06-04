@@ -3,7 +3,6 @@
 //! Supports single files and directories (walk + per-file delta).
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use mrsh_core::protocol::{Request, Response};
 use mrsh_core::wire;
 use mrsh_transfer::delta;
@@ -554,14 +553,13 @@ pub async fn pull_dir<S: AsyncRead + AsyncWrite + Unpin>(
         }
 
         // Backup local file before overwrite if requested
-        if let Some(ref suffix) = opts.backup_suffix {
-            if local_file.exists() {
+        if let Some(ref suffix) = opts.backup_suffix
+            && local_file.exists() {
                 let backup_path = format!("{}{}", local_file.display(), suffix);
                 if let Err(e) = std::fs::copy(&local_file, &backup_path) {
                     eprintln!("  backup warning: {}: {}", backup_path, e);
                 }
             }
-        }
 
         // Read existing local file for delta sync
         let local_data = std::fs::read(&local_file).ok();

@@ -58,7 +58,7 @@ pub fn handle_sync(req: &protocol::Request) -> Response {
     let path = if !raw_path.is_empty() {
         match sanitize_path(raw_path) {
             Ok(p) => p,
-            Err(e) => return error_response(&e),
+            Err(e) => return Response::error(&e),
         }
     } else {
         raw_path
@@ -90,7 +90,7 @@ pub fn handle_sync(req: &protocol::Request) -> Response {
             let patches = req.batch_patches.as_deref().unwrap_or(&[]);
             handle_find_and_move(patches)
         }
-        other => error_response(&format!("unknown sync type: {}", other)),
+        other => Response::error(&format!("unknown sync type: {}", other)),
     }
 }
 
@@ -127,7 +127,7 @@ where
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(e) => {
-            let resp = error_response(&format!("read {}: {}", path, e));
+            let resp = Response::error(&format!("read {}: {}", path, e));
             wire::send_json(stream, &resp).await?;
             return Ok(());
         }
@@ -227,20 +227,18 @@ where
 
     // Validate path and ensure parent directory exists
     if path.is_empty() {
-        let resp = error_response("missing path");
+        let resp = Response::error("missing path");
         wire::send_json(stream, &resp).await?;
         return Ok(());
     }
 
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.exists() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                let resp = error_response(&format!("create parent dir: {}", e));
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.exists()
+            && let Err(e) = std::fs::create_dir_all(parent) {
+                let resp = Response::error(&format!("create parent dir: {}", e));
                 wire::send_json(stream, &resp).await?;
                 return Ok(());
             }
-        }
-    }
 
     // Send ack — client can start streaming
     let ack = Response {
@@ -267,7 +265,7 @@ where
             b'D' => {
                 // D + flag(1) + len(4 BE) + payload
                 if msg.len() < 6 {
-                    let resp = error_response("malformed D message: too short");
+                    let resp = Response::error("malformed D message: too short");
                     wire::send_json(stream, &resp).await?;
                     return Ok(());
                 }
@@ -275,7 +273,7 @@ where
                 let payload_len =
                     u32::from_be_bytes([msg[2], msg[3], msg[4], msg[5]]) as usize;
                 if msg.len() < 6 + payload_len {
-                    let resp = error_response(&format!(
+                    let resp = Response::error(&format!(
                         "malformed D message: expected {} payload bytes, got {}",
                         payload_len,
                         msg.len() - 6
@@ -303,7 +301,7 @@ where
                 break;
             }
             other => {
-                let resp = error_response(&format!("unexpected message type: 0x{:02x}", other));
+                let resp = Response::error(&format!("unexpected message type: 0x{:02x}", other));
                 wire::send_json(stream, &resp).await?;
                 return Ok(());
             }
@@ -330,7 +328,7 @@ where
             wire::send_json(stream, &resp).await?;
         }
         Err(e) => {
-            let resp = error_response(&format!("write {}: {}", path, e));
+            let resp = Response::error(&format!("write {}: {}", path, e));
             wire::send_json(stream, &resp).await?;
         }
     }
@@ -354,7 +352,7 @@ fn handle_get_signatures(path: &str) -> Response {
                     gzip: None,
                 };
             }
-            return error_response(&format!("read {}: {}", path, e));
+            return Response::error(&format!("read {}: {}", path, e));
         }
     };
 
@@ -370,7 +368,7 @@ fn handle_get_signatures(path: &str) -> Response {
             binary: None,
             gzip: None,
         },
-        Err(e) => error_response(&format!("serialize signatures: {}", e)),
+        Err(e) => Response::error(&format!("serialize signatures: {}", e)),
     }
 }
 
@@ -378,7 +376,7 @@ fn handle_get_signatures(path: &str) -> Response {
 fn handle_compute_delta(path: &str, remote_sigs: &[delta::BlockSig]) -> Response {
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(e) => return error_response(&format!("read {}: {}", path, e)),
+        Err(e) => return Response::error(&format!("read {}: {}", path, e)),
     };
 
     let ops = delta::compute_delta(&data, remote_sigs);
@@ -387,7 +385,7 @@ fn handle_compute_delta(path: &str, remote_sigs: &[delta::BlockSig]) -> Response
     // Gzip + base64 the delta JSON
     let json = match serde_json::to_vec(&proto_ops) {
         Ok(j) => j,
-        Err(e) => return error_response(&format!("serialize delta: {}", e)),
+        Err(e) => return Response::error(&format!("serialize delta: {}", e)),
     };
 
     let compressed = gzip_compress(&json);
@@ -414,7 +412,7 @@ fn handle_apply_patch(
         && !parent.exists()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
-        return error_response(&format!("create dir: {}", e));
+        return Response::error(&format!("create dir: {}", e));
     }
 
     // If content provided, write directly (full file transfer)
@@ -422,7 +420,7 @@ fn handle_apply_patch(
         // Try to decompress if gzipped
         let raw = match base64::engine::general_purpose::STANDARD.decode(content_b64) {
             Ok(d) => d,
-            Err(e) => return error_response(&format!("decode content: {}", e)),
+            Err(e) => return Response::error(&format!("decode content: {}", e)),
         };
 
         let data = gzip_decompress(&raw).unwrap_or(raw);
@@ -436,7 +434,7 @@ fn handle_apply_patch(
                 binary: None,
                 gzip: None,
             },
-            Err(e) => error_response(&format!("write {}: {}", path, e)),
+            Err(e) => Response::error(&format!("write {}: {}", path, e)),
         };
     }
 
@@ -455,11 +453,11 @@ fn handle_apply_patch(
                 binary: None,
                 gzip: None,
             },
-            Err(e) => error_response(&format!("write {}: {}", path, e)),
+            Err(e) => Response::error(&format!("write {}: {}", path, e)),
         };
     }
 
-    error_response("patch requires delta or content")
+    Response::error("patch requires delta or content")
 }
 
 /// Read full file for pull.
@@ -476,7 +474,7 @@ fn handle_pull_file(path: &str) -> Response {
                 gzip: None,
             }
         }
-        Err(e) => error_response(&format!("read {}: {}", path, e)),
+        Err(e) => Response::error(&format!("read {}: {}", path, e)),
     }
 }
 
@@ -484,7 +482,7 @@ fn handle_pull_file(path: &str) -> Response {
 fn handle_walk(path: &str) -> Response {
     let mut entries = Vec::new();
     if let Err(e) = walk_dir(Path::new(path), &mut entries) {
-        return error_response(&format!("walk {}: {}", path, e));
+        return Response::error(&format!("walk {}: {}", path, e));
     }
 
     match serde_json::to_string(&entries) {
@@ -496,7 +494,7 @@ fn handle_walk(path: &str) -> Response {
             binary: None,
             gzip: None,
         },
-        Err(e) => error_response(&format!("serialize walk: {}", e)),
+        Err(e) => Response::error(&format!("serialize walk: {}", e)),
     }
 }
 
@@ -590,7 +588,7 @@ fn handle_batch_signatures(paths: &[String]) -> Response {
             binary: None,
             gzip: None,
         },
-        Err(e) => error_response(&format!("serialize batch-signatures: {}", e)),
+        Err(e) => Response::error(&format!("serialize batch-signatures: {}", e)),
     }
 }
 
@@ -679,7 +677,7 @@ fn handle_batch_patch(patches: &[protocol::BatchPatchItem]) -> Response {
             binary: None,
             gzip: None,
         },
-        Err(e) => error_response(&format!("serialize batch-patch: {}", e)),
+        Err(e) => Response::error(&format!("serialize batch-patch: {}", e)),
     }
 }
 
@@ -703,7 +701,7 @@ where
     let items: Vec<BinMeta> = match serde_json::from_str(meta_json) {
         Ok(v) => v,
         Err(e) => {
-            let resp = error_response(&format!("invalid bin-patch metadata: {}", e));
+            let resp = Response::error(&format!("invalid bin-patch metadata: {}", e));
             wire::send_json(stream, &resp).await?;
             return Ok(());
         }
@@ -793,7 +791,7 @@ where
 fn handle_cache_stats() -> Response {
     let cache = match BLOCK_CACHE.lock() {
         Ok(c) => c,
-        Err(e) => return error_response(&format!("cache lock poisoned: {}", e)),
+        Err(e) => return Response::error(&format!("cache lock poisoned: {}", e)),
     };
     let (blocks, files) = cache.stats();
     let stats = serde_json::json!({ "blocks": blocks, "files": files });
@@ -811,12 +809,12 @@ fn handle_cache_stats() -> Response {
 fn handle_index_dir(path: &str) -> Response {
     let dir = Path::new(path);
     if !dir.is_dir() {
-        return error_response(&format!("not a directory: {}", path));
+        return Response::error(&format!("not a directory: {}", path));
     }
 
     let mut cache = match BLOCK_CACHE.lock() {
         Ok(c) => c,
-        Err(e) => return error_response(&format!("cache lock poisoned: {}", e)),
+        Err(e) => return Response::error(&format!("cache lock poisoned: {}", e)),
     };
 
     let mut count = 0usize;
@@ -830,19 +828,17 @@ fn handle_index_dir(path: &str) -> Response {
             let ft = entry.file_type()?;
             if ft.is_dir() {
                 walk_and_index(&entry.path(), cache, count)?;
-            } else if ft.is_file() {
-                if let Some(p) = entry.path().to_str() {
-                    if cache.index_file(p).is_ok() {
+            } else if ft.is_file()
+                && let Some(p) = entry.path().to_str()
+                    && cache.index_file(p).is_ok() {
                         *count += 1;
                     }
-                }
-            }
         }
         Ok(())
     }
 
     if let Err(e) = walk_and_index(dir, &mut cache, &mut count) {
-        return error_response(&format!("walk {}: {}", path, e));
+        return Response::error(&format!("walk {}: {}", path, e));
     }
 
     // Flush to persist indexed data
@@ -887,12 +883,12 @@ fn handle_smart_sync(content: &str) -> Response {
 
     let requests: Vec<SyncRequest> = match serde_json::from_str(content) {
         Ok(r) => r,
-        Err(e) => return error_response(&format!("invalid smart-sync request: {}", e)),
+        Err(e) => return Response::error(&format!("invalid smart-sync request: {}", e)),
     };
 
     let mut cache = match BLOCK_CACHE.lock() {
         Ok(c) => c,
-        Err(e) => return error_response(&format!("cache lock poisoned: {}", e)),
+        Err(e) => return Response::error(&format!("cache lock poisoned: {}", e)),
     };
 
     let mut results = Vec::with_capacity(requests.len());
@@ -910,23 +906,21 @@ fn handle_smart_sync(content: &str) -> Response {
         let dest_path = Path::new(&req.dest);
         if dest_path.exists() {
             // Check cache first (avoids re-reading file)
-            if let Some(info) = cache.get_file_info(&req.dest) {
-                if info.content_hash == req.hash {
+            if let Some(info) = cache.get_file_info(&req.dest)
+                && info.content_hash == req.hash {
                     result.status = "exists".to_string();
                     results.push(result);
                     continue;
                 }
-            }
 
             // Cache miss or hash mismatch — read actual file to verify
-            if let Ok(data) = std::fs::read(&req.dest) {
-                if hash_sha256(&data) == req.hash {
+            if let Ok(data) = std::fs::read(&req.dest)
+                && hash_sha256(&data) == req.hash {
                     result.status = "exists".to_string();
                     let _ = cache.index_file(&req.dest);
                     results.push(result);
                     continue;
                 }
-            }
         } else {
             // File missing from disk — invalidate stale cache entry
             cache.remove_file(&req.dest);
@@ -941,8 +935,8 @@ fn handle_smart_sync(content: &str) -> Response {
             }
 
             // Verify source still has correct content
-            if let Ok(data) = std::fs::read(src_path) {
-                if hash_sha256(&data) == req.hash {
+            if let Ok(data) = std::fs::read(src_path)
+                && hash_sha256(&data) == req.hash {
                     // Move the file
                     if move_file(src_path, &req.dest).is_ok() {
                         result.status = "moved".to_string();
@@ -952,7 +946,6 @@ fn handle_smart_sync(content: &str) -> Response {
                         break;
                     }
                 }
-            }
         }
         if moved {
             results.push(result);
@@ -995,7 +988,7 @@ fn handle_smart_sync(content: &str) -> Response {
             binary: None,
             gzip: None,
         },
-        Err(e) => error_response(&format!("serialize smart-sync results: {}", e)),
+        Err(e) => Response::error(&format!("serialize smart-sync results: {}", e)),
     }
 }
 
@@ -1089,16 +1082,6 @@ fn gzip_decompress(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn error_response(msg: &str) -> Response {
-    Response {
-        success: false,
-        output: None,
-        error: Some(msg.to_string()),
-        size: None,
-        binary: None,
-        gzip: None,
-    }
-}
 
 // ── Find-and-move: server-side content-hash dedup ──────────────
 
@@ -1128,12 +1111,12 @@ struct FindMoveResult {
 fn handle_find_and_move(patches: &[protocol::BatchPatchItem]) -> Response {
     let content = match patches.first().and_then(|p| p.content.as_deref()) {
         Some(c) => c,
-        None => return error_response("No find-move items provided"),
+        None => return Response::error("No find-move items provided"),
     };
 
     let items: Vec<FindMoveItem> = match serde_json::from_str(content) {
         Ok(v) => v,
-        Err(e) => return error_response(&format!("Invalid find-move items: {}", e)),
+        Err(e) => return Response::error(&format!("Invalid find-move items: {}", e)),
     };
 
     if items.is_empty() {
@@ -1169,17 +1152,15 @@ fn handle_find_and_move(patches: &[protocol::BatchPatchItem]) -> Response {
                 let path = entry.path();
                 if path.is_dir() {
                     walk_and_index(&path, sizes, index);
-                } else if let Ok(meta) = entry.metadata() {
-                    if sizes.contains(&(meta.len() as i64)) {
-                        if let Ok(data) = std::fs::read(&path) {
+                } else if let Ok(meta) = entry.metadata()
+                    && sizes.contains(&(meta.len() as i64))
+                        && let Ok(data) = std::fs::read(&path) {
                             let hash = hash_sha256(&data);
                             index
                                 .entry(hash)
                                 .or_default()
                                 .push(path.to_string_lossy().to_string());
                         }
-                    }
-                }
             }
         }
         drop(entries);
@@ -1200,16 +1181,14 @@ fn handle_find_and_move(patches: &[protocol::BatchPatchItem]) -> Response {
         let dest_path = Path::new(&item.dest);
 
         // Check if destination already has correct file
-        if dest_path.exists() {
-            if let Ok(data) = std::fs::read(dest_path) {
-                if hash_sha256(&data) == item.hash {
+        if dest_path.exists()
+            && let Ok(data) = std::fs::read(dest_path)
+                && hash_sha256(&data) == item.hash {
                     result.found = true;
                     result.source = Some(item.dest.clone());
                     results.push(result);
                     continue;
                 }
-            }
-        }
 
         // Look for file with matching hash
         if let Some(paths) = hash_index.get(&item.hash) {

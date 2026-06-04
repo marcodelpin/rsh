@@ -3,7 +3,7 @@
 //! Navigate with arrow keys / hjkl, Enter to open dirs,
 //! Backspace to go up, 'd' to download, 'q' to quit.
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -27,7 +27,7 @@ where
         start_path.to_string()
     };
 
-    if !atty::is(atty::Stream::Stdin) {
+    if !std::io::stdin().is_terminal() {
         eprintln!("browse requires a terminal");
         return;
     }
@@ -324,20 +324,6 @@ fn join_path(base: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{}/{}", base.trim_end_matches('/'), name)
-    }
-}
-
-// ── Detect terminal (no extra dep) ──────────────────────────────
-
-mod atty {
-    use std::io::IsTerminal;
-    pub enum Stream {
-        Stdin,
-    }
-    pub fn is(stream: Stream) -> bool {
-        match stream {
-            Stream::Stdin => std::io::stdin().is_terminal(),
-        }
     }
 }
 

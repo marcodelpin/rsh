@@ -286,4 +286,37 @@ mod tests {
         let resp = handle_self_update(f.path().to_str().unwrap());
         assert!(!resp.success);
     }
+
+    #[test]
+    fn validate_exactly_at_min_size() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&vec![0u8; MIN_BINARY_SIZE as usize]).unwrap();
+        let result = validate_update_path(f.path().to_str().unwrap());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_just_under_min_size() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&vec![0u8; (MIN_BINARY_SIZE - 1) as usize]).unwrap();
+        let result = validate_update_path(f.path().to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("too small"));
+    }
+
+    #[test]
+    fn validate_empty_file() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let result = validate_update_path(f.path().to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = validate_update_path(dir.path().to_str().unwrap());
+        // Directory exists but metadata.len() == 0 or is not a regular file
+        // Either way it should fail (too small)
+        assert!(result.is_err());
+    }
 }

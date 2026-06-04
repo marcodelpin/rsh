@@ -67,13 +67,11 @@ pub fn is_tunnel_allowed(target: &str, allowed: &[String]) -> bool {
             return true; // exact match
         }
         // Wildcard port: "host:*" matches "host:ANYTHING"
-        if let Some(host_prefix) = pattern.strip_suffix(":*") {
-            if let Some(target_host) = target.rsplit_once(':').map(|(h, _)| h) {
-                if target_host == host_prefix {
+        if let Some(host_prefix) = pattern.strip_suffix(":*")
+            && let Some(target_host) = target.rsplit_once(':').map(|(h, _)| h)
+                && target_host == host_prefix {
                     return true;
                 }
-            }
-        }
     }
     false
 }

@@ -529,13 +529,13 @@ async fn update_single_host(host: &HostStatus, binary_data: &[u8]) -> UpdateResu
             }
 
             eprintln!("CONNECT FAILED: {}", direct_err);
-            return UpdateResult {
+            UpdateResult {
                 name: host.name.clone(),
                 success: false,
                 old_version,
                 new_version: None,
                 error: Some(format!("all transports failed: {}", direct_err)),
-            };
+            }
         }
     }
 }

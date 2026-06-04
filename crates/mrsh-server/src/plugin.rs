@@ -172,12 +172,12 @@ impl PluginManager {
     pub fn execute(&self, command: &str, args: &[String]) -> Response {
         let plugin_name = match self.command_map.get(command) {
             Some(n) => n,
-            None => return error_response(&format!("no plugin handles: {}", command)),
+            None => return Response::error(&format!("no plugin handles: {}", command)),
         };
 
         let plugin = match self.plugins.get(plugin_name) {
             Some(p) => p,
-            None => return error_response(&format!("plugin not loaded: {}", plugin_name)),
+            None => return Response::error(&format!("plugin not loaded: {}", plugin_name)),
         };
 
         // Build request JSON
@@ -207,7 +207,7 @@ impl PluginManager {
                     );
 
                     if rc != 0 {
-                        return error_response(&format!("plugin execute returned {}", rc));
+                        return Response::error(&format!("plugin execute returned {}", rc));
                     }
 
                     let resp_json =
@@ -221,17 +221,17 @@ impl PluginManager {
                             binary: result.data.as_ref().map(|_| true),
                             gzip: None,
                         },
-                        Err(e) => error_response(&format!("parse plugin response: {}", e)),
+                        Err(e) => Response::error(&format!("parse plugin response: {}", e)),
                     }
                 }
-                Err(e) => error_response(&format!("RSH_Execute not found: {}", e)),
+                Err(e) => Response::error(&format!("RSH_Execute not found: {}", e)),
             }
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     pub fn execute(&self, command: &str, _args: &[String]) -> Response {
-        error_response(&format!(
+        Response::error(&format!(
             "plugin execution not available on this platform: {}",
             command
         ))
@@ -253,20 +253,10 @@ pub fn handle_plugin_command(action: &str, manager: &PluginManager) -> Response 
                 gzip: None,
             }
         }
-        other => error_response(&format!("unknown plugin action: {}", other)),
+        other => Response::error(&format!("unknown plugin action: {}", other)),
     }
 }
 
-fn error_response(msg: &str) -> Response {
-    Response {
-        success: false,
-        output: None,
-        error: Some(msg.to_string()),
-        size: None,
-        binary: None,
-        gzip: None,
-    }
-}
 
 #[cfg(test)]
 mod tests {

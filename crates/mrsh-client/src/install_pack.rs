@@ -77,9 +77,18 @@ pub fn generate(opts: &InstallPackOptions) -> Result<PathBuf> {
             hex::encode(h.finalize())
         };
 
+        // Include RendezvousKey from local config (needed for relay auth)
+        let local_config = mrsh_core::config::Config::load();
+        let rdv_key_line = if let Some(ref key) = local_config.rendezvous_key {
+            format!("RendezvousKey {key}\n")
+        } else {
+            String::new()
+        };
+
         let content = format!(
             "# mrsh fleet enrollment config (auto-generated)\n\
              RendezvousServer {rdv_server}\n\
+             {rdv_key_line}\
              EnrollmentToken {token}\n\
              GroupHash {group_hash}\n",
         );
@@ -369,7 +378,7 @@ fn generate_nsi_script(version: &str, port: u16, has_startup: bool, has_config: 
         // Also copy to ProgramData (service data dir — belt + suspenders)
         s.push_str("    CopyFiles /SILENT \"$INSTDIR\\config\" \"$INSTDIR\\config.enrollment\"\n");
     }
-    s.push_str("\n");
+    s.push('\n');
 
     // Install service
     s.push_str("    DetailPrint \"Installing mrsh service...\"\n");
@@ -430,14 +439,12 @@ fn find_makensis() -> Result<PathBuf> {
         if let Ok(output) = std::process::Command::new("which")
             .arg(name)
             .output()
-        {
-            if output.status.success() {
+            && output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !path.is_empty() {
                     return Ok(PathBuf::from(path));
                 }
             }
-        }
     }
 
     // Check PATH using `where` on Windows, `which` on Unix
@@ -446,14 +453,12 @@ fn find_makensis() -> Result<PathBuf> {
         if let Ok(output) = std::process::Command::new("where")
             .arg("makensis.exe")
             .output()
-        {
-            if output.status.success() {
+            && output.status.success() {
                 let path = String::from_utf8_lossy(&output.stdout).trim().lines().next().unwrap_or("").to_string();
                 if !path.is_empty() {
                     return Ok(PathBuf::from(path));
                 }
             }
-        }
     }
 
     // Common locations
@@ -496,14 +501,13 @@ fn find_binary(explicit: &Option<PathBuf>, is_windows: bool) -> Result<PathBuf> 
     }
 
     // Check relative to the running executable's directory
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent() {
             let near_exe = exe_dir.join(format!("../deploy/{binary_name}"));
             if near_exe.exists() {
                 return Ok(near_exe);
             }
         }
-    }
 
     if !is_windows {
         let self_exe = std::env::current_exe().context("get current executable path")?;

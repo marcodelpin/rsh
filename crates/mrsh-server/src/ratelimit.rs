@@ -28,6 +28,12 @@ pub struct AuthRateLimiter {
     records: Mutex<HashMap<IpAddr, IpRecord>>,
 }
 
+impl Default for AuthRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthRateLimiter {
     pub fn new() -> Self {
         Self {
@@ -38,11 +44,10 @@ impl AuthRateLimiter {
     /// Check if an IP is currently banned. Returns true if connection should be rejected.
     pub fn is_banned(&self, ip: &IpAddr) -> bool {
         let records = self.records.lock().unwrap();
-        if let Some(record) = records.get(ip) {
-            if let Some(until) = record.banned_until {
+        if let Some(record) = records.get(ip)
+            && let Some(until) = record.banned_until {
                 return Instant::now() < until;
             }
-        }
         false
     }
 
@@ -100,11 +105,10 @@ impl AuthRateLimiter {
         let now = Instant::now();
         records.retain(|_, record| {
             // Keep if banned and ban not expired
-            if let Some(until) = record.banned_until {
-                if now < until {
+            if let Some(until) = record.banned_until
+                && now < until {
                     return true;
                 }
-            }
             // Keep if has recent failures
             record.failures.retain(|t| now.duration_since(*t) < WINDOW);
             !record.failures.is_empty()
