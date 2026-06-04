@@ -1,4 +1,4 @@
-//! rsh — Remote Shell (Rust rewrite)
+//! mrsh — Remote Shell (Rust rewrite)
 //! CLI entry point: client commands + server mode (Windows).
 //!
 //! Server mode detection:
@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
-use rsh_client::client::ConnectOptions;
+use mrsh_client::client::ConnectOptions;
 use tracing::info;
 
-/// rsh — Remote Shell
+/// mrsh — Remote Shell
 #[derive(Parser, Debug)]
 #[command(
-    name = "rsh",
+    name = "mrsh",
     version,
     about = "Remote shell tool",
     disable_help_flag = true
@@ -114,6 +114,10 @@ struct Cli {
     #[arg(long = "no-mux")]
     no_mux: bool,
 
+    /// Accept changed host keys (update known_hosts instead of rejecting)
+    #[arg(long = "accept-host-key")]
+    accept_host_key: bool,
+
     /// Stop running master for this host
     #[arg(long = "mux-stop")]
     mux_stop: bool,
@@ -127,6 +131,22 @@ struct Cli {
     #[arg(trailing_var_arg = true)]
     args: Vec<String>,
 }
+
+/// Default server port. Override at compile time: MRSH_DEFAULT_PORT=9822
+const DEFAULT_PORT: u16 = match option_env!("MRSH_DEFAULT_PORT") {
+    Some(s) => {
+        // const-compatible u16 parse
+        let b = s.as_bytes();
+        let mut n: u16 = 0;
+        let mut i = 0;
+        while i < b.len() {
+            n = n * 10 + (b[i] - b'0') as u16;
+            i += 1;
+        }
+        n
+    }
+    None => 8822,
+};
 
 /// Known local subcommands that don't require -h (used in server mode detection).
 #[cfg(target_os = "windows")]
@@ -148,16 +168,18 @@ fn compute_timeout_secs(explicit: u64, cmd: &str) -> u64 {
 
 fn main() -> Result<()> {
     // Reattach to parent console for CLI output (we're a windowsgui subsystem binary).
-    // Skip for --tray mode (tray is a GUI app, no console needed — AllocConsole causes
-    // 0xC0000409 crashes on Windows 10 IoT Enterprise LTSC build 19044).
+    // Skip for --tray and --service modes:
+    //   --tray: GUI app, no console needed — AllocConsole causes 0xC0000409 on Win10 IoT LTSC
+    //   --service: SCM background process, output goes to audit.log — AllocConsole + CONOUT$
+    //     on LTSC can prevent service startup (v1.3.3 rollback on media-host)
     #[cfg(target_os = "windows")]
     {
-        let is_tray_mode = std::env::args().any(|a| a == "--tray");
+        let needs_no_console = std::env::args().any(|a| a == "--tray" || a == "--service");
         // TUI commands need a visible, fully functional console
         let is_tui_cmd = std::env::args().any(|a| {
             matches!(a.as_str(), "dash" | "dashboard" | "logs" | "cfg" | "config-edit" | "browse" | "sftp" | "connect")
         });
-        if !is_tray_mode {
+        if !needs_no_console {
             unsafe {
                 use windows::Win32::System::Console::{
                     AllocConsole, AttachConsole, ATTACH_PARENT_PROCESS,
@@ -176,30 +198,58 @@ fn main() -> Result<()> {
                     }
                 }
                 // After attach/alloc, reopen std handles so Rust's stdin/stdout
-                // point to the (re)attached console — required for crossterm TUI.
-                if is_tui_cmd {
+                // point to the (re)attached console. Without this, GUI subsystem
+                // binary has null stdout → print! output lost (exec from PowerShell).
+                //
+                // IMPORTANT: only overwrite handles that are NULL. When launched
+                // with redirected output (WSL interop, PowerShell pipe, cmd >file),
+                // the parent sets valid pipe handles — overwriting them with CONOUT$
+                // silently discards all piped output.
+                {
                     use windows::Win32::Storage::FileSystem::{
                         CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
                         FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
                     };
                     use windows::Win32::System::Console::{
-                        SetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-                        STD_ERROR_HANDLE,
+                        GetStdHandle, SetStdHandle, STD_INPUT_HANDLE,
+                        STD_OUTPUT_HANDLE, STD_ERROR_HANDLE,
                     };
                     use windows::core::w;
-                    // Reopen CONIN$/CONOUT$ to get fresh handles to the console
-                    if let Ok(h) = CreateFileW(
-                        w!("CONIN$"), FILE_GENERIC_READ.0,
-                        FILE_SHARE_READ, None, OPEN_EXISTING, Default::default(), None,
-                    ) {
-                        let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+
+                    // Helper: check if a std handle is already valid (non-null,
+                    // non-INVALID_HANDLE_VALUE). If so, it was set by the parent
+                    // (pipe/redirect) and must NOT be overwritten.
+                    let handle_valid = |which| -> bool {
+                        matches!(GetStdHandle(which), Ok(h) if !h.is_invalid() && h.0 as usize != 0)
+                    };
+
+                    let stdin_ok = handle_valid(STD_INPUT_HANDLE);
+                    let stdout_ok = handle_valid(STD_OUTPUT_HANDLE);
+                    let stderr_ok = handle_valid(STD_ERROR_HANDLE);
+
+                    if !stdin_ok {
+                        if let Ok(h) = CreateFileW(
+                            w!("CONIN$"), FILE_GENERIC_READ.0,
+                            FILE_SHARE_READ, None, OPEN_EXISTING, Default::default(), None,
+                        ) {
+                            let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+                        }
                     }
-                    if let Ok(h) = CreateFileW(
-                        w!("CONOUT$"), FILE_GENERIC_WRITE.0,
-                        FILE_SHARE_WRITE, None, OPEN_EXISTING, Default::default(), None,
-                    ) {
-                        let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
-                        let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+                    if !stdout_ok {
+                        if let Ok(h) = CreateFileW(
+                            w!("CONOUT$"), FILE_GENERIC_WRITE.0,
+                            FILE_SHARE_WRITE, None, OPEN_EXISTING, Default::default(), None,
+                        ) {
+                            let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                        }
+                    }
+                    if !stderr_ok {
+                        if let Ok(h) = CreateFileW(
+                            w!("CONOUT$"), FILE_GENERIC_WRITE.0,
+                            FILE_SHARE_WRITE, None, OPEN_EXISTING, Default::default(), None,
+                        ) {
+                            let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+                        }
                     }
                 }
             }
@@ -207,6 +257,11 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // Accept changed host keys if flag or env var set
+    if cli.accept_host_key || std::env::var("MRSH_ACCEPT_HOST_KEY").is_ok() {
+        mrsh_core::tls::set_accept_host_key(true);
+    }
 
     // Determine if we're running in server mode (needs audit log to file)
     let is_server_mode = cli.console
@@ -231,20 +286,16 @@ fn main() -> Result<()> {
         let log_prefix = if std::env::args().any(|a| a == "--tray") { "audit-tray.log" } else { "audit.log" };
         #[cfg(not(target_os = "windows"))]
         let log_prefix = "audit.log";
-        let file_appender = tracing_appender::rolling::daily(&data_dir, log_prefix);
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_writer(file_appender)
-            .with_ansi(false);
         let filter = tracing_subscriber::EnvFilter::new(match cli.verbose {
             0 => "info",
             1 => "info",
             _ => "debug",
         });
 
-        // Tray mode has no console — skip stderr layer to avoid writing to
-        // invalid handle (causes 0xC0000409 on Windows 10 IoT LTSC).
+        // Tray/service modes have no console — skip stderr layer to avoid writing
+        // to invalid handle (causes 0xC0000409 on Windows 10 IoT LTSC).
         #[cfg(target_os = "windows")]
-        let has_console = !std::env::args().any(|a| a == "--tray");
+        let has_console = !std::env::args().any(|a| a == "--tray" || a == "--service");
         #[cfg(not(target_os = "windows"))]
         let has_console = true;
 
@@ -253,6 +304,20 @@ fn main() -> Result<()> {
         } else {
             None
         };
+
+        // Use builder to avoid panic on permission denied (e.g. service data dir
+        // not yet writable, or SYSTEM user lacking access during migration).
+        let file_layer = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(log_prefix)
+            .build(&data_dir)
+            .ok()
+            .map(|appender| {
+                tracing_subscriber::fmt::layer()
+                    .with_writer(appender)
+                    .with_ansi(false)
+            });
+
         tracing_subscriber::registry()
             .with(filter)
             .with(stderr_layer)
@@ -271,16 +336,16 @@ fn main() -> Result<()> {
     // ── Cross-platform service/install/uninstall ────────────
     if cli.install {
         let exe = std::env::current_exe()?.to_string_lossy().to_string();
-        rsh_server::service::install_service(&exe)?;
+        mrsh_server::service::install_service(&exe)?;
         return Ok(());
     }
     if cli.uninstall {
-        rsh_server::service::uninstall_service()?;
+        mrsh_server::service::uninstall_service()?;
         return Ok(());
     }
     if cli.console {
         let rt = tokio::runtime::Runtime::new()?;
-        return rt.block_on(run_server_mode(cli.port.unwrap_or(8822), false));
+        return rt.block_on(run_server_mode(cli.port.unwrap_or(DEFAULT_PORT), false));
     }
 
     // ── Explicit tray mode (Windows) ─────────────────────────
@@ -295,8 +360,8 @@ fn main() -> Result<()> {
     // ── Linux daemon mode ────────────────────────────────────
     #[cfg(not(target_os = "windows"))]
     if cli.daemon {
-        let port = cli.port.unwrap_or(8822);
-        rsh_server::service::run_as_service(move |cancel| {
+        let port = cli.port.unwrap_or(DEFAULT_PORT);
+        mrsh_server::service::run_as_service(move |cancel| {
             let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
             rt.block_on(async {
                 if let Err(e) = run_server_mode_with_cancel(port, cancel).await {
@@ -314,8 +379,17 @@ fn main() -> Result<()> {
     {
         // Explicit --service flag: SCM launched us with this flag, go straight to dispatch.
         if cli.service {
-            let port = cli.port.unwrap_or(8822);
-            rsh_server::service::run_as_service(move |cancel| {
+            // Ensure tray task exists (self-heal if missing/deleted)
+            let exe = std::env::current_exe()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !exe.is_empty() {
+                mrsh_server::service::ensure_tray_task(&exe);
+            }
+
+            let port = cli.port.unwrap_or(DEFAULT_PORT);
+            mrsh_server::service::run_as_service(move |cancel| {
                 let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
                 rt.block_on(async {
                     if let Err(e) = run_server_mode_with_cancel(port, cancel).await {
@@ -333,8 +407,8 @@ fn main() -> Result<()> {
             LOCAL_COMMANDS.contains(&a.as_str()) || a == "help" || a == "recording"
         });
         if cli.host.is_none() && !is_local_cmd {
-            let port = cli.port.unwrap_or(8822);
-            let result = rsh_server::service::run_as_service(move |cancel| {
+            let port = cli.port.unwrap_or(DEFAULT_PORT);
+            let result = mrsh_server::service::run_as_service(move |cancel| {
                 let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
                 rt.block_on(async {
                     if let Err(e) = run_server_mode_with_cancel(port, cancel).await {
@@ -359,7 +433,28 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cli: Cli) -> Result<()> {
-    let args = &cli.args;
+    // Normalize path arguments (Git Bash /c/Users → C:/Users, WSL /mnt/c → C:/, etc.)
+    // Only normalize args that look like paths — skip command name (args[0])
+    // and content arguments (exec command text, write content).
+    let cmd_peek = cli.args.first().map(|s| s.as_str()).unwrap_or("");
+    let args_normalized: Vec<String> = cli
+        .args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if i == 0 {
+                // Command name — never normalize
+                a.clone()
+            } else if cmd_peek == "exec" || (cmd_peek == "write" && i >= 2) {
+                // exec: arg is PowerShell command text — don't normalize
+                // write: args[2+] is content — don't normalize
+                a.clone()
+            } else {
+                mrsh_core::path::normalize(a)
+            }
+        })
+        .collect();
+    let args = &args_normalized;
     // Default: "version" without -h, "shell" with -h
     let cmd = args
         .first()
@@ -379,7 +474,13 @@ async fn async_main(cli: Cli) -> Result<()> {
     // ── Local commands (no -h needed) ────────────────────────
     match cmd {
         "version" => {
-            println!("rsh {} (rust)", env!("CARGO_PKG_VERSION"));
+            let version = env!("CARGO_PKG_VERSION");
+            let suffix = option_env!("MRSH_VERSION_SUFFIX").unwrap_or("");
+            if suffix.is_empty() {
+                println!("mrsh {}", version);
+            } else {
+                println!("mrsh {}-{}", version, suffix);
+            }
             return Ok(());
         }
         "fleet" => {
@@ -390,11 +491,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .and_then(|s| s.strip_prefix("--timeout=").or(Some(s.as_str())))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3);
-            let config = rsh_core::config::Config::load();
+            let config = mrsh_core::config::Config::load();
             let local_id = config.device_id.clone().unwrap_or_default();
-            eprintln!("Scanning LAN for rsh peers ({timeout_secs}s)...");
-            let peers = rsh_relay::discovery::discover_lan(
-                rsh_relay::discovery::DISCOVERY_PORT,
+            eprintln!("Scanning LAN for mrsh peers ({timeout_secs}s)...");
+            let peers = mrsh_relay::discovery::discover_lan(
+                mrsh_relay::discovery::DISCOVERY_PORT,
                 std::time::Duration::from_secs(timeout_secs),
                 &local_id,
             ).await;
@@ -413,7 +514,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         "nat" => {
             eprintln!("Detecting NAT type (querying STUN servers)...");
-            let info = rsh_relay::stun::detect_nat_type(
+            let info = mrsh_relay::stun::detect_nat_type(
                 std::time::Duration::from_secs(3),
             ).await;
             println!("NAT type: {}", info.nat_type);
@@ -426,8 +527,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             if args.len() < 2 {
                 bail!("wake requires a MAC address (aa:bb:cc:dd:ee:ff)");
             }
-            rsh_client::shell::send_wol(&args[1])?;
-            eprintln!("WoL packet sent to {}", args[1]);
+            mrsh_client::shell::send_wol(&args[1])?;
+            println!("WoL packet sent to {}", args[1]);
             return Ok(());
         }
         "recording" => {
@@ -451,7 +552,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     }
                 }
                 if log_file.is_empty() {
-                    bail!("Usage: rsh recording export <file.log> [output.cast]");
+                    bail!("Usage: mrsh recording export <file.log> [output.cast]");
                 }
                 if out_file.is_empty() {
                     out_file = log_file
@@ -460,13 +561,13 @@ async fn async_main(cli: Cli) -> Result<()> {
                         .to_string()
                         + ".cast";
                 }
-                rsh_client::recording::export_asciicast(&log_file, &out_file, width, height)?;
-                eprintln!("Exported to {}", out_file);
+                mrsh_client::recording::export_asciicast(&log_file, &out_file, width, height)?;
+                println!("Exported to {}", out_file);
                 return Ok(());
             }
             // "list" with no -h → fall through to client section
             if cli.host.is_none() && sub != "list" {
-                bail!("Usage: rsh recording <export|list>");
+                bail!("Usage: mrsh recording <export|list>");
             }
             // list with -h falls through to client commands
         }
@@ -480,17 +581,17 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         "totp-verify" => {
             if args.len() < 3 {
-                bail!("Usage: rsh totp-verify <fingerprint> <code>");
+                bail!("Usage: mrsh totp-verify <fingerprint> <code>");
             }
             return run_totp_verify(&args[1], &args[2]);
         }
         "cfg" | "config-edit" => {
-            rsh_client::config_tui::run_config_tui()?;
+            mrsh_client::config_tui::run_config_tui()?;
             return Ok(());
         }
         "connect" => {
-            match rsh_client::host_picker::run_host_picker()? {
-                rsh_client::host_picker::PickerResult::Selected(host) => {
+            match mrsh_client::host_picker::run_host_picker()? {
+                mrsh_client::host_picker::PickerResult::Selected(host) => {
                     let target = host.hostname.as_deref().unwrap_or(&host.pattern);
                     let port = if host.port > 0 { host.port } else { 8822 };
                     eprintln!("Connecting to {} ({}:{})...", host.pattern, target, port);
@@ -500,11 +601,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                         key_path: host.identity_file.clone(),
                         password_user: cli.user.clone(),
                     };
-                    let mut client = rsh_client::client::connect(&opts).await?;
-                    rsh_client::shell::run_shell(&mut client, &[]).await?;
+                    let mut client = mrsh_client::client::connect(&opts).await?;
+                    mrsh_client::shell::run_shell(&mut client, &[]).await?;
                     return Ok(());
                 }
-                rsh_client::host_picker::PickerResult::Cancelled => {
+                mrsh_client::host_picker::PickerResult::Cancelled => {
                     return Ok(());
                 }
             }
@@ -513,11 +614,11 @@ async fn async_main(cli: Cli) -> Result<()> {
             return run_log_query(&args[1..]);
         }
         "logs" => {
-            rsh_client::log_viewer::run_log_viewer()?;
+            mrsh_client::log_viewer::run_log_viewer()?;
             return Ok(());
         }
         "dash" | "dashboard" => {
-            rsh_client::dashboard::run_dashboard().await?;
+            mrsh_client::dashboard::run_dashboard().await?;
             return Ok(());
         }
         "pack" | "install-pack" => {
@@ -538,7 +639,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             eprintln!("error: -h <host> required for --mux-stop");
             std::process::exit(1);
         });
-        return rsh_client::mux::stop_master(host, cli.port.unwrap_or(8822)).await;
+        return mrsh_client::mux::stop_master(host, cli.port.unwrap_or(DEFAULT_PORT)).await;
     }
 
     // ── Server mode: no -h, no local command, on Windows ────
@@ -556,7 +657,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     });
 
     // Resolve from config
-    let config = rsh_core::config::Config::load();
+    let config = mrsh_core::config::Config::load();
     let host_config = config.find_host(host);
     let port_explicit = cli.port.is_some(); // user passed -p explicitly
     let (resolved_host, mut resolved_port, port_from_config) = if let Some(hc) = host_config {
@@ -567,15 +668,15 @@ async fn async_main(cli: Cli) -> Result<()> {
             cli.port.is_none() && cfg_port != 8822, // config specified non-default port
         )
     } else {
-        (host.to_string(), cli.port.unwrap_or(8822), false)
+        (host.to_string(), cli.port.unwrap_or(DEFAULT_PORT), false)
     };
     // Auto-try ports when neither -p nor config specified a port
     let auto_try_ports = !port_explicit && !port_from_config;
 
     // ── Auto-mux: try UDS before opening new connection ──────
     if !cli.no_mux && !cli.master {
-        if let Some(mux_req) = rsh_client::mux::build_mux_request(cmd, args) {
-            if let Some(resp) = rsh_client::mux::try_request(host, resolved_port, &mux_req).await {
+        if let Some(mux_req) = mrsh_client::mux::build_mux_request(cmd, args) {
+            if let Some(resp) = mrsh_client::mux::try_request(host, resolved_port, &mux_req).await {
                 if resp.success {
                     if let Some(ref output) = resp.output {
                         print!("{}", output);
@@ -595,7 +696,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     let device_id = host_config
         .and_then(|hc| hc.device_id.clone())
         .or_else(|| {
-            if rsh_relay::rendezvous::is_device_id(host) {
+            if mrsh_relay::rendezvous::is_device_id(host) {
                 Some(host.to_string())
             } else {
                 None
@@ -613,7 +714,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             .next()
             .with_context(|| format!("no address for {}", resolved_host))?;
 
-        let quic = rsh_client::quic::QuicClient::connect(
+        let quic = mrsh_client::quic::QuicClient::connect(
             addr,
             &resolved_host,
             cli.key.as_deref(),
@@ -669,7 +770,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
                 let data = std::fs::read(&args[1])?;
                 let written = quic.push(&args[2], &data).await?;
-                eprintln!("pushed {} bytes to {}", written, args[2]);
+                println!("pushed {} bytes to {}", written, args[2]);
             }
             "pull" | "cat" => {
                 if args.len() < 2 {
@@ -680,7 +781,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     std::io::Write::write_all(&mut std::io::stdout(), &data)?;
                 } else {
                     std::fs::write(&args[2], &data)?;
-                    eprintln!("pulled {} bytes to {}", data.len(), args[2]);
+                    println!("pulled {} bytes to {}", data.len(), args[2]);
                 }
             }
             "ls" => {
@@ -696,7 +797,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     bail!("tunnel requires: <local_bind> <remote_host:port>");
                 }
                 let (local_bind, remote_target) =
-                    rsh_client::tunnel::parse_tunnel_spec(&args[1], &args[2])?;
+                    mrsh_client::tunnel::parse_tunnel_spec(&args[1], &args[2])?;
                 eprintln!(
                     "tunnel (QUIC): {} → {} via {}",
                     local_bind, remote_target, resolved_host
@@ -716,7 +817,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
             }
             "shell" => {
-                rsh_client::shell::run_quic_shell(&quic).await?;
+                mrsh_client::shell::run_quic_shell(&quic).await?;
             }
             // ── Fleet ops: route through exec with native-equivalent PowerShell ──
             "info" => {
@@ -789,7 +890,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 .context("decode screenshot base64")?;
                 let out_path = format!("screenshot_{}.jpg", display);
                 std::fs::write(&out_path, &data)?;
-                eprintln!("saved {} ({} bytes)", out_path, data.len());
+                println!("saved {} ({} bytes)", out_path, data.len());
             }
             // ── Clipboard ────────────────────────────────────────────
             "clip" | "clipboard" => {
@@ -806,7 +907,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         let text = args[2..].join(" ");
                         let escaped = text.replace('\'', "''");
                         quic.exec(&format!("Set-Clipboard '{}'", escaped)).await?;
-                        eprintln!("clipboard set");
+                        println!("clipboard set");
                     }
                     other => bail!("unknown clip action: {} (use get|set)", other),
                 }
@@ -837,7 +938,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
                 let content = args[2..].join(" ");
                 let written = quic.push(&args[1], content.as_bytes()).await?;
-                eprintln!("wrote {} bytes to {}", written, args[1]);
+                println!("wrote {} bytes to {}", written, args[1]);
             }
             // ── Self-update ──────────────────────────────────────────
             "self-update" => {
@@ -856,7 +957,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                      'OK: restart service to apply'",
                     escaped
                 )).await?;
-                eprintln!("{}", output);
+                println!("{}", output);
             }
             // ── GUI automation ───────────────────────────────────────
             "input" | "mouse" | "key" | "window" => {
@@ -882,7 +983,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 }
-                eprintln!("Rebooting {}:{}...", resolved_host, resolved_port);
+                println!("Rebooting {}:{}...", resolved_host, resolved_port);
                 quic.exec("Restart-Computer -Force").await.ok();
             }
             "shutdown" => {
@@ -896,9 +997,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 }
-                eprintln!("Shutting down {}:{}...", resolved_host, resolved_port);
+                println!("Shutting down {}:{}...", resolved_host, resolved_port);
                 quic.exec("Stop-Computer -Force").await.ok();
-                eprintln!("Shutdown command sent.");
+                println!("Shutdown command sent.");
             }
             "sleep" => {
                 let force = args.get(1).map(|s| s == "-f" || s == "--force").unwrap_or(false);
@@ -911,16 +1012,16 @@ async fn async_main(cli: Cli) -> Result<()> {
                         return Ok(());
                     }
                 }
-                eprintln!("Putting {}:{} to sleep...", resolved_host, resolved_port);
+                println!("Putting {}:{} to sleep...", resolved_host, resolved_port);
                 quic.exec(
                     "Add-Type -Assembly System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $true, $false)"
                 ).await.ok();
-                eprintln!("Sleep command sent.");
+                println!("Sleep command sent.");
             }
             "lock" => {
-                eprintln!("Locking workstation on {}:{}...", resolved_host, resolved_port);
+                println!("Locking workstation on {}:{}...", resolved_host, resolved_port);
                 quic.exec("rundll32.exe user32.dll,LockWorkStation").await?;
-                eprintln!("Workstation locked.");
+                println!("Workstation locked.");
             }
             // ── Status (multi-ping with RTT stats) ───────────────────
             "status" => {
@@ -953,10 +1054,40 @@ async fn async_main(cli: Cli) -> Result<()> {
                     sorted.sort();
                     let p50 = sorted[sorted.len() / 2];
                     let loss = (failures as f64 / count as f64) * 100.0;
+
+                    println!("--- {} (QUIC) ping statistics ---", resolved_host);
+                    println!("{} transmitted, {} received, {:.0}% loss", count, rtts.len(), loss);
                     println!("rtt min/avg/max/p50 = {:.1?}/{:.1?}/{:.1?}/{:.1?}", min, avg, max, p50);
-                    if failures > 0 {
-                        println!("packet loss: {:.0}%", loss);
-                    }
+
+                    let jitter = if rtts.len() >= 2 {
+                        let avg_ns = avg.as_nanos() as f64;
+                        let sum_sq: f64 = rtts.iter().map(|d| {
+                            let diff = d.as_nanos() as f64 - avg_ns;
+                            diff * diff
+                        }).sum();
+                        std::time::Duration::from_nanos((sum_sq / rtts.len() as f64).sqrt() as u64)
+                    } else {
+                        std::time::Duration::ZERO
+                    };
+                    println!("jitter: {:.1?}", jitter);
+
+                    let quality = if loss > 50.0 {
+                        "POOR (high packet loss)"
+                    } else if avg > std::time::Duration::from_millis(500) {
+                        "POOR (high latency)"
+                    } else if loss > 10.0
+                        || avg > std::time::Duration::from_millis(200)
+                        || jitter > std::time::Duration::from_millis(100)
+                    {
+                        "FAIR"
+                    } else if avg > std::time::Duration::from_millis(50)
+                        || jitter > std::time::Duration::from_millis(20)
+                    {
+                        "GOOD"
+                    } else {
+                        "EXCELLENT"
+                    };
+                    println!("quality: {}", quality);
                 }
             }
             // ── Cache management ─────────────────────────────────────
@@ -966,7 +1097,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 }
                 match args[1].as_str() {
                     "stats" => {
-                        let output = quic.exec("if (Test-Path 'C:\\ProgramData\\remote-shell\\cache') { Get-ChildItem 'C:\\ProgramData\\remote-shell\\cache' -Recurse | Measure-Object -Property Length -Sum | Select-Object Count,Sum | ConvertTo-Json } else { '{\"Count\":0,\"Sum\":0}' }").await?;
+                        let output = quic.exec("if (Test-Path 'C:\\ProgramData\\mrsh\\cache') { Get-ChildItem 'C:\\ProgramData\\mrsh\\cache' -Recurse | Measure-Object -Property Length -Sum | Select-Object Count,Sum | ConvertTo-Json } else { '{\"Count\":0,\"Sum\":0}' }").await?;
                         println!("{}", output);
                     }
                     "index" => {
@@ -989,14 +1120,14 @@ async fn async_main(cli: Cli) -> Result<()> {
                     bail!("plugin requires <action> [args...]");
                 }
                 let plugin_cmd = args[1..].join(" ");
-                let output = quic.exec(&format!("rsh plugin {}", plugin_cmd)).await?;
+                let output = quic.exec(&format!("mrsh plugin {}", plugin_cmd)).await?;
                 if !output.is_empty() {
                     println!("{}", output);
                 }
             }
             // ── Recording list ───────────────────────────────────────
             "recording" => {
-                let output = quic.exec("if (Test-Path 'C:\\ProgramData\\remote-shell\\recordings') { Get-ChildItem 'C:\\ProgramData\\remote-shell\\recordings' -Filter '*.cast' | Select-Object Name,Length,LastWriteTime | ConvertTo-Json } else { '[]' }").await?;
+                let output = quic.exec("if (Test-Path 'C:\\ProgramData\\mrsh\\recordings') { Get-ChildItem 'C:\\ProgramData\\mrsh\\recordings' -Filter '*.cast' | Select-Object Name,Length,LastWriteTime | ConvertTo-Json } else { '[]' }").await?;
                 println!("{}", output);
             }
             // ── Server version ───────────────────────────────────────
@@ -1019,8 +1150,11 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     let mut client = if let Some(ref dev_id) = device_id {
+        #[cfg(feature = "no-relay")]
+        bail!("relay connections disabled in this build");
         // Relay path: resolve via hbbs, connect via P2P or hbbr
-        let relay_opts = rsh_client::relay_connect::RelayConnectOptions {
+        #[cfg(not(feature = "no-relay"))]
+        let relay_opts = mrsh_client::relay_connect::RelayConnectOptions {
             device_id: dev_id.clone(),
             rendezvous_server: config
                 .rendezvous_server
@@ -1032,7 +1166,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             server_name: resolved_host.clone(),
             port: resolved_port,
         };
-        rsh_client::relay_connect::connect_via_relay(&relay_opts).await?
+        mrsh_client::relay_connect::connect_via_relay(&relay_opts).await?
     } else if auto_try_ports {
         // Auto-try ports: try 8822 → 9822 → 22
         let opts = ConnectOptions {
@@ -1041,9 +1175,35 @@ async fn async_main(cli: Cli) -> Result<()> {
             key_path: cli.key.clone(),
             password_user: cli.user.clone(),
         };
-        let (client, actual_port) = rsh_client::client::connect_auto_try(&opts).await?;
-        resolved_port = actual_port;
-        client
+        match mrsh_client::client::connect_auto_try(&opts).await {
+            Ok((client, actual_port)) => {
+                resolved_port = actual_port;
+                client
+            }
+            Err(tls_err) => {
+                // TLS failed on all ports — try SSH fallback on port 22
+                #[cfg(feature = "ssh")]
+                {
+                    debug!("TLS failed, trying SSH fallback on port 22: {}", tls_err);
+                    if mrsh_client::ssh_client::ssh_client_available() {
+                        match mrsh_client::ssh_client::SshSession::connect(
+                            &opts.host, 22, &opts.key_path,
+                        ).await {
+                            Ok(ssh) => {
+                                eprintln!("Connected via SSH (no mrsh service on target)");
+                                // Handle command directly via SSH session
+                                let exit = run_ssh_command(ssh, cmd, &args).await?;
+                                std::process::exit(exit);
+                            }
+                            Err(ssh_err) => {
+                                debug!("SSH fallback also failed: {}", ssh_err);
+                            }
+                        }
+                    }
+                }
+                return Err(tls_err);
+            }
+        }
     } else {
         // Direct connection to explicit port
         let opts = ConnectOptions {
@@ -1052,12 +1212,12 @@ async fn async_main(cli: Cli) -> Result<()> {
             key_path: cli.key.clone(),
             password_user: cli.user.clone(),
         };
-        rsh_client::client::connect(&opts).await?
+        mrsh_client::client::connect(&opts).await?
     };
 
     // ── Control master mode (-M) ──────────────────────────────
     if cli.master {
-        return rsh_client::mux::run_master(host, resolved_port, client).await;
+        return mrsh_client::mux::run_master(host, resolved_port, client).await;
     }
 
     // ── Session logging ────────────────────────────────────────
@@ -1069,8 +1229,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         };
         // Rotate old logs on session start (cheap: just readdir)
         let log_dir = config.session_log_dir();
-        rsh_client::session_log::rotate_logs(&log_dir, config.session_log_retain);
-        Some(rsh_client::session_log::SessionTracker::start(
+        mrsh_client::session_log::rotate_logs(&log_dir, config.session_log_retain);
+        Some(mrsh_client::session_log::SessionTracker::start(
             host,
             resolved_port,
             cmd,
@@ -1101,12 +1261,29 @@ async fn async_main(cli: Cli) -> Result<()> {
         let connect_fn = move || {
             let opts = connect_opts.clone();
             async move {
-                let client = rsh_client::client::connect(&opts).await?;
+                let client = mrsh_client::client::connect(&opts).await?;
                 Ok(client.into_stream())
             }
         };
 
-        rsh_client::socks::run_socks5(socks_port, connect_fn).await?;
+        mrsh_client::socks::run_socks5(socks_port, connect_fn).await?;
+        return Ok(());
+    }
+
+    // Streaming exec runs without outer timeout — output flow keeps connection alive.
+    if cmd == "exec" && client.supports_stream_exec() {
+        if args.len() < 2 {
+            bail!("exec requires a command");
+        }
+        let command = args[1..].join(" ");
+        let exit_code = mrsh_client::commands::exec_stream(&mut client, &command, &[]).await?;
+        // Finish session log
+        if let Some(tracker) = tracker {
+            tracker.finish(exit_code);
+        }
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
         return Ok(());
     }
 
@@ -1116,20 +1293,21 @@ async fn async_main(cli: Cli) -> Result<()> {
     let cmd_future = async {
     match cmd {
         "ping" => {
-            let result = rsh_client::commands::ping(&mut client).await?;
+            let result = mrsh_client::commands::ping(&mut client).await?;
             println!("{}", result);
         }
         "exec" => {
+            // Fallback: buffered exec for servers without stream-exec capability
             if args.len() < 2 {
                 bail!("exec requires a command");
             }
             let command = args[1..].join(" ");
-            let result = rsh_client::commands::exec(&mut client, &command, &[]).await?;
+            let result = mrsh_client::commands::exec(&mut client, &command, &[]).await?;
             print!("{}", result);
         }
         "ls" => {
             let path = args.get(1).map(|s| s.as_str()).unwrap_or(".");
-            let files = rsh_client::commands::ls(&mut client, path).await?;
+            let files = mrsh_client::commands::ls(&mut client, path).await?;
             for f in &files {
                 let kind = if f.is_dir { "d" } else { "-" };
                 println!(
@@ -1142,7 +1320,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             if args.len() < 2 {
                 bail!("cat requires a path");
             }
-            let text = rsh_client::commands::cat_text(&mut client, &args[1]).await?;
+            let text = mrsh_client::commands::cat_text(&mut client, &args[1]).await?;
             print!("{}", text);
         }
         "push" => {
@@ -1152,33 +1330,32 @@ async fn async_main(cli: Cli) -> Result<()> {
             let local_path = std::path::Path::new(&args[1]);
             let meta = std::fs::metadata(local_path)
                 .map_err(|e| anyhow::anyhow!("cannot stat {}: {}", args[1], e))?;
-            let xfer_opts = rsh_client::sync::TransferOptions {
+            let xfer_opts = mrsh_client::sync::TransferOptions {
                 progress: cli.progress,
                 dry_run: cli.dry_run,
                 backup_suffix: cli.backup.clone(),
                 bwlimit_kbps: cli.bwlimit,
             };
             if meta.is_dir() {
-                let result = rsh_client::sync::push_dir(&mut client, local_path, &args[2], &xfer_opts).await?;
+                let result = mrsh_client::sync::push_dir(&mut client, local_path, &args[2], &xfer_opts).await?;
                 eprintln!(
                     "pushed directory: {}/{} files, {} bytes",
                     result.files_transferred, result.files_total, result.bytes_total
                 );
                 if cli.delete {
-                    let deleted = rsh_client::sync::delete_remote_extras(
+                    let deleted = mrsh_client::sync::delete_remote_extras(
                         &mut client, local_path, &args[2],
                     ).await?;
                     if deleted > 0 {
-                        eprintln!("--delete: removed {} remote files", deleted);
+                        println!("--delete: removed {} remote files", deleted);
                     }
                 }
             } else {
                 if cli.dry_run {
                     eprintln!("[dry-run] would push {} -> {}", args[1], args[2]);
                 } else {
-                    let data = std::fs::read(local_path)?;
-                    let result = rsh_client::sync::push(&mut client, &data, &args[2]).await?;
-                    eprintln!(
+                    let result = mrsh_client::sync::push_file(&mut client, local_path, &args[2]).await?;
+                    println!(
                         "pushed {} bytes to {} (delta: {})",
                         result.bytes_sent, result.path, result.delta
                     );
@@ -1189,7 +1366,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             if args.len() < 3 {
                 bail!("pull requires <remote> <local>");
             }
-            let xfer_opts = rsh_client::sync::TransferOptions {
+            let xfer_opts = mrsh_client::sync::TransferOptions {
                 progress: cli.progress,
                 dry_run: cli.dry_run,
                 backup_suffix: cli.backup.clone(),
@@ -1197,13 +1374,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             };
             // Check if remote is a directory (ls succeeds on dirs)
             let is_dir = {
-                let files = rsh_client::commands::ls(&mut client, &args[1]).await;
+                let files = mrsh_client::commands::ls(&mut client, &args[1]).await;
                 files.is_ok()
             };
             if is_dir {
                 let local_path = std::path::Path::new(&args[2]);
-                let result = rsh_client::sync::pull_dir(&mut client, &args[1], local_path, &xfer_opts).await?;
-                eprintln!(
+                let result = mrsh_client::sync::pull_dir(&mut client, &args[1], local_path, &xfer_opts).await?;
+                println!(
                     "pulled directory: {}/{} files, {} bytes",
                     result.files_transferred, result.files_total, result.bytes_total
                 );
@@ -1213,9 +1390,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                 } else {
                     let local_data = std::fs::read(&args[2]).ok();
                     let result =
-                        rsh_client::sync::pull(&mut client, local_data.as_deref(), &args[1]).await?;
+                        mrsh_client::sync::pull(&mut client, local_data.as_deref(), &args[1]).await?;
                     std::fs::write(&args[2], &result.data)?;
-                    eprintln!(
+                    println!(
                         "pulled {} bytes (delta: {})",
                         result.data.len(),
                         result.delta
@@ -1228,31 +1405,31 @@ async fn async_main(cli: Cli) -> Result<()> {
             let quality: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(75);
             let scale: u8 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100);
             let data =
-                rsh_client::commands::screenshot(&mut client, display_idx, quality, scale).await?;
+                mrsh_client::commands::screenshot(&mut client, display_idx, quality, scale).await?;
             let out_path = format!("screenshot_{}.jpg", display_idx);
             std::fs::write(&out_path, &data)?;
-            eprintln!("saved {} ({} bytes)", out_path, data.len());
+            println!("saved {} ({} bytes)", out_path, data.len());
         }
         "sessions" => {
             let action = args.get(1).map(|s| s.as_str()).unwrap_or("list");
             match action {
                 "list" => {
-                    let result = rsh_client::commands::sessions_list(&mut client).await?;
+                    let result = mrsh_client::commands::sessions_list(&mut client).await?;
                     println!("{}", result);
                 }
                 "kill" => {
                     if args.len() < 3 {
                         bail!("sessions kill requires <session-id>");
                     }
-                    rsh_client::commands::session_kill(&mut client, &args[2]).await?;
-                    eprintln!("session killed");
+                    mrsh_client::commands::session_kill(&mut client, &args[2]).await?;
+                    println!("session killed");
                 }
                 other => bail!("unknown sessions action: {}", other),
             }
         }
         "shell" => {
             let env_vars: Vec<String> = args.iter().skip(1).cloned().collect();
-            rsh_client::shell::run_shell(&mut client, &env_vars).await?;
+            mrsh_client::shell::run_shell(&mut client, &env_vars).await?;
         }
         "attach" => {
             // attach [session-id] [--ro]
@@ -1266,7 +1443,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     _ => env_vars.push(arg.clone()),
                 }
             }
-            rsh_client::shell::run_attach(&mut client, session_id, read_only, &env_vars).await?;
+            mrsh_client::shell::run_attach(&mut client, session_id, read_only, &env_vars).await?;
         }
         "browse" => {
             let start_path = args.get(1).map(|s| s.as_str()).unwrap_or(".");
@@ -1275,23 +1452,23 @@ async fn async_main(cli: Cli) -> Result<()> {
             // RefCell borrow held across block_on is safe: closures run synchronously
             use std::cell::RefCell;
             let client_cell = RefCell::new(client);
-            rsh_client::browse::run_browser(
+            mrsh_client::browse::run_browser(
                 start_path,
                 |dir_path| {
                     let mut c = client_cell.borrow_mut();
-                    let result = handle.block_on(rsh_client::commands::ls(&mut *c, dir_path));
+                    let result = handle.block_on(mrsh_client::commands::ls(&mut *c, dir_path));
                     result.map_err(|e| e.to_string())
                 },
                 |remote_path, local_path| {
                     let mut c = client_cell.borrow_mut();
                     let result =
-                        handle.block_on(rsh_client::sync::pull(&mut *c, None, remote_path));
+                        handle.block_on(mrsh_client::sync::pull(&mut *c, None, remote_path));
                     match result {
                         Ok(pr) => {
                             if let Err(e) = std::fs::write(local_path, &pr.data) {
                                 eprintln!("write error: {}", e);
                             } else {
-                                eprintln!("saved {} ({} bytes)", local_path, pr.data.len());
+                                println!("saved {} ({} bytes)", local_path, pr.data.len());
                             }
                         }
                         Err(e) => eprintln!("pull error: {}", e),
@@ -1305,23 +1482,23 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         "sftp" => {
             let host_display = cli.host.as_deref().unwrap_or("unknown");
-            rsh_client::sftp::run_sftp(&mut client, host_display).await?;
+            mrsh_client::sftp::run_sftp(&mut client, host_display).await?;
         }
         "tunnel" => {
-            // rsh -h host tunnel <local_bind> <remote_host:remote_port>
-            // rsh -h host tunnel 127.0.0.1:5432 db-server:5432
-            // rsh -h host tunnel 5432 db-server:5432
+            // mrsh -h host tunnel <local_bind> <remote_host:remote_port>
+            // mrsh -h host tunnel 127.0.0.1:5432 db-server:5432
+            // mrsh -h host tunnel 5432 db-server:5432
             if args.len() < 3 {
                 bail!("tunnel requires: <local_bind> <remote_host:port>");
             }
             let (local_bind, remote_target) =
-                rsh_client::tunnel::parse_tunnel_spec(&args[1], &args[2])?;
+                mrsh_client::tunnel::parse_tunnel_spec(&args[1], &args[2])?;
             eprintln!("tunnel: {} → {} via {}", local_bind, remote_target, resolved_host);
-            rsh_client::tunnel::run_tunnel(client.stream_mut(), &local_bind, &remote_target).await?;
+            mrsh_client::tunnel::run_tunnel(client.stream_mut(), &local_bind, &remote_target).await?;
         }
         "recording" => {
             // Only "list" reaches here (export handled in local section)
-            let output = rsh_client::recording::list_remote(&mut client).await?;
+            let output = mrsh_client::recording::list_remote(&mut client).await?;
             print!("{}", output);
         }
         "write" => {
@@ -1329,19 +1506,19 @@ async fn async_main(cli: Cli) -> Result<()> {
                 bail!("write requires <remote-path> <content>");
             }
             let content = args[2..].join(" ");
-            rsh_client::commands::write_file(&mut client, &args[1], content.as_bytes()).await?;
-            eprintln!("wrote {} bytes to {}", content.len(), args[1]);
+            mrsh_client::commands::write_file(&mut client, &args[1], content.as_bytes()).await?;
+            println!("wrote {} bytes to {}", content.len(), args[1]);
         }
         "self-update" => {
             if args.len() < 2 {
                 bail!("self-update requires <remote-binary-path>");
             }
-            let result = rsh_client::commands::self_update(&mut client, &args[1]).await?;
-            eprintln!("{}", result);
+            let result = mrsh_client::commands::self_update(&mut client, &args[1]).await?;
+            println!("{}", result);
         }
         "input" => {
-            // rsh -h host input mouse pos
-            // rsh -h host input mouse move 500,300
+            // mrsh -h host input mouse pos
+            // mrsh -h host input mouse move 500,300
             if args.len() < 3 {
                 bail!("input requires <type> <action> [args...]");
             }
@@ -1351,19 +1528,19 @@ async fn async_main(cli: Cli) -> Result<()> {
                 String::new()
             };
             let result =
-                rsh_client::commands::input(&mut client, &args[1], &args[2], &extra)
+                mrsh_client::commands::input(&mut client, &args[1], &args[2], &extra)
                     .await?;
             println!("{}", result);
         }
         "ps" => {
-            let result = rsh_client::commands::ps(&mut client).await?;
+            let result = mrsh_client::commands::ps(&mut client).await?;
             println!("{}", result);
         }
         "kill" => {
             if args.len() < 2 {
                 bail!("kill requires a PID");
             }
-            let result = rsh_client::commands::kill_process(&mut client, &args[1]).await?;
+            let result = mrsh_client::commands::kill_process(&mut client, &args[1]).await?;
             println!("{}", result);
         }
         "tail" => {
@@ -1371,31 +1548,31 @@ async fn async_main(cli: Cli) -> Result<()> {
                 bail!("tail requires <path> [lines]");
             }
             let lines: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-            let result = rsh_client::commands::tail(&mut client, &args[1], lines).await?;
+            let result = mrsh_client::commands::tail(&mut client, &args[1], lines).await?;
             print!("{}", result);
         }
         "filever" => {
             if args.len() < 2 {
                 bail!("filever requires <path>");
             }
-            let result = rsh_client::commands::filever(&mut client, &args[1]).await?;
+            let result = mrsh_client::commands::filever(&mut client, &args[1]).await?;
             println!("{}", result);
         }
         "info" => {
-            let result = rsh_client::commands::info(&mut client).await?;
+            let result = mrsh_client::commands::info(&mut client).await?;
             println!("{}", result);
         }
         "eventlog" | "evtlog" => {
             let log_name = args.get(1).map(|s| s.as_str()).unwrap_or("System");
             let count: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(50);
-            let result = rsh_client::commands::eventlog(&mut client, log_name, count).await?;
+            let result = mrsh_client::commands::eventlog(&mut client, log_name, count).await?;
             println!("{}", result);
         }
         "clip" | "clipboard" => {
             let action = args.get(1).map(|s| s.as_str()).unwrap_or("get");
             match action {
                 "get" | "read" => {
-                    let result = rsh_client::commands::clip_get(&mut client).await?;
+                    let result = mrsh_client::commands::clip_get(&mut client).await?;
                     print!("{}", result);
                 }
                 "set" | "write" | "copy" => {
@@ -1403,7 +1580,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         bail!("clip set requires text");
                     }
                     let text = args[2..].join(" ");
-                    let result = rsh_client::commands::clip_set(&mut client, &text).await?;
+                    let result = mrsh_client::commands::clip_set(&mut client, &text).await?;
                     println!("{}", result);
                 }
                 "sync" => {
@@ -1411,7 +1588,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         .and_then(|s| s.strip_prefix("--interval=").or(Some(s.as_str())))
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(500);
-                    rsh_client::commands::clip_sync(
+                    mrsh_client::commands::clip_sync(
                         &mut client,
                         std::time::Duration::from_millis(interval_ms),
                     ).await?;
@@ -1424,7 +1601,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 bail!("service requires: list|status|start|stop|restart [name]");
             }
             let name = args.get(2).map(|s| s.as_str());
-            let result = rsh_client::commands::service(&mut client, &args[1], name).await?;
+            let result = mrsh_client::commands::service(&mut client, &args[1], name).await?;
             println!("{}", result);
         }
         "plugin" => {
@@ -1432,7 +1609,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 bail!("plugin requires <action> [args...]");
             }
             let plugin_args = args[1..].join(" ");
-            let result = rsh_client::commands::plugin(&mut client, &plugin_args).await?;
+            let result = mrsh_client::commands::plugin(&mut client, &plugin_args).await?;
             if !result.is_empty() {
                 println!("{}", result);
             }
@@ -1451,8 +1628,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             }
-            eprintln!("Rebooting {}:{}...", resolved_host, resolved_port);
-            rsh_client::commands::exec(&mut client, "Restart-Computer -Force", &[])
+            println!("Rebooting {}:{}...", resolved_host, resolved_port);
+            mrsh_client::commands::exec(&mut client, "Restart-Computer -Force", &[])
                 .await
                 .ok();
         }
@@ -1470,11 +1647,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             }
-            eprintln!("Shutting down {}:{}...", resolved_host, resolved_port);
-            rsh_client::commands::exec(&mut client, "Stop-Computer -Force", &[])
+            println!("Shutting down {}:{}...", resolved_host, resolved_port);
+            mrsh_client::commands::exec(&mut client, "Stop-Computer -Force", &[])
                 .await
                 .ok();
-            eprintln!("Shutdown command sent.");
+            println!("Shutdown command sent.");
         }
         "sleep" => {
             let force = args
@@ -1490,30 +1667,30 @@ async fn async_main(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
             }
-            eprintln!("Putting {}:{} to sleep...", resolved_host, resolved_port);
-            rsh_client::commands::exec(
+            println!("Putting {}:{} to sleep...", resolved_host, resolved_port);
+            mrsh_client::commands::exec(
                 &mut client,
                 "Add-Type -Assembly System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState([System.Windows.Forms.PowerState]::Suspend, $true, $false)",
                 &[],
             ).await.ok();
-            eprintln!("Sleep command sent.");
+            println!("Sleep command sent.");
         }
         "lock" => {
             eprintln!(
                 "Locking workstation on {}:{}...",
                 resolved_host, resolved_port
             );
-            rsh_client::commands::exec(&mut client, "rundll32.exe user32.dll,LockWorkStation", &[])
+            mrsh_client::commands::exec(&mut client, "rundll32.exe user32.dll,LockWorkStation", &[])
                 .await?;
-            eprintln!("Workstation locked.");
+            println!("Workstation locked.");
         }
         "mouse" | "key" | "window" => {
-            // GUI automation: rsh -h host mouse move 500 300
+            // GUI automation: mrsh -h host mouse move 500 300
             if args.len() < 3 {
                 bail!("{} requires <action> <args>", cmd);
             }
             let result =
-                rsh_client::commands::input(&mut client, cmd, &args[1], &args[2..].join(" "))
+                mrsh_client::commands::input(&mut client, cmd, &args[1], &args[2..].join(" "))
                     .await?;
             if !result.is_empty() {
                 println!("{}", result);
@@ -1525,7 +1702,7 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             match args[1].as_str() {
                 "stats" => {
-                    let req = rsh_client::commands::build_request("sync", None, None, None);
+                    let req = mrsh_client::commands::build_request("sync", None, None, None);
                     let mut req = req;
                     req.sync_type = Some("cache-stats".to_string());
                     let resp = client.request(&req).await?;
@@ -1539,7 +1716,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                         bail!("cache index requires <remote-path>");
                     }
                     let mut req =
-                        rsh_client::commands::build_request("sync", None, Some(&args[2]), None);
+                        mrsh_client::commands::build_request("sync", None, Some(&args[2]), None);
                     req.sync_type = Some("index-dir".to_string());
                     let resp = client.request(&req).await?;
                     if !resp.success {
@@ -1557,7 +1734,7 @@ async fn async_main(cli: Cli) -> Result<()> {
 
             for i in 0..count {
                 let start = std::time::Instant::now();
-                match rsh_client::commands::ping(&mut client).await {
+                match mrsh_client::commands::ping(&mut client).await {
                     Ok(_) => {
                         let elapsed = start.elapsed();
                         eprintln!("  ping {}: {:.1?}", i + 1, elapsed);
@@ -1597,13 +1774,31 @@ async fn async_main(cli: Cli) -> Result<()> {
                     min, avg, max, p50
                 );
 
+                // Jitter (standard deviation of RTTs)
+                let jitter = if rtts.len() >= 2 {
+                    let avg_ns = avg.as_nanos() as f64;
+                    let sum_sq: f64 = rtts.iter().map(|d| {
+                        let diff = d.as_nanos() as f64 - avg_ns;
+                        diff * diff
+                    }).sum();
+                    std::time::Duration::from_nanos((sum_sq / rtts.len() as f64).sqrt() as u64)
+                } else {
+                    std::time::Duration::ZERO
+                };
+                println!("jitter: {:.1?}", jitter);
+
                 let quality = if loss > 50.0 {
                     "POOR (high packet loss)"
                 } else if avg > std::time::Duration::from_millis(500) {
                     "POOR (high latency)"
-                } else if loss > 10.0 || avg > std::time::Duration::from_millis(200) {
+                } else if loss > 10.0
+                    || avg > std::time::Duration::from_millis(200)
+                    || jitter > std::time::Duration::from_millis(100)
+                {
                     "FAIR"
-                } else if avg > std::time::Duration::from_millis(50) {
+                } else if avg > std::time::Duration::from_millis(50)
+                    || jitter > std::time::Duration::from_millis(20)
+                {
                     "GOOD"
                 } else {
                     "EXCELLENT"
@@ -1613,9 +1808,32 @@ async fn async_main(cli: Cli) -> Result<()> {
 
             // Remote info
             println!("\n--- remote info ---");
-            if let Ok(info_json) = rsh_client::commands::info(&mut client).await {
+            if let Ok(info_json) = mrsh_client::commands::info(&mut client).await {
                 println!("{}", info_json)
             }
+        }
+        "sync-dir" => {
+            if args.len() < 3 {
+                bail!("sync-dir requires <local-dir> <remote-dir>");
+            }
+            let xfer_opts = mrsh_client::sync::TransferOptions {
+                progress: cli.progress,
+                dry_run: cli.dry_run,
+                backup_suffix: cli.backup.clone(),
+                bwlimit_kbps: cli.bwlimit,
+            };
+            let exclude: Vec<String> = args.iter()
+                .filter(|a| a.starts_with("--exclude="))
+                .map(|a| a.trim_start_matches("--exclude=").to_string())
+                .collect();
+            let local_path = std::path::Path::new(&args[1]);
+            let result = mrsh_client::sync::sync_dir(
+                &mut client, local_path, &args[2], &xfer_opts, &exclude,
+            ).await?;
+            println!(
+                "sync-dir: {} pulled, {} pushed, {} unchanged",
+                result.pulled, result.pushed, result.unchanged
+            );
         }
         "watch" => {
             if args.len() < 3 {
@@ -1624,13 +1842,13 @@ async fn async_main(cli: Cli) -> Result<()> {
             run_watch(&mut client, &args[1], &args[2]).await?;
         }
         "server-version" => {
-            let result = rsh_client::commands::ping(&mut client).await?;
+            let result = mrsh_client::commands::ping(&mut client).await?;
             println!("{}", result);
         }
         _other => {
             // Unknown command → treat as exec
             let command = args.join(" ");
-            let result = rsh_client::commands::exec(&mut client, &command, &[]).await?;
+            let result = mrsh_client::commands::exec(&mut client, &command, &[]).await?;
             print!("{}", result);
         }
     }
@@ -1660,11 +1878,11 @@ async fn async_main(cli: Cli) -> Result<()> {
 /// Generate ed25519 keypair in OpenSSH format.
 fn run_keygen(output: Option<&std::path::Path>) -> Result<()> {
     use anyhow::Context;
-    use rsh_core::auth;
+    use mrsh_core::auth;
 
     let default_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".rsh");
+        .join(".mrsh");
     let default_key = default_dir.join("id_ed25519");
     let key_path = output.unwrap_or(&default_key);
 
@@ -1683,7 +1901,7 @@ fn run_keygen(output: Option<&std::path::Path>) -> Result<()> {
     };
     let comment = std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "rsh".to_string());
+        .unwrap_or_else(|_| "mrsh".to_string());
     let private_key =
         ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(ed_kp), &comment)
             .context("create ed25519 private key")?;
@@ -1745,7 +1963,7 @@ fn run_keygen(output: Option<&std::path::Path>) -> Result<()> {
 /// - Recovery codes (for adding to server's totp_recovery file)
 fn run_totp_setup(fingerprint: Option<&str>) -> Result<()> {
     use anyhow::Context;
-    use rsh_core::auth;
+    use mrsh_core::auth;
     use sha2::{Digest, Sha256};
 
     let fp = if let Some(fp) = fingerprint {
@@ -1754,7 +1972,7 @@ fn run_totp_setup(fingerprint: Option<&str>) -> Result<()> {
         // Try to read the default key and compute its fingerprint
         let key_pair = auth::discover_key().context(
             "no fingerprint provided and no default key found.\n\
-             Usage: rsh totp-setup [fingerprint]\n\
+             Usage: mrsh totp-setup [fingerprint]\n\
              Or ensure ~/.ssh/id_ed25519 exists.",
         )?;
         let raw_pub = key_pair.public_key_bytes();
@@ -1808,7 +2026,7 @@ fn run_totp_setup(fingerprint: Option<&str>) -> Result<()> {
 
 /// Verify a TOTP code against a secret (for testing setup).
 fn run_totp_verify(secret_or_fingerprint: &str, code: &str) -> Result<()> {
-    use rsh_core::auth;
+    use mrsh_core::auth;
 
     // If it looks like a base32 secret (all uppercase + digits, length 32+), use directly.
     // Otherwise treat as fingerprint and look up in totp_secrets file.
@@ -1852,7 +2070,7 @@ fn run_totp_verify(secret_or_fingerprint: &str, code: &str) -> Result<()> {
 
 /// Query and display session logs.
 fn run_log_query(args: &[String]) -> Result<()> {
-    let config = rsh_core::config::Config::load();
+    let config = mrsh_core::config::Config::load();
     let log_dir = config.session_log_dir();
 
     let mut host_filter = None;
@@ -1904,18 +2122,18 @@ fn run_log_query(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let filter = rsh_client::session_log::LogFilter {
+    let filter = mrsh_client::session_log::LogFilter {
         host: host_filter,
         since,
         until,
     };
 
-    let entries = rsh_client::session_log::query_logs(&log_dir, &filter);
+    let entries = mrsh_client::session_log::query_logs(&log_dir, &filter);
 
     if entries.is_empty() {
         eprintln!("No session log entries found in {}", log_dir.display());
         if !config.session_log {
-            eprintln!("Hint: session logging is disabled. Remove 'SessionLog false' from ~/.rsh/config to re-enable.");
+            eprintln!("Hint: session logging is disabled. Remove 'SessionLog false' from ~/.mrsh/config to re-enable.");
         }
         return Ok(());
     }
@@ -1946,7 +2164,7 @@ fn run_log_query(args: &[String]) -> Result<()> {
                     .chars()
                     .take(30)
                     .collect::<String>(),
-                rsh_client::session_log::format_duration(entry.duration_s),
+                mrsh_client::session_log::format_duration(entry.duration_s),
                 entry.exit,
             );
         }
@@ -1954,7 +2172,7 @@ fn run_log_query(args: &[String]) -> Result<()> {
     }
 
     // Summary by host
-    let summaries = rsh_client::session_log::summarize_by_host(&entries);
+    let summaries = mrsh_client::session_log::summarize_by_host(&entries);
 
     println!(
         "\n{:<25} {:>10} {:>8} {:>12} {:>12}",
@@ -1998,7 +2216,7 @@ fn run_log_query(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Generate an install pack for deploying rsh to a new machine.
+/// Generate an install pack for deploying mrsh to a new machine.
 fn run_install_pack(args: &[String]) -> Result<()> {
     let mut platform = if cfg!(target_os = "windows") {
         "windows".to_string()
@@ -2050,7 +2268,7 @@ fn run_install_pack(args: &[String]) -> Result<()> {
             "--port" => {
                 i += 1;
                 if let Some(p) = args.get(i) {
-                    port = p.parse().unwrap_or(8822);
+                    port = p.parse().unwrap_or(DEFAULT_PORT);
                 }
             }
             "--nas-auth" => {
@@ -2088,7 +2306,7 @@ fn run_install_pack(args: &[String]) -> Result<()> {
                     .strip_prefix("--port=")
                     .unwrap()
                     .parse()
-                    .unwrap_or(8822);
+                    .unwrap_or(DEFAULT_PORT);
             }
             other if other.starts_with("--nas-auth=") => {
                 nas_auth = Some(other.strip_prefix("--nas-auth=").unwrap().to_string());
@@ -2102,7 +2320,7 @@ fn run_install_pack(args: &[String]) -> Result<()> {
             _ => {
                 bail!(
                     "Unknown install-pack option: {other}\n\
-                     Usage: rsh install-pack [--platform windows|linux] [--output FILE] [--binary PATH]\n\
+                     Usage: mrsh install-pack [--platform windows|linux] [--output FILE] [--binary PATH]\n\
                      \x20      [--key KEY_OR_FILE] [--port PORT] [--nas-auth CMD]\n\
                      \x20      [--group NAME] [--rendezvous-server HOST:PORT]\n\
                      \x20      Linux: produces self-extracting .sh (bash + tar.gz)\n\
@@ -2115,7 +2333,7 @@ fn run_install_pack(args: &[String]) -> Result<()> {
     }
 
     use anyhow::Context;
-    let opts = rsh_client::install_pack::InstallPackOptions {
+    let opts = mrsh_client::install_pack::InstallPackOptions {
         platform,
         output,
         binary,
@@ -2127,7 +2345,7 @@ fn run_install_pack(args: &[String]) -> Result<()> {
     };
 
     println!("Generating install pack...");
-    let out_file = rsh_client::install_pack::generate(&opts)?;
+    let out_file = mrsh_client::install_pack::generate(&opts)?;
     println!("\nDone: {}", out_file.display());
     Ok(())
 }
@@ -2161,7 +2379,7 @@ async fn run_relay_server(args: &[String]) -> Result<()> {
         i += 1;
     }
 
-    let server = rsh_relay::relay::RelayServer::new(&key);
+    let server = mrsh_relay::relay::RelayServer::new(&key);
     let addr = format!("0.0.0.0:{port}");
     eprintln!("relay server (hbbr) listening on {addr}");
     server.listen_and_serve(&addr).await
@@ -2207,7 +2425,7 @@ async fn run_rendezvous_server(args: &[String]) -> Result<()> {
         bail!("--relay <host:port> is required (address of hbbr relay server)");
     }
 
-    let server = rsh_relay::rendezvous::RendezvousServer::new(&key, &relay);
+    let server = mrsh_relay::rendezvous::RendezvousServer::new(&key, &relay);
     let addr = format!("0.0.0.0:{port}");
     eprintln!("rendezvous server (hbbs) listening on {addr} (relay: {relay})");
     server.listen_and_serve(&addr).await
@@ -2216,13 +2434,13 @@ async fn run_rendezvous_server(args: &[String]) -> Result<()> {
 /// Fleet status and update across configured hosts.
 async fn run_fleet(args: &[String]) -> Result<()> {
     let action = args.first().map(|s| s.as_str()).unwrap_or("status");
-    let config = rsh_core::config::Config::load();
+    let config = mrsh_core::config::Config::load();
 
     match action {
         "status" => {
             let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-            let statuses = rsh_client::fleet::status(&config).await;
-            println!("{}", rsh_client::fleet::format_status_table_inner(&statuses, verbose));
+            let statuses = mrsh_client::fleet::status(&config).await;
+            println!("{}", mrsh_client::fleet::format_status_table_inner(&statuses, verbose));
         }
         "update" => {
             let binary_path = args.get(1).map(|s| s.as_str()).unwrap_or("deploy/rsh.exe");
@@ -2247,16 +2465,16 @@ async fn run_fleet(args: &[String]) -> Result<()> {
             );
 
             // Show current status first
-            let statuses = rsh_client::fleet::status(&config).await;
-            println!("{}\n", rsh_client::fleet::format_status_table(&statuses));
+            let statuses = mrsh_client::fleet::status(&config).await;
+            println!("{}\n", mrsh_client::fleet::format_status_table(&statuses));
 
             let results =
-                rsh_client::fleet::update_fleet(&config, &binary_data, target_version).await;
-            println!("{}", rsh_client::fleet::format_update_results(&results));
+                mrsh_client::fleet::update_fleet(&config, &binary_data, target_version).await;
+            println!("{}", mrsh_client::fleet::format_update_results(&results));
         }
         "config" => {
             // Check rendezvous config consistency across fleet
-            let statuses = rsh_client::fleet::status(&config).await;
+            let statuses = mrsh_client::fleet::status(&config).await;
             let online: Vec<_> = statuses.iter().filter(|s| s.online).collect();
 
             if online.is_empty() {
@@ -2276,8 +2494,8 @@ async fn run_fleet(args: &[String]) -> Result<()> {
                     key_path: None,
                     password_user: None,
                 };
-                match rsh_client::client::connect(&opts).await {
-                    Ok(mut c) => match rsh_client::commands::native(&mut c, "config").await {
+                match mrsh_client::client::connect(&opts).await {
+                    Ok(mut c) => match mrsh_client::commands::native(&mut c, "config").await {
                         Ok(cfg) => {
                             let matches = cfg.contains(&expected_rdv);
                             let mark = if matches { "OK" } else { "DRIFT" };
@@ -2294,7 +2512,7 @@ async fn run_fleet(args: &[String]) -> Result<()> {
         }
         "discover" => {
             // Fleet discovery via rendezvous group query.
-            // Usage: rsh fleet discover --group <name>
+            // Usage: mrsh fleet discover --group <name>
             let mut group_name = None;
             let mut i = 1;
             while i < args.len() {
@@ -2311,16 +2529,16 @@ async fn run_fleet(args: &[String]) -> Result<()> {
                 i += 1;
             }
             let group_name = group_name
-                .ok_or_else(|| anyhow::anyhow!("--group <name> required\nUsage: rsh fleet discover --group <name>"))?;
+                .ok_or_else(|| anyhow::anyhow!("--group <name> required\nUsage: mrsh fleet discover --group <name>"))?;
 
             // Look up enrollment token
-            let token = rsh_client::install_pack::get_group_token(&group_name)?;
+            let token = mrsh_client::install_pack::get_group_token(&group_name)?;
 
             // Build rendezvous client
             let rdv_server = config.rendezvous_server.clone()
                 .unwrap_or_else(|| "localhost:21116".to_string());
 
-            let rdv_client = rsh_relay::rendezvous::Client {
+            let rdv_client = mrsh_relay::rendezvous::Client {
                 servers: vec![rdv_server.clone()],
                 licence_key: config.rendezvous_key.clone().unwrap_or_default(),
                 local_id: String::new(),
@@ -2368,7 +2586,9 @@ async fn run_fleet(args: &[String]) -> Result<()> {
                     peer.device_id, peer.hostname, peer.platform, addr_str, net_label, ago);
             }
 
-            let lan_count = peers.iter().filter(|p| p.addr.map_or(false, |a| is_same_lan(a, &local_addrs))).count();
+            let lan_count = peers.iter()
+                .filter(|p| p.addr.map_or(false, |a| is_same_lan(a, &local_addrs)))
+                .count();
             println!("\n{} peer(s) total, {} on LAN", peers.len(), lan_count);
         }
         other => bail!("unknown fleet action: {} (use status|update|config|discover)", other),
@@ -2381,7 +2601,7 @@ async fn run_fleet(args: &[String]) -> Result<()> {
 
 /// Watch a local directory for changes and auto-push to remote.
 async fn run_watch<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
-    client: &mut rsh_client::client::RshClient<S>,
+    client: &mut mrsh_client::client::RshClient<S>,
     local_dir: &str,
     remote_dir: &str,
 ) -> Result<()> {
@@ -2469,22 +2689,15 @@ async fn run_watch<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Sen
                     // Convert to Windows remote path
                     let remote_path = format!("{}\\{}", remote_dir, rel.replace('/', "\\"));
 
-                    match std::fs::read(path) {
-                        Ok(data) => {
-                            match rsh_client::sync::push(client, &data, &remote_path).await {
-                                Ok(result) => {
-                                    eprintln!(
-                                        "  {} ({} bytes, delta: {})",
-                                        rel, result.bytes_sent, result.delta
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!("  {} FAILED: {}", rel, e);
-                                }
-                            }
+                    match mrsh_client::sync::push_file(client, path, &remote_path).await {
+                        Ok(result) => {
+                            eprintln!(
+                                "  {} ({} bytes, delta: {})",
+                                rel, result.bytes_sent, result.delta
+                            );
                         }
-                        Err(_) => {
-                            // File may have been deleted
+                        Err(e) => {
+                            eprintln!("  {} FAILED: {}", rel, e);
                             continue;
                         }
                     }
@@ -2519,7 +2732,7 @@ async fn run_watch<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Sen
 #[cfg(feature = "quic")]
 async fn handle_quic_socks5_conn(
     mut client: tokio::net::TcpStream,
-    quic: &rsh_client::quic::QuicClient,
+    quic: &mrsh_client::quic::QuicClient,
 ) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -2627,7 +2840,7 @@ async fn run_server_mode_with_cancel(
 /// 1. Config `device_id` field (if set) → use it
 /// 2. Legacy `device_id` file in data_dir (from old Go installs) → use it
 /// 3. Neither → generate a new 9-digit numeric ID, save to config
-fn resolve_device_id(config: &rsh_core::config::Config, data_dir: &std::path::Path) -> String {
+fn resolve_device_id(config: &mrsh_core::config::Config, data_dir: &std::path::Path) -> String {
     let config_id = config.device_id.clone().unwrap_or_default();
     if !config_id.is_empty() {
         return config_id;
@@ -2649,7 +2862,7 @@ fn resolve_device_id(config: &rsh_core::config::Config, data_dir: &std::path::Pa
     };
 
     // Persist to config so it's stable across restarts
-    let mut cfg = rsh_core::config::Config::load();
+    let mut cfg = mrsh_core::config::Config::load();
     cfg.device_id = Some(id.clone());
     if let Err(e) = cfg.save() {
         tracing::warn!("could not save device_id to config: {}", e);
@@ -2665,6 +2878,7 @@ fn resolve_device_id(config: &rsh_core::config::Config, data_dir: &std::path::Pa
 fn build_server_caps() -> Vec<String> {
     let mut caps = vec![
         "exec".to_string(),
+        "stream-exec".to_string(),
         "push".to_string(),
         "pull".to_string(),
         "self-update".to_string(),
@@ -2716,8 +2930,8 @@ async fn run_server_mode_inner(
     _with_tray: bool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
-    use rsh_core::{auth, tls};
-    use rsh_server::{handler::ServerContext, listener, session};
+    use mrsh_core::{auth, tls};
+    use mrsh_server::{handler::ServerContext, listener, session};
     use tokio_rustls::TlsAcceptor;
 
     let data_dir = server_data_dir();
@@ -2765,19 +2979,26 @@ async fn run_server_mode_inner(
     };
 
     // Initialize connection notification channel (for tray toast notifications)
-    let _notify_rx = rsh_server::notify::init();
+    let _notify_rx = mrsh_server::notify::init();
 
     let ctx = Arc::new(ServerContext {
         authorized_keys,
         revoked_keys,
-        server_version: env!("CARGO_PKG_VERSION").to_string(),
-        banner: None,
+        server_version: {
+            let v = env!("CARGO_PKG_VERSION").to_string();
+            match option_env!("MRSH_VERSION_SUFFIX") {
+                Some(s) if !s.is_empty() => format!("{}-{}", v, s),
+                _ => v,
+            }
+        },
+        banner: option_env!("MRSH_BANNER").map(|s| s.to_string()),
         caps,
         session_store: session::SessionStore::new(),
-        rate_limiter: rsh_server::ratelimit::AuthRateLimiter::new(),
+        rate_limiter: mrsh_server::ratelimit::AuthRateLimiter::new(),
         allowed_tunnels: load_allowed_tunnels(&data_dir),
         totp_secrets,
         totp_recovery_path,
+        server_key_path: Some(data_dir.join("server_key")),
     });
 
     // Clone TLS acceptor and ctx for relay handler before moving into ServerConfig.
@@ -2795,8 +3016,12 @@ async fn run_server_mode_inner(
 
     // Spawn rendezvous registration loop with relay notification support.
     {
-        let user_config = rsh_core::config::Config::load();
-        let rdv_servers = user_config.get_rendezvous_servers();
+        let user_config = mrsh_core::config::Config::load();
+        // Compile-time override: MRSH_RDV_SERVER=host:port bakes the rendezvous server
+        let rdv_servers = match option_env!("MRSH_RDV_SERVER") {
+            Some(rdv) if !rdv.is_empty() => vec![rdv.to_string()],
+            _ => user_config.get_rendezvous_servers(),
+        };
         let device_id = resolve_device_id(&user_config, &data_dir);
         let rdv_key = user_config.rendezvous_key.clone().unwrap_or_default();
         // Compute group_hash from enrollment_token (if present in config).
@@ -2825,7 +3050,7 @@ async fn run_server_mode_inner(
             let disc_platform = platform.clone();
             let disc_port = port;
             tokio::spawn(async move {
-                rsh_relay::discovery::run_discovery_responder(
+                mrsh_relay::discovery::run_discovery_responder(
                     cancel_disc, disc_id, disc_host, disc_platform, disc_port,
                 ).await;
             });
@@ -2833,13 +3058,13 @@ async fn run_server_mode_inner(
 
         if !rdv_servers.is_empty() && !device_id.is_empty() {
             let (relay_tx, mut relay_rx) =
-                tokio::sync::mpsc::channel::<rsh_relay::rendezvous::RelayNotification>(16);
+                tokio::sync::mpsc::channel::<mrsh_relay::rendezvous::RelayNotification>(16);
 
             // Registration + relay notification listener.
             let cancel_reg = cancel.clone();
             let svc_port = port;
             tokio::spawn(async move {
-                let client = rsh_relay::rendezvous::Client {
+                let client = mrsh_relay::rendezvous::Client {
                     servers: rdv_servers,
                     licence_key: rdv_key.clone(),
                     local_id: device_id,
@@ -2877,7 +3102,7 @@ async fn run_server_mode_inner(
 
     #[cfg(target_os = "windows")]
     if _with_tray {
-        use rsh_server::tray;
+        use mrsh_server::tray;
 
         // Tray mode — run listener in background, tray on main thread
         let cancel_clone = cancel.clone();
@@ -2914,9 +3139,9 @@ async fn run_server_mode_inner(
 /// wants to connect to this server via relay. We connect to hbbr with the
 /// same UUID so hbbr can pair us with the client.
 async fn accept_relay_connection(
-    notif: rsh_relay::rendezvous::RelayNotification,
+    notif: mrsh_relay::rendezvous::RelayNotification,
     acceptor: tokio_rustls::TlsAcceptor,
-    ctx: Arc<rsh_server::handler::ServerContext>,
+    ctx: Arc<mrsh_server::handler::ServerContext>,
     licence_key: &str,
 ) -> Result<()> {
     let relay_addr = if notif.relay_server.contains(':') {
@@ -2930,7 +3155,7 @@ async fn accept_relay_connection(
         relay_addr, notif.uuid
     );
 
-    let relay_stream = rsh_relay::relay::connect_relay(&relay_addr, &notif.uuid, licence_key)
+    let relay_stream = mrsh_relay::relay::connect_relay(&relay_addr, &notif.uuid, licence_key)
         .await
         .context("relay: connect to hbbr")?;
 
@@ -2946,7 +3171,7 @@ async fn accept_relay_connection(
 
     info!("relay accept: TLS established, dispatching");
 
-    rsh_server::handler::handle_connection(tls_stream, &ctx, None).await?;
+    mrsh_server::handler::handle_connection(tls_stream, &ctx, None).await?;
 
     Ok(())
 }
@@ -3008,14 +3233,61 @@ fn is_same_lan(remote: std::net::SocketAddr, local_addrs: &[std::net::Ipv4Addr])
     false
 }
 
+/// Handle a command over SSH fallback (when target has no mrsh service).
+/// Returns exit code for the process.
+#[cfg(feature = "ssh")]
+async fn run_ssh_command(
+    ssh: mrsh_client::ssh_client::SshSession,
+    cmd: &str,
+    args: &[String],
+) -> Result<i32> {
+    match cmd {
+        "exec" => {
+            if args.len() < 2 {
+                bail!("exec requires a command");
+            }
+            let command = args[1..].join(" ");
+            let (exit_code, output) = ssh.exec(&command).await?;
+            print!("{}", output);
+            Ok(exit_code as i32)
+        }
+        "ping" => {
+            let (code, output) = ssh.exec("echo pong").await?;
+            print!("{}", output);
+            Ok(code as i32)
+        }
+        "push" => {
+            if args.len() < 3 {
+                bail!("push requires <local> <remote>");
+            }
+            let local_path = std::path::Path::new(&args[1]);
+            let bytes = ssh.push(local_path, &args[2]).await?;
+            println!("pushed {} bytes via SSH", bytes);
+            Ok(0)
+        }
+        "pull" => {
+            if args.len() < 3 {
+                bail!("pull requires <remote> <local>");
+            }
+            let data = ssh.pull(&args[1]).await?;
+            std::fs::write(&args[2], &data)?;
+            println!("pulled {} bytes via SSH", data.len());
+            Ok(0)
+        }
+        other => {
+            bail!("command '{}' not supported over SSH fallback (only exec, ping, push, pull)", other);
+        }
+    }
+}
+
 fn print_usage() {
     let version = env!("CARGO_PKG_VERSION");
     println!(
-        r#"rsh {version} (rust) — Remote Shell Tool
+        r#"mrsh {version} (rust) — Remote Shell Tool
 
 USAGE:
-  rsh [options] <command> [args...]
-  rsh -h <host> [-p port] [-i key] <command> [args...]
+  mrsh [options] <command> [args...]
+  mrsh -h <host> [-p port] [-i key] <command> [args...]
 
 OPTIONS:
   -h <host>     Remote host (IP, hostname, or DeviceID)
@@ -3060,15 +3332,18 @@ LOCAL COMMANDS (no -h needed):
 
 CLIENT COMMANDS (require -h):
   ping          Test connectivity
-  exec <cmd>    Execute command (PowerShell on Windows)
+  exec <cmd>    Execute command (streaming output, no timeout)
   shell         Interactive shell (ConPTY on Windows, PTY on Linux)
   attach [id]   Persistent session (--ro for read-only)
   browse [path] Interactive file browser (TUI)
   sftp          SFTP-like interactive file transfer shell
   server-version  Show remote server version
   recording list  List session recordings on remote host
-  push <l> <r>  Push file (delta sync)
-  pull <r> <l>  Pull file (delta sync)
+  push <l> <r>  Push file or directory (delta sync)
+  pull <r> <l>  Pull file or directory (delta sync)
+  sync-dir <l> <r>  Bidirectional sync (newer wins, mtime+size)
+                  Reads .syncignore from local dir (pattern-per-line)
+                  --exclude=<pattern>  Additional exclude (exact or glob)
 
 TRANSFER OPTIONS:
   --progress    Show progress bar with rate and ETA
@@ -3114,35 +3389,63 @@ MUX (connection multiplexing):
   --mux-stop    Stop running master for this host
 
 AI USAGE:
-  rsh is a unified remote shell tool (client+server in one binary) for AI agents.
+  mrsh is a unified remote shell tool (client+server in one binary) for AI agents.
   It replaces SSH for Windows targets with ed25519 auth, file transfer, GUI automation.
 
   CONNECTIVITY:
   - CONNECTION PRIORITY: LAN direct > Tailscale > Relay (DeviceID)
-  - CONFIG FILE: ~/.rsh/config defines Host aliases with Hostname, Port, DeviceID, MAC.
+  - CONFIG FILE: ~/.mrsh/config defines Host aliases with Hostname, Port, DeviceID, MAC.
     Always check config before assuming default ports.
-  - AUTO-TRY PORTS: Without -p, rsh tries 8822 → 9822 → 22 in sequence.
-    Port 22 covers hosts running rsh on the SSH port. No manual -p needed.
+  - AUTO-TRY PORTS: Without -p, mrsh tries 8822 → 9822 → 22 in sequence.
+    Port 22 covers hosts running mrsh on the SSH port. No manual -p needed.
+  - FIREWALL: On install (--install) or first startup, mrsh MUST open firewall
+    for all ports it listens on. Without this, LAN clients get "connection refused".
+    Windows: netsh advfirewall firewall add rule name="mrsh-inbound" dir=in action=allow protocol=TCP localport=8822 profile=private
+    Linux:   ufw allow 8822/tcp  OR  firewall-cmd --add-port=8822/tcp --permanent
+    If mrsh listens on multiple ports (8822, 9822), ALL must have firewall rules.
+    Tailscale installs its own firewall rules but only for the Tailscale IP —
+    LAN traffic (192.168.x.x) is NOT covered and will be blocked without explicit rules.
   - WSL CONNECTIVITY: WSL cannot reach Tailscale hosts (100.x.x.x) via TCP.
-    For Tailscale targets, use the Windows rsh client:
-      powershell.exe -Command "C:\ProgramData\remote-shell\rsh.exe -h <IP> -p <port> exec '<cmd>' | Out-String"
-    For LAN targets (192.168.x.x), WSL rsh works directly.
+    For Tailscale targets, use the Windows mrsh client:
+      powershell.exe -Command "& mrsh -h <host> exec '<cmd>' 2>&1 | Out-String"
+    For LAN targets (192.168.x.x), WSL mrsh works directly.
+    Note: success messages go to stdout, progress/errors to stderr.
   - RELAY FALLBACK: When LAN and Tailscale both fail, try DeviceID:
-      rsh -h <DeviceID> exec '<cmd>'
-    DeviceIDs are in ~/.rsh/config. Relay races P2P and hbbr in parallel.
+      mrsh -h <DeviceID> exec '<cmd>'
+    DeviceIDs are in ~/.mrsh/config. Relay races P2P and hbbr in parallel.
   - ALWAYS use UNC paths for network shares, NEVER mapped drive letters.
     Prefer DNS hostnames in UNC: \\nas-server\share not \\10.0.0.1\share
 
   EXEC BEHAVIOR:
-  - rsh exec runs commands via PowerShell (-NoProfile -Command), NOT CMD.
+  - mrsh exec runs commands via PowerShell (-NoProfile -Command), NOT CMD.
     Use PowerShell syntax: Get-ChildItem (not dir), Remove-Item (not del),
     Get-Content (not type), Set-Content (not echo >), Test-Path (not if exist).
   - The destination path in push is resolved by the SERVER, not the client.
+  - STREAMING: exec output is streamed in real-time (stdout/stderr chunks arrive
+    as the command produces them). No timeout on streaming exec — output flow
+    keeps the connection alive. Large log searches, long-running commands, and
+    Select-String on big files all work without timeout.
+  - LARGE FILES: For large log files, prefer server-side filtering to reduce transfer:
+      mrsh exec "Select-String -Pattern 'error' -Path 'C:\ProgramData\mrsh\audit.log' | Select-Object -Last 50"
+      mrsh exec "Get-Content 'C:\path\log.txt' -Tail 100"
+      mrsh exec "Get-Content 'C:\path\log.txt' -Tail 1000 | Select-String 'pattern'"
+    These filter on the server — only matching lines are sent to the client.
+    Avoid: Get-Content of entire multi-MB file without filtering (transfers everything).
+  - FALLBACK: If the server lacks stream-exec capability (old version), exec falls
+    back to buffered mode (120s timeout). Use --timeout=N to override.
 
   TRANSFER:
   - Push/pull use CDC delta sync by default (block-level, resumable).
   - Use --raw to skip delta and transfer full files (simpler, no cache).
   - Use --log-file to write logs to file AND console simultaneously.
+  - sync-dir <local> <remote>: bidirectional sync. Compares mtime+size,
+    pulls newer-remote files, pushes newer-local files. Gracefully falls
+    back to size-only when server lacks mtime support (pre-1.4.3).
+    Reads .syncignore from local dir root (one pattern per line, # comments).
+    Default excludes: .git, .venv, .tmp, .beads, .claude, __pycache__,
+    node_modules, target, .pytest_cache, .ruff_cache.
+  - SCP: standard `scp` command works against mrsh SSH server.
+    mrsh intercepts scp -t/-f on exec channel, handles the protocol natively.
 
   OUTPUT FORMATS:
     ls       → JSON array: [{{"name":"f.txt","size":1234,"mode":"0644","mod":"...","isDir":false}}]
@@ -3154,57 +3457,76 @@ AI USAGE:
     service list/status → Windows service management
 
   SYSTEM DISCOVERY:
-    rsh info --json          System info (hostname, OS, RAM, disk, NICs)
-    rsh service list         List Windows services
-    rsh service status <svc> Service details (state, PID, binary path)
-    rsh wake <host|MAC>      Wake-on-LAN (send magic packet, MAC from config)
-    rsh fleet status         Show version/status of all configured hosts
+    mrsh info --json          System info (hostname, OS, RAM, disk, NICs)
+    mrsh service list         List Windows services
+    mrsh service status <svc> Service details (state, PID, binary path)
+    mrsh wake <host|MAC>      Wake-on-LAN (send magic packet, MAC from config)
+    mrsh fleet status         Show version/status of all configured hosts
 
-  SELF-UPDATE:
-  - CRITICAL: NEVER kill/stop/restart rsh through its own connection using /ru SYSTEM.
+  DEPLOYMENT TO NEW/BROKEN MACHINE:
+  - ALWAYS use `mrsh pack` to generate an installer. NEVER manually copy naked binaries.
+    mrsh pack --platform windows --key ~/.ssh/id_ed25519.pub --port 8822 \
+              --rendezvous-server rendezvous.example.com:21116 -o installer.exe
+    The installer bundles: binary (mrsh.exe) + authorized_keys + firewall rules + service registration.
+    It also: stops old rsh/mrsh services, deletes legacy rsh.exe, cleans C:\ProgramData\remote-shell\,
+    registers new mrsh service with correct display name, launches tray in user session.
+    User copies installer to target, runs as admin, done.
+  - For fleet updates (already-running machines): use `mrsh self-update`:
+      mrsh -h <host> push deploy/mrsh.exe "C:\Temp\mrsh-new.exe"
+      mrsh -h <host> self-update "C:\Temp\mrsh-new.exe"
+    self-update creates a schtask that stops service, swaps binary, restarts.
+    Do NOT use manual bat/ps1 scripts — self-update handles stop/swap/start automatically.
+
+  SERVICE + TRAY ARCHITECTURE:
+  - Service (port 8822): runs as SYSTEM via SCM, auto-start. Handles all commands.
+  - Tray (port 9822): runs in user session, shows system tray icon. Handles GUI commands.
+  - At service startup, `ensure_tray_task` auto-heals the tray scheduled task:
+    * Checks if mrsh-tray schtask exists → creates via XML import if missing
+    * Uses GroupId S-1-5-32-545 (Users) → task runs in interactive user session
+    * Checks if tray process is running → launches via schtasks /run if not
+  - --install registers both service AND tray task. The tray task uses XML import
+    with GroupId for correct session targeting (schtasks /create alone runs in session 0).
+
+  SELF-UPDATE (existing machines):
+  - CRITICAL: NEVER kill/stop/restart mrsh through its own connection using /ru SYSTEM.
     SYSTEM cannot start tray-mode apps in user desktop session — locks you out.
   - SAFE UPDATE PROCEDURE:
-    0. DETERMINE MODE: service (port 8822) or tray (port 9822)?
-       Service mode: fleet update or schtask with net stop/start remote-shell is safe.
-       Tray mode: use schtask with /ru <USERNAME> (NOT /ru SYSTEM).
-    1. BEFORE touching the service, verify alternative access (SSH, WinRM, RDP).
-       If rsh is the ONLY access channel, DO NOT proceed — ask for recovery path.
-    2. Canonical install directory: C:\ProgramData\remote-shell\
-    3. Push new binary alongside: rsh push deploy/rsh.exe "C:\ProgramData\remote-shell\rsh-new.exe"
-    4. Create ONE schtask (never overwrite without verifying outcome of previous).
-    5. Wait 15s, verify: rsh ping
-    WARNING: rsh exec may report exit code 1 even on success (output formatting).
+    1. BEFORE touching the service, verify alternative access (SSH, WinRM, RDP, debug-server).
+       If mrsh is the ONLY access channel, DO NOT proceed — ask for recovery path.
+    2. Canonical install directory: C:\ProgramData\mrsh\ (binary: mrsh.exe, NOT rsh.exe)
+    3. Push + self-update: mrsh push deploy/mrsh.exe "C:\Temp\mrsh-new.exe"
+       then: mrsh self-update "C:\Temp\mrsh-new.exe"
+    4. The service auto-heals the tray task on restart (ensure_tray_task).
+    5. Wait 15s, verify: mrsh -h <host> exec "hostname"
 
   GUI INTERACTION:
     Service port 8822 (SYSTEM) has NO access to user desktop session.
-    For screenshot/window list/find, launch tray-mode as logged-in user:
-      1. Find user: rsh -p 8822 exec "quser"
-      2. Launch: schtasks /create ... /ru <USERNAME> + schtasks /run
-      3. Connect tray: rsh -p 9822 ping
+    The tray (port 9822) runs in the user session — use it for GUI commands.
+    The service auto-launches the tray at startup via ensure_tray_task.
     Capability matrix:
       | Feature           | Port 8822 (SYSTEM) | Port 9822 (tray/user) |
       | exec, push/pull   | Yes                | Yes                   |
       | mouse/key input   | Yes (cross-session)| Yes                   |
       | window list/find  | null (no desktop)  | Yes (JSON)            |
       | screenshot        | fails              | Yes                   |
-    Cleanup: rsh -p 8822 exec 'schtasks /delete /tn "rsh-tray" /f'
+    If tray is not running: mrsh -p 8822 exec 'schtasks /run /tn mrsh-tray'
 
   REMOTE EXECUTION — NO ORPHAN PROCESSES:
-  - Use rsh exec DIRECTLY for commands. Do NOT create intermediate .bat/.ps1 wrappers
+  - Use mrsh exec DIRECTLY for commands. Do NOT create intermediate .bat/.ps1 wrappers
     that leave orphan processes on the remote desktop.
-      CORRECT: rsh exec 'Get-Process | Where-Object {{ $_.Name -eq "app" }}'
-      WRONG:   rsh exec 'cmd /k "dir"'        ← leaves orphan cmd.exe window
-      WRONG:   rsh exec 'start /b script.bat'  ← leaves orphan console
-  - If you need cmd.exe features (pipes, cd /d): rsh exec 'cmd /c "..."'
+      CORRECT: mrsh exec 'Get-Process | Where-Object {{ $_.Name -eq "app" }}'
+      WRONG:   mrsh exec 'cmd /k "dir"'        ← leaves orphan cmd.exe window
+      WRONG:   mrsh exec 'start /b script.bat'  ← leaves orphan console
+  - If you need cmd.exe features (pipes, cd /d): mrsh exec 'cmd /c "..."'
     Always use /c (auto-exits after command), NEVER /k (keeps console open).
-  - If you need PowerShell: rsh exec 'powershell -NoProfile -Command "..."'
+  - If you need PowerShell: mrsh exec 'powershell -NoProfile -Command "..."'
 
   HIDDEN SCHTASK EXECUTION (no console window on remote desktop):
   - Bare schtasks /tr "powershell ..." shows a console window to the remote user.
   - Use VBS wrapper (run-hidden.vbs) to launch PowerShell hidden (window style 0):
       Set objShell = CreateObject("WScript.Shell")
       objShell.Run "powershell ... -File """ & WScript.Arguments(0) & """", 0, True
-  - Deploy once: rsh push run-hidden.vbs 'C:/Temp/run-hidden.vbs'
+  - Deploy once: mrsh push run-hidden.vbs 'C:/Temp/run-hidden.vbs'
   - Usage: /tr "wscript C:\Temp\run-hidden.vbs C:\Temp\script.ps1"
     instead of: /tr "powershell -ExecutionPolicy Bypass -File ..."
   - PS1 output: use *> C:\Temp\<name>.log redirect (NOT Start-Transcript).
@@ -3215,10 +3537,10 @@ AI USAGE:
 }
 
 /// Get the server data directory.
-/// Windows service: C:\ProgramData\remote-shell\
-/// Windows user: %USERPROFILE%\.rsh\
+/// Windows service: C:\ProgramData\mrsh\
+/// Windows user: %USERPROFILE%\.mrsh\
 /// Linux root/service: /etc/rsh/
-/// Linux user: ~/.rsh/
+/// Linux user: ~/.mrsh/
 /// Load allowed tunnel targets from `allowed_tunnels` file (one per line).
 /// Empty file or missing file = all tunnels allowed (default open).
 /// Format: `host:port` or `host:*` (wildcard port).
@@ -3228,7 +3550,7 @@ AI USAGE:
 /// - `denied_ips` only → blacklist mode (listed IPs are blocked)
 /// - Both files → allow list + deny list (deny takes precedence)
 /// - Neither file → all IPs allowed (default open)
-fn load_ip_acl(data_dir: &std::path::Path) -> rsh_server::listener::IpAccessControl {
+fn load_ip_acl(data_dir: &std::path::Path) -> mrsh_server::listener::IpAccessControl {
     let load_file = |name: &str| -> Vec<String> {
         let path = data_dir.join(name);
         match std::fs::read_to_string(&path) {
@@ -3252,9 +3574,9 @@ fn load_ip_acl(data_dir: &std::path::Path) -> rsh_server::listener::IpAccessCont
     let deny = load_file("denied_ips");
 
     if allow.is_empty() && deny.is_empty() {
-        rsh_server::listener::IpAccessControl::allow_all()
+        mrsh_server::listener::IpAccessControl::allow_all()
     } else {
-        rsh_server::listener::IpAccessControl::new(&allow, &deny)
+        mrsh_server::listener::IpAccessControl::new(&allow, &deny)
     }
 }
 
@@ -3284,19 +3606,48 @@ fn load_allowed_tunnels(data_dir: &std::path::Path) -> Vec<String> {
 fn server_data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     {
-        // Check canonical service location first
-        let service_dir = std::path::PathBuf::from(r"C:\ProgramData\remote-shell");
-        if service_dir.exists() {
-            return service_dir;
+        let new_dir = std::path::PathBuf::from(r"C:\ProgramData\mrsh");
+        let legacy_dir = std::path::PathBuf::from(r"C:\ProgramData\remote-shell");
+
+        // New location exists — use it
+        if new_dir.exists() {
+            return new_dir;
+        }
+
+        // Legacy location exists — migrate critical files then use new dir
+        if legacy_dir.exists() {
+            if std::fs::create_dir_all(&new_dir).is_ok() {
+                for name in &[
+                    "authorized_keys",
+                    "id_ed25519",
+                    "id_ed25519.pub",
+                    "device_id",
+                    "tls_cert.pem",
+                    "tls_key.pem",
+                    "banner.txt",
+                    "revoked_keys",
+                ] {
+                    let src = legacy_dir.join(name);
+                    let dst = new_dir.join(name);
+                    if src.exists() && !dst.exists() {
+                        let _ = std::fs::copy(&src, &dst);
+                    }
+                }
+                tracing::info!(
+                    "migrated data from {} to {}",
+                    legacy_dir.display(),
+                    new_dir.display()
+                );
+                return new_dir;
+            }
         }
 
         // Fall back to user home
         if let Some(home) = std::env::var_os("USERPROFILE") {
-            return std::path::PathBuf::from(home).join(".rsh");
+            return std::path::PathBuf::from(home).join(".mrsh");
         }
 
-        // Last resort
-        return service_dir;
+        new_dir
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -3307,9 +3658,9 @@ fn server_data_dir() -> std::path::PathBuf {
             return service_dir;
         }
 
-        // User mode: ~/.rsh/
+        // User mode: ~/.mrsh/
         if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(".rsh");
+            return std::path::PathBuf::from(home).join(".mrsh");
         }
 
         std::path::PathBuf::from("/etc/rsh")
@@ -3360,19 +3711,19 @@ mod tests {
 
     #[test]
     fn cli_timeout_default_is_zero() {
-        let cli = Cli::try_parse_from(["rsh", "-h", "host", "ping"]).unwrap();
+        let cli = Cli::try_parse_from(["mrsh", "-h", "host", "ping"]).unwrap();
         assert_eq!(cli.timeout, 0);
     }
 
     #[test]
     fn cli_timeout_explicit_value_parsed() {
-        let cli = Cli::try_parse_from(["rsh", "-h", "host", "--timeout", "45", "ping"]).unwrap();
+        let cli = Cli::try_parse_from(["mrsh", "-h", "host", "--timeout", "45", "ping"]).unwrap();
         assert_eq!(cli.timeout, 45);
     }
 
     #[test]
     fn cli_timeout_zero_explicit_parsed() {
-        let cli = Cli::try_parse_from(["rsh", "-h", "host", "--timeout", "0", "exec", "ls"]).unwrap();
+        let cli = Cli::try_parse_from(["mrsh", "-h", "host", "--timeout", "0", "exec", "ls"]).unwrap();
         assert_eq!(cli.timeout, 0);
     }
 
@@ -3403,7 +3754,7 @@ mod tests {
     #[test]
     fn caps_contains_common_capabilities() {
         let caps = build_server_caps();
-        for expected in &["exec", "push", "pull", "self-update", "info", "ps", "kill", "ls", "cat", "tail", "clip", "screenshot"] {
+        for expected in &["exec", "stream-exec", "push", "pull", "self-update", "info", "ps", "kill", "ls", "cat", "tail", "clip", "screenshot"] {
             assert!(caps.iter().any(|c| c == expected), "missing common cap: {}", expected);
         }
     }
@@ -3435,7 +3786,7 @@ mod tests {
     #[test]
     fn device_id_from_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = rsh_core::config::Config::default();
+        let mut config = mrsh_core::config::Config::default();
         config.device_id = Some("123456789".to_string());
         let id = resolve_device_id(&config, tmp.path());
         assert_eq!(id, "123456789");
@@ -3445,7 +3796,7 @@ mod tests {
     fn device_id_from_legacy_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("device_id"), "987654321\n").unwrap();
-        let config = rsh_core::config::Config::default(); // no device_id set
+        let config = mrsh_core::config::Config::default(); // no device_id set
         let id = resolve_device_id(&config, tmp.path());
         assert_eq!(id, "987654321");
     }
@@ -3453,7 +3804,7 @@ mod tests {
     #[test]
     fn device_id_generated_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let config = rsh_core::config::Config::default();
+        let config = mrsh_core::config::Config::default();
         let id = resolve_device_id(&config, tmp.path());
         // Should be 9 digits
         assert_eq!(id.len(), 9, "generated ID should be 9 digits: {}", id);
@@ -3466,7 +3817,7 @@ mod tests {
     fn device_id_config_takes_precedence_over_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("device_id"), "111111111").unwrap();
-        let mut config = rsh_core::config::Config::default();
+        let mut config = mrsh_core::config::Config::default();
         config.device_id = Some("222222222".to_string());
         let id = resolve_device_id(&config, tmp.path());
         assert_eq!(id, "222222222", "config should take precedence over file");
