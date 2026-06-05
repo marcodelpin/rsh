@@ -351,6 +351,44 @@ pub fn install_service(_exe_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the service user for the systemd unit.
+///
+/// If running via `sudo`, returns the invoking user (`SUDO_USER`).
+/// Otherwise returns the current effective user's name.
+/// Falls back to "root" if detection fails.
+#[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
+fn resolve_service_user() -> String {
+    // SUDO_USER is the human user who ran sudo (most common case for install)
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        if !sudo_user.is_empty() && sudo_user != "root" {
+            return sudo_user;
+        }
+    }
+    // Not sudo — resolve from euid
+    let euid = unsafe { libc::geteuid() };
+    // Try getpwuid_r for the name
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = [0u8; 4096];
+        let mut result = std::ptr::null_mut();
+        if libc::getpwuid_r(
+            euid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        ) == 0
+            && !result.is_null()
+        {
+            let name = std::ffi::CStr::from_ptr(pwd.pw_name);
+            if let Ok(s) = name.to_str() {
+                return s.to_string();
+            }
+        }
+    }
+    "root".to_string()
+}
+
 #[cfg(all(not(target_os = "windows"), not(target_os = "android")))]
 pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
     // Canonical install dir: /opt/mrsh/. The binary lives here owned by the
@@ -378,10 +416,11 @@ pub fn install_service(exe_path: &str) -> anyhow::Result<()> {
     std::os::unix::fs::symlink(&target_bin, legacy_bin)
         .map_err(|e| anyhow::anyhow!("symlink {} -> {}: {}", legacy_bin, target_bin, e))?;
 
-    // Ownership note: caller (running as root via sudo) should chown the dir
-    // to the intended service user. Default install assumes the unit's User=
-    // matches the invoking user when not run via sudo. The migration script
-    // (.tmp/migrate-mrsh-linux.sh) handles existing-install ownership transfer.
+    // Resolve the service user: if running via sudo, detect the invoking user
+    // (SUDO_USER); otherwise use the current euid's name. This ensures the
+    // systemd unit runs as the human user, not root. The data dir
+    // (~/.mrsh or /etc/mrsh) must be readable by this user.
+    let service_user = resolve_service_user();
 
     let unit = format!(
         r#"[Unit]
@@ -393,12 +432,15 @@ Type=simple
 ExecStart={exe} --daemon
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/etc/mrsh
+WorkingDirectory=/home/{user}/.mrsh
+User={user}
+Group={user}
 
 [Install]
 WantedBy=multi-user.target
 "#,
         exe = target_bin,
+        user = service_user,
     );
     // Remove any legacy rsh.service unit from older installs (renamed to mrsh.service).
     let legacy_unit = "/etc/systemd/system/rsh.service";
