@@ -41,12 +41,11 @@ use ed25519_dalek::{
 ///   1. `MRSH_RELEASE_PUBKEY` env var — raw PEM contents (CI/release builds)
 ///   2. `MRSH_RELEASE_PUBKEY_FILE` env var — path to `.pem` file
 ///      canonical: `/path/to/release-pubkey.pub.pem`
-///      (internal-ref: keypair generated 2026-05-18, private key at release-private.pem)
 ///   3. Empty string — local/dev builds (verify path requires
 ///      `--insecure-no-verify` until populated; see selfupdate.rs runtime gate)
 ///
-/// Keypair generated 2026-05-18 per internal-ref (F8 cycle 0). Private key escrowed
-/// in /path/to/release-private.pem (kept offline).
+/// The matching private key is generated once with openssl (below) and kept
+/// offline by the operator; it is never committed to this repository.
 /// Public key raw hex: 26a9ba143f71cd1056c0535e3935a4e1ef2fe7b8ca183f92555ccf10cb3c2c6e
 ///
 /// Generation (operator, out of band — already done; key in secret repo):

@@ -29,8 +29,8 @@
 //!   - any of the above where `<user>` matches the SENDER's USERNAME
 //!   - leading `<drive>:[/\]Temp[/\]...` when receiver is Linux (MSYS-converted
 //!     `/tmp/...` — the most common spuri-creation path). Rewrites to `/tmp/...`.
-//!     Fix landed 2026-05-09 after fleet audit found ~50M of `W:/Temp/*` literal
-//!     dirs across multiple build hosts.
+//!     Fix landed 2026-05-09 after an audit found large amounts of `W:/Temp/*`
+//!     literal dirs spread across multiple build hosts.
 //!
 //! When the receiver is detected as Windows we leave Windows-style paths alone.
 //! When the receiver is Linux/macOS we rewrite to `<receiver-home>/<rest>`.
